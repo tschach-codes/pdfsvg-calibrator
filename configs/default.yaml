@@ -1,0 +1,30 @@
+rot_degrees: [0, 180]
+angle_tol_deg: 6.0
+min_len_raw: 6.0
+merge:
+  gap_max_rel: 0.01
+  off_tol_rel: 0.003
+grid_cell_rel: 0.02
+chamfer:
+  sigma_rel: 0.004
+  hard_mul: 3.0
+ransac:
+  iters: 900
+  refine_scale_step: 0.004
+  refine_trans_px: 3
+verify:
+  pick_k: 5
+  diversity_rel: 0.10
+  radius_px: 80
+  dir_tol_deg: 6.0
+  tol_rel: 0.01
+neighbors:
+  use: true
+  radius_rel: 0.06
+  dt: 0.03
+  dtheta_deg: 8.0
+cost_weights:
+  endpoint: 0.5
+  midpoint: 0.3
+  direction: 0.2
+  neighbors: 0.1
