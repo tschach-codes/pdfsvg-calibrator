@@ -1,6 +1,5 @@
 # Changelog
 
 ## Unreleased
-- Added adaptive PDF polyline extraction with TLS straightness filtering and H/V classification.
-- Parsed SVG document dimensions from width/height and viewBox with unit handling.
-- Introduced straightness-related configuration defaults and regression tests.
+- Added transform-aware SVG parser with curve flattening and line fitting.
+- Introduced SVG parsing tests and configuration options for curve tolerance and straightness thresholds.

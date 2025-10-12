@@ -4,6 +4,9 @@ curve_tol_rel: 0.001
 straight_max_dev_rel: 0.002
 straight_max_angle_spread_deg: 4.0
 min_len_raw: 6.0
+curve_tol_rel: 0.001
+straight_max_dev_rel: 0.0015
+straight_max_angle_spread_deg: 3.0
 merge:
   gap_max_rel: 0.01
   off_tol_rel: 0.003

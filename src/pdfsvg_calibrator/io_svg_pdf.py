@@ -375,21 +375,6 @@ def _parse_viewbox(root) -> Tuple[float, float]:
 
 
 def load_svg_segments(svg_path: str, cfg: dict):
-    segments = parse_svg_segments(svg_path)
-
-    from lxml import etree as ET
-
-    parser = ET.XMLParser(huge_tree=True, recover=True, remove_blank_text=False)
-    tree = ET.parse(svg_path, parser=parser)
-    root = tree.getroot()
-
-    width = _parse_length(root.get("width"))
-    height = _parse_length(root.get("height"))
-
-    if width > 0 and height > 0:
-        size = (width, height)
-    else:
-        view_w, view_h = _parse_viewbox(root)
-        size = (view_w, view_h) if view_w > 0 and view_h > 0 else (0.0, 0.0)
-
-    return segments, size
+    segs = parse_svg_segments(svg_path, cfg)
+    size = (0.0, 0.0)  # could parse viewBox later
+    return segs, size
