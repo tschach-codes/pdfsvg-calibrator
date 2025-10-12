@@ -1,6 +1,7 @@
 rot_degrees: [0, 180]
 angle_tol_deg: 6.0
 min_len_raw: 6.0
+rng_seed: 1337
 merge:
   gap_max_rel: 0.01
   off_tol_rel: 0.003
