@@ -1,4 +1,5 @@
 # Changelog
 
 ## Unreleased
-- Implemented verification line selection scoring with chamfer support and diversity-aware balancing for reference segments.
+- Added transform-aware SVG parser with curve flattening and line fitting.
+- Introduced SVG parsing tests and configuration options for curve tolerance and straightness thresholds.
