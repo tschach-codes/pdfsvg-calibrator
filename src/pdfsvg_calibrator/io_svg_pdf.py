@@ -62,6 +62,6 @@ def convert_pdf_to_svg_if_needed(pdf_path: str, page_index: int, outdir: str)->s
     return svg_out
 
 def load_svg_segments(svg_path: str, cfg: dict):
-    segs = parse_svg_segments(svg_path)
+    segs = parse_svg_segments(svg_path, cfg)
     size = (0.0, 0.0)  # could parse viewBox later
     return segs, size
