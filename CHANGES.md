@@ -5,3 +5,4 @@
 - Introduced SVG parsing tests and configuration options for curve tolerance and straightness thresholds.
 - Implemented neighborhood-aware PDF↔SVG line matching with Hungarian assignment and confidence metrics.
 - Added synthetic matching tests covering clean, ambiguous, and missing-target scenarios.
+- Produced overlay visualizations (SVG/PDF) with labelled IDs and emitted a per-line CSV report.

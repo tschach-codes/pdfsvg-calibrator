@@ -45,3 +45,9 @@
 - Added composite candidate cost combining direction, midpoint/endpoints, and neighbor penalties.
 - Integrated custom Hungarian solver for five-to-many assignments.
 - Produced match metrics (ratio, relative error, PASS/FAIL, confidence) across synthetic tests.
+
+## Progress – G
+- Implemented SVG overlays with transformed PDF baselines and labelled matches.
+- Added PDF overlays that mirror original geometry and embed readable ID badges.
+- Generated CSV reports combining model parameters with per-line metrics and notes.
+- Created smoke tests that assert overlay structure and CSV content for matched/unmatched cases.
