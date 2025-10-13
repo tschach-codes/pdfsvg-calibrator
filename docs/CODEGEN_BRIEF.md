@@ -51,3 +51,10 @@
 - Added PDF overlays that mirror original geometry and embed readable ID badges.
 - Generated CSV reports combining model parameters with per-line metrics and notes.
 - Created smoke tests that assert overlay structure and CSV content for matched/unmatched cases.
+
+## Progress – H
+- Added Typer CLI `pdfsvg-calibrate run` that wires config loading, geometry extraction, calibration, and reporting.
+- Integrated Rich-powered status logging with plain-text fallback and deterministic RNG overrides.
+- Hardened error paths for missing vectors, calibration failures, and unreadable configs with exit codes 2/1.
+- Summarised results via model/score panel plus five-line table and emitted overlay/CSV paths in the console.
+- Added subprocess-based end-to-end tests for happy path, raster SVG rejection, and calibration failure diagnostics.
