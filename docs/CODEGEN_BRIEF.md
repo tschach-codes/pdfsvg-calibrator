@@ -13,7 +13,7 @@
 2. **Transform Hypothesis & Estimation** – enumerates orientation flips (0°/180° core, optional 90°/270°) and uses RANSAC with chamfer-like scores to robustly estimate scale/translation parameters, accommodating outliers.
 3. **Neighborhood Signature Builder** – for each segment, computes descriptors of adjacent segments (positions, orientation parity, length ratios) so that matching leverages spatial context, reducing false correspondences.
 4. **Global Matcher** – combines transform and signature scores to assemble a cost matrix and solves for the top five matches using an in-house Hungarian algorithm to guarantee one-to-one assignments.
-5. **Verification & Reporting** – revalidates the five matched pairs with precise geometry under the refined transform, generates overlays (PDF/SVG) with line IDs, and outputs a CSV containing per-line metrics and PASS/FAIL flags. Also emits status flags/confidences when data is insufficient or validation partly fails.
+5. **Verification & Reporting** – revalidates the five matched pairs with precise geometry under the refined transform, generates overlays (PDF/SVG) with line IDs, and outputs a CSV containing per-line metrics and notes. Also emits status flags/confidences when data is insufficient or validation partly fails.
 6. **Configuration & CLI** – exposes tolerances, iteration limits, and search radii via YAML config, accessible through `pdfsvg-calibrate run <pdf> --page N --config ... --outdir ...` using Typer/Rich for UX.
 
 ## Edge Cases & Coverage
@@ -58,3 +58,7 @@
 - Hardened error paths for missing vectors, calibration failures, and unreadable configs with exit codes 2/1.
 - Summarised results via model/score panel plus five-line table and emitted overlay/CSV paths in the console.
 - Added subprocess-based end-to-end tests for happy path, raster SVG rejection, and calibration failure diagnostics.
+
+## Progress – R
+- Dokumentationseinheit ergänzt: laienfreundliche README mit Quickstart, Outputs, Troubleshooting und FAQ.
+- Technische Referenz `docs/HOW_IT_WORKS.md` verfasst (Pipeline, Datenflüsse, Parametertabelle mit Code-Fundstellen, Debug-/Performance-Hinweise).
