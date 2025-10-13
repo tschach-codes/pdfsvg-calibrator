@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import xml.etree.ElementTree as ET
 from typing import List, Sequence, Tuple
 
 import fitz
@@ -376,5 +377,16 @@ def _parse_viewbox(root) -> Tuple[float, float]:
 
 def load_svg_segments(svg_path: str, cfg: dict):
     segs = parse_svg_segments(svg_path, cfg)
-    size = (0.0, 0.0)  # could parse viewBox later
-    return segs, size
+    try:
+        tree = ET.parse(svg_path)
+    except ET.ParseError:
+        return segs, (0.0, 0.0)
+    root = tree.getroot()
+    width = _parse_length(root.get("width"))
+    height = _parse_length(root.get("height"))
+    vb_w, vb_h = _parse_viewbox(root)
+    if width == 0.0 and vb_w:
+        width = vb_w
+    if height == 0.0 and vb_h:
+        height = vb_h
+    return segs, (width, height)

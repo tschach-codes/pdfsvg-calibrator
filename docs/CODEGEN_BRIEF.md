@@ -13,7 +13,7 @@
 2. **Transform Hypothesis & Estimation** – enumerates orientation flips (0°/180° core, optional 90°/270°) and uses RANSAC with chamfer-like scores to robustly estimate scale/translation parameters, accommodating outliers.
 3. **Neighborhood Signature Builder** – for each segment, computes descriptors of adjacent segments (positions, orientation parity, length ratios) so that matching leverages spatial context, reducing false correspondences.
 4. **Global Matcher** – combines transform and signature scores to assemble a cost matrix and solves for the top five matches using an in-house Hungarian algorithm to guarantee one-to-one assignments.
-5. **Verification & Reporting** – revalidates the five matched pairs with precise geometry under the refined transform, generates overlays (PDF/SVG) with line IDs, and outputs a CSV containing per-line metrics and PASS/FAIL flags. Also emits status flags/ confidences when data is insufficient or validation partly fails.
+5. **Verification & Reporting** – revalidates the five matched pairs with precise geometry under the refined transform, generates overlays (PDF/SVG) with line IDs, and outputs a CSV containing per-line metrics and PASS/FAIL flags. Also emits status flags/confidences when data is insufficient or validation partly fails.
 6. **Configuration & CLI** – exposes tolerances, iteration limits, and search radii via YAML config, accessible through `pdfsvg-calibrate run <pdf> --page N --config ... --outdir ...` using Typer/Rich for UX.
 
 ## Edge Cases & Coverage
@@ -39,3 +39,9 @@
 - Default to attempting 0°/180° orientations first, only exploring 90°/270° when explicitly enabled via config to control runtime.
 - Treat "long" lines via a configurable minimum length threshold, initially 10% of max dimension unless overridden.
 - Neighborhood signature considers the four nearest H/V neighbors within a configurable radius.
+
+## Progress – F
+- Built deterministic neighborhood signatures with `(t, Δθ, ρ)` tuples.
+- Added composite candidate cost combining direction, midpoint/endpoints, and neighbor penalties.
+- Integrated custom Hungarian solver for five-to-many assignments.
+- Produced match metrics (ratio, relative error, PASS/FAIL, confidence) across synthetic tests.
