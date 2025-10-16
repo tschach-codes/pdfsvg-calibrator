@@ -100,26 +100,33 @@ def calibrate(
     refine_cfg = cfg_local.setdefault("refine", {})  # type: ignore[assignment]
     if not isinstance(refine_cfg, dict):
         raise ValueError("refine config must be a mapping")
-    scale_window_val = refine_cfg.get("scale_max_dev_rel", 0.02)
-    scale_window = abs(float(scale_window_val))
-    refine_cfg["scale_max_dev_rel"] = scale_window
-    refine_cfg.setdefault("trans_max_dev_px", 10.0)
-    refine_cfg.setdefault("max_iters", 120)
+    scale_window_base_val = abs(float(refine_cfg.get("scale_max_dev_rel", 0.02)))
+    trans_window_base = abs(float(refine_cfg.get("trans_max_dev_px", 10.0)))
+    max_iters_base = int(refine_cfg.get("max_iters", 120))
     refine_cfg.setdefault("max_samples", 1500)
-    if use_orientation:
-        refine_cfg.setdefault("scale_seed", (seed_sx, seed_sy))
-        refine_cfg.setdefault("trans_seed", (tx0, ty0))
-        refine_cfg.setdefault(
-            "scale_abs_bounds",
-            (
+
+    def _apply_refine_window(
+        scale_window: float,
+        trans_window: float,
+        *,
+        max_iters: int | None = None,
+    ) -> None:
+        refine_cfg["scale_max_dev_rel"] = scale_window
+        refine_cfg["trans_max_dev_px"] = trans_window
+        refine_cfg["max_iters"] = max_iters if max_iters is not None else max_iters_base
+        if use_orientation:
+            refine_cfg["scale_seed"] = (seed_sx, seed_sy)
+            refine_cfg["trans_seed"] = (tx0, ty0)
+            refine_cfg["scale_abs_bounds"] = (
                 (sx0 * (1.0 - scale_window), sx0 * (1.0 + scale_window)),
                 (sy0 * (1.0 - scale_window), sy0 * (1.0 + scale_window)),
-            ),
-        )
-    else:
-        refine_cfg.pop("scale_seed", None)
-        refine_cfg.pop("trans_seed", None)
-        refine_cfg.pop("scale_abs_bounds", None)
+            )
+        else:
+            refine_cfg.pop("scale_seed", None)
+            refine_cfg.pop("trans_seed", None)
+            refine_cfg.pop("scale_abs_bounds", None)
+
+    _apply_refine_window(scale_window_base_val, trans_window_base)
 
     if use_orientation:
         log.info(
@@ -156,5 +163,73 @@ def calibrate(
     grid_cfg.setdefault("initial_cell_rel", 0.05)
     grid_cfg.setdefault("final_cell_rel", 0.02)
 
+    quality_gate_cfg = refine_cfg.get("quality_gate", {})
+    if quality_gate_cfg and not isinstance(quality_gate_cfg, dict):
+        raise ValueError("refine.quality_gate must be a mapping if provided")
+    gate_enabled = True
+    if isinstance(quality_gate_cfg, dict):
+        gate_enabled = bool(quality_gate_cfg.get("enabled", True))
+        rmse_gate_val = quality_gate_cfg.get("rmse_px", 12.0)
+        rmse_gate = float(rmse_gate_val) if rmse_gate_val is not None else None
+        score_gate_val = quality_gate_cfg.get("score_min", 0.15)
+        score_gate = float(score_gate_val) if score_gate_val is not None else None
+        fallback_trans = abs(float(quality_gate_cfg.get("fallback_trans_max_dev_px", 25.0)))
+        fallback_scale = abs(float(quality_gate_cfg.get("fallback_scale_max_dev_rel", 0.05)))
+        fallback_iters_cfg = int(quality_gate_cfg.get("fallback_max_iters", 60))
+    else:  # pragma: no cover - defensive
+        rmse_gate = 12.0
+        score_gate = 0.15
+        fallback_trans = 25.0
+        fallback_scale = 0.05
+        fallback_iters_cfg = 60
+
+    def _quality_failures(result: Model) -> list[str]:
+        issues: list[str] = []
+        if rmse_gate is not None and rmse_gate > 0.0 and result.rmse > rmse_gate:
+            issues.append(f"RMSE {result.rmse:.2f}px > {rmse_gate:.2f}px")
+        if score_gate is not None and result.score < score_gate:
+            issues.append(f"Score {result.score:.4f} < {score_gate:.4f}")
+        return issues
+
     model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+
+    quality_notes: list[str] = []
+    if gate_enabled:
+        failures = _quality_failures(model)
+        if failures:
+            fallback_trans_window = max(trans_window_base, fallback_trans)
+            fallback_scale_window = max(scale_window_base_val, fallback_scale)
+            fallback_iters = max(1, min(max_iters_base, fallback_iters_cfg))
+            log.warning(
+                "[calib] quality gate triggered (RMSE=%.2fpx, P95=%.2fpx, Score=%.4f; %s); "
+                "expanding to trans=±%.1fpx, scale=±%.2f%% and running fallback (max %d iters)",
+                model.rmse,
+                model.p95,
+                model.score,
+                "; ".join(failures),
+                fallback_trans_window,
+                fallback_scale_window * 100.0,
+                fallback_iters,
+            )
+            _apply_refine_window(fallback_scale_window, fallback_trans_window, max_iters=fallback_iters)
+            ransac_cfg["iters"] = fallback_iters
+            model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+            post_failures = _quality_failures(model)
+            if post_failures:
+                message = (
+                    "Calibration quality below threshold after fallback (RMSE="
+                    f"{model.rmse:.2f}px, P95={model.p95:.2f}px, Score={model.score:.4f}): "
+                    + "; ".join(post_failures)
+                )
+                log.warning("[calib] %s", message)
+                quality_notes.append(message)
+            else:
+                note = (
+                    "Quality gate fallback succeeded after expanding bounds (RMSE="
+                    f"{model.rmse:.2f}px, P95={model.p95:.2f}px, Score={model.score:.4f})."
+                )
+                log.info("[calib] %s", note)
+                quality_notes.append(note)
+
+    model.quality_notes = tuple(quality_notes)
     return model

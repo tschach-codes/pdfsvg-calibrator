@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Literal, Optional, Tuple
 
 @dataclass
 class Segment:
@@ -12,6 +12,7 @@ class Model:
     rot_deg: int
     sx: float; sy: float; tx: float; ty: float
     score: float; rmse: float; p95: float; median: float
+    quality_notes: Tuple[str, ...] = ()
 
 @dataclass
 class Match:
