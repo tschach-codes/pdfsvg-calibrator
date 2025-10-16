@@ -101,14 +101,6 @@ def build_seg_grid(svg_segs: Sequence[Segment], cell_size: float) -> SegGrid:
     )
 
 
-def _filter_by_length(
-    segs: Sequence[Segment], min_length: float
-) -> List[Segment]:
-    if min_length <= 0.0:
-        return list(segs)
-    return [seg for seg in segs if _segment_length(seg) >= min_length]
-
-
 def _segment_length(seg: Segment) -> float:
     return math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
 
