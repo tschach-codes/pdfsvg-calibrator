@@ -258,6 +258,12 @@ def calibrate(
     pdf_segs_all = list(pdf_segs)
     svg_segs_all = list(svg_segs)
 
+    log.debug(
+        "[calib] Eingang: %d PDF-Segmente, %d SVG-Segmente",
+        len(pdf_segs_all),
+        len(svg_segs_all),
+    )
+
     diag_pdf = math.hypot(*pdf_size)
     diag_svg = math.hypot(*svg_size)
     if diag_pdf == 0.0 or diag_svg == 0.0:
@@ -269,6 +275,8 @@ def calibrate(
     pdf_min_len = min_len_rel * (pdf_width if pdf_width > 0.0 else diag_pdf)
     svg_min_len = min_len_rel * (svg_width if svg_width > 0.0 else diag_svg)
 
+    filter_start = perf_counter()
+
     pdf_segs = _filter_by_length(pdf_segs_all, pdf_min_len)
     if not pdf_segs:
         pdf_segs = pdf_segs_all
@@ -279,16 +287,19 @@ def calibrate(
         svg_segs = svg_segs_all
         svg_min_len = 0.0
 
-    if min_len_rel > 0.0:
-        log.debug(
-            "[calib] Segmentlängenfilter aktiv: pdf>=%.3f (nutze %d/%d), svg>=%.3f (nutze %d/%d)",
-            pdf_min_len,
-            len(pdf_segs),
-            len(pdf_segs_all),
-            svg_min_len,
-            len(svg_segs),
-            len(svg_segs_all),
-        )
+    filter_duration = perf_counter() - filter_start
+
+    log.debug(
+        "[calib] Segmentlängenfilter: rel=%.4f → pdf>=%.3f (%d/%d), svg>=%.3f (%d/%d) in %.3fs",
+        min_len_rel,
+        pdf_min_len,
+        len(pdf_segs),
+        len(pdf_segs_all),
+        svg_min_len,
+        len(svg_segs),
+        len(svg_segs_all),
+        filter_duration,
+    )
 
     grid_cell = cfg.get("grid_cell_rel", 0.02) * diag_svg
     grid_start = perf_counter()
@@ -379,27 +390,45 @@ def calibrate(
 
     for rot_deg in rot_degrees:
         rot_start = perf_counter()
+        rotate_start = perf_counter()
         rotated_pdf = [_rotate_segment(seg, rot_deg, center_pdf) for seg in pdf_segs]
+        rotate_duration = perf_counter() - rotate_start
+
+        classify_start = perf_counter()
         pdf_h, pdf_v = classify_hv(rotated_pdf, angle_tol)
+        classify_duration = perf_counter() - classify_start
         _ensure_hv_non_empty("PDF", pdf_h, pdf_v)
 
         log.debug(
-            "[calib] rot=%s klassifiziert (%d horizontale, %d vertikale Segmente)",
+            "[calib] rot=%s rotiert in %.3fs, klassifiziert (%d horizontale, %d vertikale Segmente) in %.3fs",
             rot_deg,
+            rotate_duration,
             len(pdf_h),
             len(pdf_v),
+            classify_duration,
         )
 
+        sample_start = perf_counter()
         pts_pdf = sample_points_on_segments(rotated_pdf, step, max_pts)
+        sample_duration = perf_counter() - sample_start
         if not pts_pdf:
             raise ValueError("Es konnten keine Stichprobenpunkte aus den PDF-Segmenten generiert werden")
 
         log.debug(
-            "[calib] rot=%s Sampling: %d Punkte (step=%.3f, max=%d)",
+            "[calib] rot=%s Sampling: %d Punkte (step=%.3f, max=%d) in %.3fs",
             rot_deg,
             len(pts_pdf),
             step,
             max_pts,
+            sample_duration,
+        )
+
+        log.debug(
+            "[calib] rot=%s RANSAC: %d Iterationen, refine_scale_step=%.4f, refine_trans_px=%.3f",
+            rot_deg,
+            iters,
+            refine_scale_step,
+            refine_trans_px,
         )
 
         chamfer_calls_before = chamfer_stats["calls"]
@@ -492,6 +521,16 @@ def calibrate(
                             best_local[1],
                             best_local[2],
                             best_local[3],
+                        )
+                        log.debug(
+                            "[calib] rot=%s neues globales Maximum: score=%.6f, sx=%.6f, sy=%.6f, tx=%.3f, ty=%.3f (Iter %d)",
+                            rot_deg,
+                            best_score,
+                            best_local[0],
+                            best_local[1],
+                            best_local[2],
+                            best_local[3],
+                            iter_idx + 1,
                         )
             if (iter_idx + 1) % iter_log_interval == 0:
                 calls = chamfer_stats["calls"] - chamfer_calls_before
