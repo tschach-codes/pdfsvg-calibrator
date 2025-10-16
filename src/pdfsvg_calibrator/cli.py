@@ -20,6 +20,7 @@ from .io_svg_pdf import (
     load_pdf_segments,
     load_svg_segments,
 )
+from .metrics import MetricsTracker, Timer, use_tracker
 from .match_verify import match_lines, select_lines
 from .overlays import write_pdf_overlay, write_report_csv, write_svg_overlay
 from .types import Match, Model
@@ -36,6 +37,9 @@ else:  # pragma: no cover - executed only when Rich is missing
     Panel = None  # type: ignore[assignment]
     Table = None  # type: ignore[assignment]
     Theme = None  # type: ignore[assignment]
+
+
+log = logging.getLogger(__name__)
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -374,6 +378,28 @@ def _summarize(
                 logger.warn(f"  - {item}")
 
 
+def _log_timing_summary(tracker: MetricsTracker) -> None:
+    total = tracker.get_time("total.run")
+    orientation = tracker.get_time("orientation.total")
+    seed = tracker.get_time("seed.select")
+    refine = tracker.get_time("refine.total")
+    verify = tracker.get_time("verify.match")
+    io_overlays = (
+        tracker.get_time("io.overlay_svg")
+        + tracker.get_time("io.overlay_pdf")
+        + tracker.get_time("io.report_csv")
+    )
+    summary = (
+        f"Total={total:.2f} s | Orientation={orientation:.2f} s | "
+        f"Seed={seed:.2f} s | Refine={refine:.2f} s | "
+        f"Verify={verify:.2f} s | IO/Overlays={io_overlays:.2f} s"
+    )
+    log.info("[timing] " + summary)
+    chamfer_calls = int(tracker.get_count("chamfer.calls"))
+    samples = int(tracker.get_count("sampling.points"))
+    log.info("[timing] Chamfer calls=%d | Samples=%d", chamfer_calls, samples)
+
+
 def _handle_known_exception(logger: Logger, exc: Exception, *, prefix: str | None = None) -> None:
     message = str(exc) if str(exc) else exc.__class__.__name__
     if prefix:
@@ -417,92 +443,124 @@ def run(
     bridge.setFormatter(logging.Formatter("%(message)s"))
     package_logger.addHandler(bridge)
 
+    tracker = MetricsTracker()
+
     try:
-        logger.step("Konfiguration laden")
-        try:
-            cfg = _load_config_with_defaults(config, rng_seed)
-        except FileNotFoundError as exc:
-            raise
-        except yaml.YAMLError as exc:
-            raise ValueError(f"Konfiguration konnte nicht gelesen werden: {exc}") from exc
+        with use_tracker(tracker):
+            with Timer("total.run"):
+                logger.step("Konfiguration laden")
+                try:
+                    cfg = _load_config_with_defaults(config, rng_seed)
+                except FileNotFoundError as exc:
+                    raise
+                except yaml.YAMLError as exc:
+                    raise ValueError(f"Konfiguration konnte nicht gelesen werden: {exc}") from exc
 
-        neighbors = cfg.setdefault("neighbors", {})
-        neighbors["use"] = True
+                neighbors = cfg.setdefault("neighbors", {})
+                neighbors["use"] = True
 
-        if svg is not None:
-            svg_path = svg.resolve()
-            _ensure_exists(svg_path, "SVG")
-        else:
-            with logger.status("SVG ermitteln"):
-                svg_path = Path(convert_pdf_to_svg_if_needed(str(pdf), page, str(outdir)))
+                if svg is not None:
+                    svg_path = svg.resolve()
+                    _ensure_exists(svg_path, "SVG")
+                else:
+                    with logger.status("SVG ermitteln"):
+                        svg_path = Path(
+                            convert_pdf_to_svg_if_needed(str(pdf), page, str(outdir))
+                        )
 
-        outdir.mkdir(parents=True, exist_ok=True)
+                outdir.mkdir(parents=True, exist_ok=True)
 
-        logger.step("PDF-Segmente laden")
-        with logger.status("PDF analysieren"):
-            pdf_segs, pdf_size = load_pdf_segments(str(pdf), page, cfg)
-        logger.debug(f"PDF-Segmente: {len(pdf_segs)} (Seite {page}, Größe {pdf_size})")
+                logger.step("PDF-Segmente laden")
+                with logger.status("PDF analysieren"):
+                    pdf_segs, pdf_size = load_pdf_segments(str(pdf), page, cfg)
+                logger.debug(
+                    f"PDF-Segmente: {len(pdf_segs)} (Seite {page}, Größe {pdf_size})"
+                )
 
-        logger.step("SVG-Segmente laden")
-        with logger.status("SVG analysieren"):
-            svg_segs, svg_size = load_svg_segments(str(svg_path), cfg)
-        logger.debug(f"SVG-Segmente: {len(svg_segs)} (Größe {svg_size})")
+                logger.step("SVG-Segmente laden")
+                with logger.status("SVG analysieren"):
+                    svg_segs, svg_size = load_svg_segments(str(svg_path), cfg)
+                logger.debug(f"SVG-Segmente: {len(svg_segs)} (Größe {svg_size})")
 
-        if not svg_segs:
-            raise ValueError("SVG enthält keine Vektoren")
+                if not svg_segs:
+                    raise ValueError("SVG enthält keine Vektoren")
 
-        logger.step("Modell kalibrieren")
-        with logger.status("Kalibrierung läuft"):
-            model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg)
+                logger.step("Modell kalibrieren")
+                with logger.status("Kalibrierung läuft"):
+                    model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg)
 
-        alignment = _alignment_diagnostics(model, svg_size)
+                alignment = _alignment_diagnostics(model, svg_size)
 
-        alignment_warnings: List[str] = []
-        if model.rot_deg % 360 != 0:
-            alignment_warnings.append(
-                f"Rotation {model.rot_deg}° erkannt – automatische Exporte erwarten 0°."
-            )
-        if alignment.get("flipped"):
-            alignment_warnings.append(
-                "Automatisch erzeugte SVG wirkt gespiegelt (sx*sy < 0)."
-            )
-        if alignment.get("shift", 0.0) > alignment.get("tol", 0.0):
-            alignment_warnings.append(
-                "Automatischer SVG-Export wirkt verschoben: "
-                f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px."
-            )
+                alignment_warnings: List[str] = []
+                if model.rot_deg % 360 != 0:
+                    alignment_warnings.append(
+                        f"Rotation {model.rot_deg}° erkannt – automatische Exporte erwarten 0°."
+                    )
+                if alignment.get("flipped"):
+                    alignment_warnings.append(
+                        "Automatisch erzeugte SVG wirkt gespiegelt (sx*sy < 0)."
+                    )
+                if alignment.get("shift", 0.0) > alignment.get("tol", 0.0):
+                    alignment_warnings.append(
+                        "Automatischer SVG-Export wirkt verschoben: "
+                        f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px."
+                    )
 
-        logger.step("Top-Linien auswählen")
-        with logger.status("Linienauswahl"):
-            pdf_lines, line_info = select_lines(pdf_segs, model, svg_segs, cfg)
-        logger.debug(f"Ausgewählte Linien: {len(pdf_lines)}")
+                logger.step("Top-Linien auswählen")
+                with logger.status("Linienauswahl"):
+                    with Timer("seed.select"):
+                        pdf_lines, line_info = select_lines(pdf_segs, model, svg_segs, cfg)
+                logger.debug(f"Ausgewählte Linien: {len(pdf_lines)}")
 
-        logger.step("Linien abgleichen")
-        with logger.status("Matching"):
-            raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
-        matches = _renumber_matches(raw_matches)
+                logger.step("Linien abgleichen")
+                with logger.status("Matching"):
+                    with Timer("verify.match"):
+                        raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
+                matches = _renumber_matches(raw_matches)
 
-        extra_warnings: List[str] = alignment_warnings
-        if len(matches) < 5:
-            extra_warnings.append(f"Nur {len(matches)} Linien verfügbar – verbleibende Slots bleiben leer.")
-        if any(match.svg_seg is None for match in matches):
-            extra_warnings.append("Mindestens eine Linie konnte keinem SVG-Segment zugeordnet werden.")
+                extra_warnings: List[str] = alignment_warnings
+                if len(matches) < 5:
+                    extra_warnings.append(
+                        f"Nur {len(matches)} Linien verfügbar – verbleibende Slots bleiben leer."
+                    )
+                if any(match.svg_seg is None for match in matches):
+                    extra_warnings.append(
+                        "Mindestens eine Linie konnte keinem SVG-Segment zugeordnet werden."
+                    )
 
-        logger.step("Overlays & Bericht schreiben")
-        with logger.status("SVG-Overlay"):
-            overlay_svg = Path(write_svg_overlay(str(svg_path), str(outdir), str(pdf), page, model, matches))
-        with logger.status("PDF-Overlay"):
-            overlay_pdf = Path(write_pdf_overlay(str(pdf), page, str(outdir), matches))
-        with logger.status("CSV-Bericht"):
-            report_csv = Path(write_report_csv(str(outdir), str(pdf), page, model, matches))
+                logger.step("Overlays & Bericht schreiben")
+                with logger.status("SVG-Overlay"):
+                    with Timer("io.overlay_svg"):
+                        overlay_svg = Path(
+                            write_svg_overlay(
+                                str(svg_path),
+                                str(outdir),
+                                str(pdf),
+                                page,
+                                model,
+                                matches,
+                            )
+                        )
+                with logger.status("PDF-Overlay"):
+                    with Timer("io.overlay_pdf"):
+                        overlay_pdf = Path(
+                            write_pdf_overlay(str(pdf), page, str(outdir), matches)
+                        )
+                with logger.status("CSV-Bericht"):
+                    with Timer("io.report_csv"):
+                        report_csv = Path(
+                            write_report_csv(str(outdir), str(pdf), page, model, matches)
+                        )
 
-        outputs = {
-            "SVG": overlay_svg,
-            "PDF": overlay_pdf,
-            "CSV": report_csv,
-        }
+                outputs = {
+                    "SVG": overlay_svg,
+                    "PDF": overlay_pdf,
+                    "CSV": report_csv,
+                }
 
-        _summarize(logger, model, matches, outputs, line_info, extra_warnings, alignment)
+                _summarize(logger, model, matches, outputs, line_info, extra_warnings, alignment)
+
+            _log_timing_summary(tracker)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         _handle_known_exception(logger, exc, prefix="Fehler")
         raise typer.Exit(code=2) from exc

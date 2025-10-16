@@ -8,6 +8,7 @@ from typing import Dict, Mapping, Sequence, Tuple
 from .fit_model import calibrate as _calibrate_ransac
 from .orientation import DEFAULT_RASTER_SIZE, DEFAULT_USE_PHASE_CORRELATION, pick_flip_and_rot
 from .types import Model, Segment
+from .metrics import Timer
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +192,8 @@ def calibrate(
             issues.append(f"Score {result.score:.4f} < {score_gate:.4f}")
         return issues
 
-    model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+    with Timer("refine.total"):
+        model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
 
     quality_notes: list[str] = []
     if gate_enabled:

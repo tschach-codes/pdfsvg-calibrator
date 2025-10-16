@@ -10,6 +10,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 from .geom import classify_hv
+from .metrics import Timer, get_tracker
 from .types import Model, Segment
 
 
@@ -157,21 +158,27 @@ def _rotate_segment(seg: Segment, angle_deg: float, center: Tuple[float, float])
 def sample_points_on_segments(segs: Sequence[Segment], step: float, max_pts: int) -> List[Tuple[float, float]]:
     if step <= 0:
         raise ValueError("sampling step muss > 0 sein")
-    points: List[Tuple[float, float]] = []
-    for seg in segs:
-        length = _segment_length(seg)
-        if length == 0.0:
-            continue
-        intervals = max(int(math.ceil(length / step)), 1)
-        for i in range(intervals + 1):
-            if len(points) >= max_pts:
-                return points
-            t = i / intervals
-            x = seg.x1 + (seg.x2 - seg.x1) * t
-            y = seg.y1 + (seg.y2 - seg.y1) * t
-            points.append((x, y))
-        if len(points) >= max_pts:
-            break
+    tracker = get_tracker()
+    with Timer("sampling.total"):
+        points: List[Tuple[float, float]] = []
+        cap = max(1, max_pts)
+        for seg in segs:
+            length = _segment_length(seg)
+            if length == 0.0:
+                continue
+            intervals = max(int(math.ceil(length / step)), 1)
+            for i in range(intervals + 1):
+                if len(points) >= cap:
+                    break
+                t = i / intervals
+                x = seg.x1 + (seg.x2 - seg.x1) * t
+                y = seg.y1 + (seg.y2 - seg.y1) * t
+                points.append((x, y))
+            if len(points) >= cap:
+                break
+    if tracker is not None:
+        tracker.increment("sampling.calls")
+        tracker.increment("sampling.points", len(points))
     return points
 
 
@@ -394,6 +401,7 @@ def calibrate(
     svg_h, svg_v = classify_hv(list(svg_segs), angle_tol)
     _ensure_hv_non_empty("SVG", svg_h, svg_v)
 
+    tracker = get_tracker()
     debug_cfg = cfg.get("debug", {})
     enable_chamfer_stats = bool(
         debug_cfg.get("chamfer_stats", log.isEnabledFor(logging.DEBUG))
@@ -445,38 +453,23 @@ def calibrate(
 
     chamfer_stats = {"calls": 0, "time": 0.0}
 
-    if enable_chamfer_stats:
-
-        def eval_chamfer(
-            pts_pdf: Sequence[Tuple[float, float]],
-            sx: float,
-            sy: float,
-            tx: float,
-            ty: float,
-            svg_grid: SegGrid,
-            sigma: float,
-            hard: float,
-        ) -> float:
-            start = perf_counter()
-            try:
-                return chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
-            finally:
-                chamfer_stats["calls"] += 1
-                chamfer_stats["time"] += perf_counter() - start
-
-    else:
-
-        def eval_chamfer(
-            pts_pdf: Sequence[Tuple[float, float]],
-            sx: float,
-            sy: float,
-            tx: float,
-            ty: float,
-            svg_grid: SegGrid,
-            sigma: float,
-            hard: float,
-        ) -> float:
-            return chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+    def eval_chamfer(
+        pts_pdf: Sequence[Tuple[float, float]],
+        sx: float,
+        sy: float,
+        tx: float,
+        ty: float,
+        svg_grid: SegGrid,
+        sigma: float,
+        hard: float,
+    ) -> float:
+        with Timer("chamfer.total") as timer:
+            score = chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+        chamfer_stats["calls"] += 1
+        chamfer_stats["time"] += timer.duration
+        if tracker is not None:
+            tracker.increment("chamfer.calls")
+        return score
 
     best_model: Model | None = None
     best_score_coarse = -math.inf
@@ -835,8 +828,11 @@ def calibrate(
     total_duration = perf_counter() - start_total
     total_ms = total_duration * 1000.0
     chamfer_ms = chamfer_stats["time"] * 1000.0
+    samples_total = len(pts_pdf_full)
+    if tracker is not None:
+        samples_total = int(tracker.get_count("sampling.points"))
     log.info(
-        "[calib] abgeschlossen rot=%s score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer)",
+        "[calib] abgeschlossen rot=%s score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer, Samples=%d)",
         best_model.rot_deg,
         best_model.score,
         best_model.sx,
@@ -847,6 +843,7 @@ def calibrate(
         chamfer_stats["calls"],
         total_ms,
         chamfer_ms,
+        samples_total,
     )
 
     return best_model
