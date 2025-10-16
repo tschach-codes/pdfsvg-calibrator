@@ -329,12 +329,14 @@ def calibrate(
     grid_cfg = cfg.get("grid", {})
     if grid_cfg and not isinstance(grid_cfg, dict):
         raise ValueError("grid config muss ein Mapping sein")
-    grid_cell_rel = float(cfg.get("grid_cell_rel", 0.02))
+    grid_cell_rel = float(cfg.get("grid_cell_rel", 0.05))
     initial_cell_rel = grid_cell_rel
-    final_cell_rel = grid_cell_rel
+    final_cell_rel = float(cfg.get("grid_final_cell_rel", 0.02))
     if isinstance(grid_cfg, dict):
-        initial_cell_rel = float(grid_cfg.get("initial_cell_rel", grid_cell_rel))
-        final_cell_rel = float(grid_cfg.get("final_cell_rel", initial_cell_rel))
+        initial_cell_rel = float(grid_cfg.get("initial_cell_rel", initial_cell_rel))
+        final_cell_rel = float(grid_cfg.get("final_cell_rel", final_cell_rel))
+    if final_cell_rel <= 0.0:
+        final_cell_rel = initial_cell_rel
 
     grid_cell = initial_cell_rel * diag_svg
     grid_start = perf_counter()
@@ -360,26 +362,29 @@ def calibrate(
     if isinstance(sampling_cfg, dict):
         step_rel = float(sampling_cfg.get("step_rel", step_rel))
     step = step_rel * diag_pdf
-    max_pts_default = 3000
+    max_pts_cap = 1500
+    max_pts_from_sampling = max_pts_cap
     if isinstance(sampling_cfg, dict):
-        max_pts_default = int(sampling_cfg.get("max_points", max_pts_default))
+        max_pts_from_sampling = int(sampling_cfg.get("max_points", max_pts_cap))
 
     refine_cfg = cfg.get("refine", {})
     if refine_cfg and not isinstance(refine_cfg, dict):
         raise ValueError("refine config muss ein Mapping sein")
-    max_pts = max_pts_default
+    refine_max_samples = max_pts_cap
     if isinstance(refine_cfg, dict):
-        max_pts = max(1, int(min(max_pts_default, refine_cfg.get("max_samples", max_pts_default))))
-    else:
-        max_pts = max(1, max_pts_default)
+        refine_max_samples = int(refine_cfg.get("max_samples", max_pts_cap))
+    max_pts = max(1, min(max_pts_cap, refine_max_samples, max_pts_from_sampling))
 
     ransac_cfg = cfg.get("ransac", {})
-    iters = int(ransac_cfg.get("iters", 900))
+    iters = int(ransac_cfg.get("iters", 120))
     refine_scale_step = float(ransac_cfg.get("refine_scale_step", 0.004))
     refine_trans_px = float(ransac_cfg.get("refine_trans_px", 3.0))
-    max_no_improve = int(ransac_cfg.get("max_no_improve", 250))
-    if max_no_improve < 0:
-        max_no_improve = 0
+    patience_val = ransac_cfg.get("patience")
+    if patience_val is None:
+        patience_val = ransac_cfg.get("max_no_improve", 60)
+    patience = int(patience_val)
+    if patience < 0:
+        patience = 0
 
     rng_seed = cfg.get("rng_seed")
     rng = random.Random(rng_seed)
@@ -474,7 +479,9 @@ def calibrate(
             return chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
 
     best_model: Model | None = None
-    best_score = -math.inf
+    best_score_coarse = -math.inf
+    best_score_fine = -math.inf
+    svg_grid_fine: SegGrid | None = None
     best_params: Tuple[int, float, float, float, float] | None = None
     total_iters = 0
     center_pdf = (pdf_size[0] * 0.5, pdf_size[1] * 0.5)
@@ -535,12 +542,12 @@ def calibrate(
         )
 
         log.debug(
-            "[calib] rot=%s RANSAC: %d Iterationen, refine_scale_step=%.4f, refine_trans_px=%.3f, max_no_improve=%s",
+            "[calib] rot=%s RANSAC: %d Iterationen, refine_scale_step=%.4f, refine_trans_px=%.3f, patience=%s",
             rot_deg,
             iters,
             refine_scale_step,
             refine_trans_px,
-            "∞" if max_no_improve == 0 else max_no_improve,
+            "∞" if patience == 0 else patience,
         )
 
         chamfer_calls_before = chamfer_stats["calls"]
@@ -605,7 +612,7 @@ def calibrate(
                     score = eval_chamfer(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
                     if score > rot_best_score:
                         rot_best_score = score
-                    if score <= best_score:
+                    if score <= best_score_coarse:
                         continue
 
                     best_local = (sx, sy, tx, ty, score)
@@ -657,15 +664,40 @@ def calibrate(
                                     if score_ref > rot_best_score:
                                         rot_best_score = score_ref
 
-                    if best_local[4] > best_score:
-                        best_score = best_local[4]
+                    if best_local[4] > best_score_coarse:
+                        fine_score = best_local[4]
+                        if final_cell_rel != initial_cell_rel:
+                            if svg_grid_fine is None:
+                                fine_grid_start = perf_counter()
+                                svg_grid_fine = build_seg_grid(svg_segs, final_cell_rel * diag_svg)
+                                fine_grid_duration = perf_counter() - fine_grid_start
+                                log.debug(
+                                    "[calib] Feines Chamfer-Grid aufgebaut: cell=%.3f (%d Segmente, %d Rasterzellen, Ø %.1f Segmente/Zelle) in %.3fs",
+                                    svg_grid_fine.cell_size,
+                                    len(svg_segs),
+                                    len(svg_grid_fine.cells),
+                                    svg_grid_fine.avg_segments_per_cell,
+                                    fine_grid_duration,
+                                )
+                            fine_score = eval_chamfer(
+                                pts_pdf,
+                                best_local[0],
+                                best_local[1],
+                                best_local[2],
+                                best_local[3],
+                                svg_grid_fine,
+                                sigma,
+                                hard,
+                            )
+                        best_score_coarse = best_local[4]
+                        best_score_fine = fine_score
                         best_model = Model(
                             rot_deg=rot_deg,
                             sx=best_local[0],
                             sy=best_local[1],
                             tx=best_local[2],
                             ty=best_local[3],
-                            score=best_local[4],
+                            score=fine_score,
                             rmse=0.0,
                             p95=0.0,
                             median=0.0,
@@ -679,9 +711,10 @@ def calibrate(
                         )
                         improved_iter = True
                         log.debug(
-                            "[calib] rot=%s neues globales Maximum: score=%.6f, sx=%.6f, sy=%.6f, tx=%.3f, ty=%.3f (Iter %d)",
+                            "[calib] rot=%s neues globales Maximum: coarse=%.6f, fine=%.6f, sx=%.6f, sy=%.6f, tx=%.3f, ty=%.3f (Iter %d)",
                             rot_deg,
-                            best_score,
+                            best_score_coarse,
+                            best_score_fine,
                             best_local[0],
                             best_local[1],
                             best_local[2],
@@ -692,13 +725,13 @@ def calibrate(
                 iters_without_improve = 0
             else:
                 iters_without_improve += 1
-                if max_no_improve and iters_without_improve >= max_no_improve:
+                if patience and iters_without_improve >= patience:
                     log.debug(
-                        "[calib] rot=%s Abbruch nach %d Iterationen (davon %d ohne Verbesserung, max_no_improve=%d)",
+                        "[calib] rot=%s Abbruch nach %d Iterationen (davon %d ohne Verbesserung, patience=%d)",
                         rot_deg,
                         executed_iters,
                         iters_without_improve,
-                        max_no_improve,
+                        patience,
                     )
                     break
             if (iter_idx + 1) % iter_log_interval == 0:
@@ -710,7 +743,7 @@ def calibrate(
                     iter_idx + 1,
                     iters,
                     "-inf" if rot_best_score == -math.inf else f"{rot_best_score:.6f}",
-                    "-inf" if best_score == -math.inf else f"{best_score:.6f}",
+                    "-inf" if best_score_coarse == -math.inf else f"{best_score_coarse:.6f}",
                     calls,
                     duration,
                 )
@@ -729,7 +762,7 @@ def calibrate(
         )
         total_iters += executed_iters
 
-    if best_params is None or best_score <= 0.0:
+    if best_params is None or best_score_fine <= 0.0:
         total_duration = perf_counter() - start_total
         log.debug(
             "[calib] keine Lösung gefunden (%.3fs, Chamfer=%d Aufrufe, %.3fs)",

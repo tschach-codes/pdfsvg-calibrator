@@ -147,6 +147,7 @@ def calibrate(
     sampling_cfg = cfg_local.setdefault("sampling", {})  # type: ignore[assignment]
     if not isinstance(sampling_cfg, dict):
         raise ValueError("sampling config must be a mapping")
+    sampling_cfg.setdefault("step_rel", 0.03)
     sampling_cfg.setdefault("max_points", refine_cfg.get("max_samples", 1500))
 
     grid_cfg = cfg_local.setdefault("grid", {})  # type: ignore[assignment]

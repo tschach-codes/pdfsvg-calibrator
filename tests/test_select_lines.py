@@ -12,7 +12,7 @@ from pdfsvg_calibrator.types import Model, Segment
 def _base_cfg():
     return {
         "verify": {"pick_k": 5, "diversity_rel": 0.1, "dir_tol_deg": 6.0},
-        "sampling": {"step_rel": 0.02, "max_points": 2048},
+        "sampling": {"step_rel": 0.03, "max_points": 1500},
         "chamfer": {"sigma_rel": 0.01, "hard_mul": 3.0},
         "grid_cell_rel": 0.05,
     }

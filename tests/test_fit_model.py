@@ -114,15 +114,16 @@ def _config(rot_degrees: Sequence[int], seed: int = 123) -> dict:
     return {
         "rot_degrees": list(rot_degrees),
         "angle_tol_deg": 6.0,
-        "grid_cell_rel": 0.02,
+        "grid_cell_rel": 0.05,
+        "grid_final_cell_rel": 0.02,
         "chamfer": {"sigma_rel": 0.004, "hard_mul": 3.0},
         "ransac": {
             "iters": 800,
             "refine_scale_step": 0.004,
             "refine_trans_px": 3.0,
-            "max_no_improve": 250,
+            "patience": 60,
         },
-        "sampling": {"step_rel": 0.03, "max_points": 3000},
+        "sampling": {"step_rel": 0.03, "max_points": 1500},
         "rng_seed": seed,
     }
 
@@ -200,8 +201,7 @@ def test_ransac_early_stop_large_scene(caplog):
 
     cfg = _config([0], seed=4242)
     cfg["ransac"]["iters"] = 600
-    cfg["ransac"]["max_no_improve"] = 40
-    cfg["sampling"]["max_points"] = 2500
+    cfg["ransac"]["patience"] = 40
 
     caplog.set_level(logging.DEBUG, "pdfsvg_calibrator")
 
@@ -213,7 +213,7 @@ def test_ransac_early_stop_large_scene(caplog):
     abort_logged = False
     for record in caplog.records:
         message = record.getMessage()
-        if "Abbruch" in message and "max_no_improve" in message:
+        if "Abbruch" in message and "patience" in message:
             abort_logged = True
         if "[calib] rot=0 fertig" in message and "Iterationen" in message:
             iter_log = message
@@ -225,7 +225,7 @@ def test_ransac_early_stop_large_scene(caplog):
     executed_iters = int(match.group(1))
 
     assert executed_iters < cfg["ransac"]["iters"]
-    assert abort_logged, "RANSAC sollte vorzeitig wegen max_no_improve abbrechen"
+    assert abort_logged, "RANSAC sollte vorzeitig wegen patience abbrechen"
 
     assert model.score > 0.0
 
@@ -240,8 +240,7 @@ def test_prefilter_diagonal_reference_logged(caplog):
     cfg["min_seg_length_rel"] = 0.1
     cfg["prefilter"] = {"len_rel_ref": "diagonal"}
     cfg["ransac"]["iters"] = 120
-    cfg["ransac"]["max_no_improve"] = 40
-    cfg["sampling"]["max_points"] = 1500
+    cfg["ransac"]["patience"] = 40
 
     caplog.set_level(logging.DEBUG, "pdfsvg_calibrator")
 
