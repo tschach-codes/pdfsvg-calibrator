@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import re
+import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -9,6 +11,9 @@ import numpy as np
 from lxml import etree as ET
 
 from .types import Segment
+
+
+log = logging.getLogger(__name__)
 
 
 _FLOAT_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?")
@@ -573,6 +578,149 @@ def _add_segments_from_polyline(points: List[Tuple[float, float]], diag: float, 
         segments.append(Segment(a[0], a[1], b[0], b[1]))
 
 
+def _segment_length(seg: Segment) -> float:
+    return float(math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1))
+
+
+def _segment_angle(seg: Segment) -> Optional[float]:
+    length = _segment_length(seg)
+    if length <= 1e-9:
+        return None
+    angle = math.degrees(math.atan2(seg.y2 - seg.y1, seg.x2 - seg.x1)) % 180.0
+    if angle < 0:
+        angle += 180.0
+    return float(angle)
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    diff = abs(a - b) % 180.0
+    if diff > 90.0:
+        diff = 180.0 - diff
+    return float(diff)
+
+
+def _point_line_distance(pt: Tuple[float, float], start: Tuple[float, float], end: Tuple[float, float]) -> float:
+    x0, y0 = pt
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    denom = math.hypot(dx, dy)
+    if denom <= 1e-12:
+        return math.hypot(x0 - x1, y0 - y1)
+    return abs((x0 - x1) * dy - (y0 - y1) * dx) / denom
+
+
+def _max_perpendicular_offset(a: Segment, b: Segment) -> float:
+    start = (a.x1, a.y1)
+    end = (a.x2, a.y2)
+    offsets = [
+        _point_line_distance((b.x1, b.y1), start, end),
+        _point_line_distance((b.x2, b.y2), start, end),
+    ]
+    return float(max(offsets))
+
+
+def _merge_collinear_segments(segments: List[Segment], diag: float, cfg: dict) -> List[Segment]:
+    merge_cfg = cfg.get("merge") or {}
+    if not merge_cfg.get("enable", False):
+        return segments
+
+    if len(segments) < 2:
+        return segments
+
+    angle_tol = float(merge_cfg.get("collinear_angle_tol_deg", 3.0))
+    gap_tol = float(merge_cfg.get("gap_max_rel", 0.003)) * diag
+    offset_tol = float(merge_cfg.get("offset_tol_rel", 0.002)) * diag
+
+    angles: List[Optional[float]] = []
+    for seg in segments:
+        angles.append(_segment_angle(seg))
+
+    bucket_size = max(gap_tol, 1e-6)
+
+    parent = list(range(len(segments)))
+    rank = [0] * len(segments)
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri = find(i)
+        rj = find(j)
+        if ri == rj:
+            return
+        if rank[ri] < rank[rj]:
+            parent[ri] = rj
+        elif rank[ri] > rank[rj]:
+            parent[rj] = ri
+        else:
+            parent[rj] = ri
+            rank[ri] += 1
+
+    buckets: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = defaultdict(list)
+
+    for idx, seg in enumerate(segments):
+        endpoints = ((seg.x1, seg.y1), (seg.x2, seg.y2))
+        for x, y in endpoints:
+            cell = (int(round(x / bucket_size)), int(round(y / bucket_size)))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    candidates = buckets.get((cell[0] + dx, cell[1] + dy))
+                    if not candidates:
+                        continue
+                    for other_idx, ox, oy in candidates:
+                        if other_idx == idx:
+                            continue
+                        ang_a = angles[idx]
+                        ang_b = angles[other_idx]
+                        if ang_a is None or ang_b is None:
+                            continue
+                        if _angle_diff_deg(ang_a, ang_b) > angle_tol:
+                            continue
+                        if math.hypot(x - ox, y - oy) > gap_tol:
+                            continue
+                        offset = max(
+                            _max_perpendicular_offset(seg, segments[other_idx]),
+                            _max_perpendicular_offset(segments[other_idx], seg),
+                        )
+                        if offset > offset_tol:
+                            continue
+                        union(idx, other_idx)
+            buckets[cell].append((idx, x, y))
+
+    components: Dict[int, List[int]] = defaultdict(list)
+    for idx in range(len(segments)):
+        components[find(idx)].append(idx)
+
+    merged: List[Segment] = []
+    for _, comp in sorted(components.items(), key=lambda item: min(item[1])):
+        if len(comp) == 1:
+            merged.append(segments[comp[0]])
+            continue
+
+        points: List[Tuple[float, float]] = []
+        for idx in comp:
+            seg = segments[idx]
+            points.append((seg.x1, seg.y1))
+            points.append((seg.x2, seg.y2))
+
+        fit = _fit_polyline(points)
+        if fit and fit.segment and fit.delta_max <= offset_tol:
+            seg_fit = fit.segment
+            if _segment_length(seg_fit) > 1e-9:
+                merged.append(seg_fit)
+                continue
+
+        for idx in comp:
+            merged.append(segments[idx])
+
+    return merged
+
+
 def _extract_viewbox_matrix(node: ET.Element) -> np.ndarray:
     view_box = node.get("viewBox")
     width = _parse_length(node.get("width"))
@@ -726,7 +874,28 @@ def parse_svg_segments(svg_path: str, cfg: dict) -> List[Segment]:
     for child in root:
         process_node(child, root_matrix)
 
-    return segments
+    merged = _merge_collinear_segments(segments, diag, cfg)
+    merge_cfg = cfg.get("merge") or {}
+    if merge_cfg.get("enable", False):
+        before = len(segments)
+        after = len(merged)
+        if before == 0:
+            percent_str = "0%"
+        else:
+            percent = ((after - before) / before) * 100.0
+            if abs(percent) < 0.05:
+                percent_str = "0%"
+            else:
+                sign = "-" if percent < 0 else "+"
+                percent_str = f"{sign}{abs(percent):.0f}%"
+        log.info(
+            "SVG segments: %s → %s after merge (%s)",
+            f"{before:,}",
+            f"{after:,}",
+            percent_str,
+        )
+
+    return merged
 
 
 __all__ = ["parse_svg_segments", "_fit_polyline", "LineFit"]
