@@ -342,6 +342,7 @@ def _summarize(
 
     warnings: List[str] = list(line_info.get("notes", []))
     warnings.extend(extra_warnings)
+    warnings.extend(model.quality_notes)
 
     if logger.console is not None:
         logger.console.rule("Calibration Summary")

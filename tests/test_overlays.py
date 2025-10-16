@@ -192,10 +192,11 @@ def test_write_report_csv(sample_pdf: Path, tmp_path: Path) -> None:
             "ty",
             "score",
             "rmse",
-            "p95",
-            "median",
-            "id",
-            "axis",
+        "p95",
+        "median",
+        "calibration_notes",
+        "id",
+        "axis",
             "pdf_len",
             "svg_len",
             "ratio",
@@ -207,6 +208,8 @@ def test_write_report_csv(sample_pdf: Path, tmp_path: Path) -> None:
         ]
         rows = list(reader)
     assert len(rows) == 5
+
+    assert all(row["calibration_notes"] == "" for row in rows)
 
     row1 = next(row for row in rows if row["id"] == "1")
     assert pytest.approx(float(row1["ratio"])) == 1.1
