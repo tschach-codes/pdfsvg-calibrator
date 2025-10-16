@@ -5,7 +5,7 @@ from typing import List, Sequence, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from pdfsvg_calibrator.fit_model import calibrate
+from pdfsvg_calibrator.fit_model import calibrate, _filter_by_length
 from pdfsvg_calibrator.types import Segment
 
 
@@ -134,3 +134,26 @@ def test_calibrate_affine_with_rotation_180():
     model = calibrate(pdf_segments, svg_segments, pdf_size, svg_size, cfg)
 
     _assert_model_close(model, true_params, cfg, svg_size)
+
+
+def test_filter_by_length_uses_absolute_threshold():
+    segs = [
+        Segment(x1=0.0, y1=0.0, x2=30.0, y2=0.0),  # long enough
+        Segment(x1=0.0, y1=10.0, x2=15.0, y2=10.0),  # too short
+        Segment(x1=0.0, y1=20.0, x2=0.0, y2=45.0),  # long enough vertical
+    ]
+
+    filtered = _filter_by_length(segs, min_length=20.0)
+
+    assert filtered == [segs[0], segs[2]]
+
+
+def test_filter_by_length_keeps_original_for_zero_threshold():
+    segs = [
+        Segment(x1=0.0, y1=0.0, x2=5.0, y2=0.0),
+        Segment(x1=0.0, y1=5.0, x2=0.0, y2=9.0),
+    ]
+
+    filtered = _filter_by_length(segs, min_length=0.0)
+
+    assert filtered == segs
