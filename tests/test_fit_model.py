@@ -5,6 +5,8 @@ import re
 import sys
 from typing import List, Sequence, Tuple
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pdfsvg_calibrator.fit_model import calibrate, _filter_by_length
@@ -226,3 +228,50 @@ def test_ransac_early_stop_large_scene(caplog):
     assert abort_logged, "RANSAC sollte vorzeitig wegen max_no_improve abbrechen"
 
     assert model.score > 0.0
+
+
+def test_prefilter_diagonal_reference_logged(caplog):
+    pdf_size = (420.0, 594.0)
+    pdf_segments = _base_segments(*pdf_size)
+    svg_segments = _transform_segments(pdf_segments, pdf_size, rot_deg=0, sx=1.0, sy=1.0, tx=0.0, ty=0.0)
+    svg_size = pdf_size
+
+    cfg = _config([0], seed=101)
+    cfg["min_seg_length_rel"] = 0.1
+    cfg["prefilter"] = {"len_rel_ref": "diagonal"}
+    cfg["ransac"]["iters"] = 120
+    cfg["ransac"]["max_no_improve"] = 40
+    cfg["sampling"]["max_points"] = 1500
+
+    caplog.set_level(logging.DEBUG, "pdfsvg_calibrator")
+
+    model = calibrate(pdf_segments, svg_segments, pdf_size, svg_size, cfg)
+
+    assert model.score > 0.0
+
+    diag = math.hypot(*pdf_size)
+    expected_cut = cfg["min_seg_length_rel"] * diag
+
+    segment_log = None
+    for record in caplog.records:
+        message = record.getMessage()
+        if "Segmentlängenfilter" in message:
+            segment_log = message
+            break
+
+    assert segment_log is not None, "Segmentlängenfilter-Logeintrag nicht gefunden"
+    assert "ref=diagonal" in segment_log
+    assert f"pdf>={expected_cut:.3f}px" in segment_log
+
+
+def test_prefilter_invalid_reference_raises():
+    pdf_size = (200.0, 150.0)
+    pdf_segments = _base_segments(*pdf_size)
+    svg_segments = _transform_segments(pdf_segments, pdf_size, rot_deg=0, sx=1.0, sy=1.0, tx=0.0, ty=0.0)
+    svg_size = pdf_size
+
+    cfg = _config([0], seed=77)
+    cfg["prefilter"] = {"len_rel_ref": "bogus"}
+
+    with pytest.raises(ValueError, match="prefilter.len_rel_ref"):
+        calibrate(pdf_segments, svg_segments, pdf_size, svg_size, cfg)

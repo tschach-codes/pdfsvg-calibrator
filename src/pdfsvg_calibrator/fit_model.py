@@ -273,13 +273,20 @@ def calibrate(
     if prefilter_cfg and not isinstance(prefilter_cfg, dict):
         raise ValueError("prefilter config muss ein Mapping sein")
     min_len_rel = float(cfg.get("min_seg_length_rel", 0.0))
+
     ref_choice = "width"
     if isinstance(prefilter_cfg, dict):
         ref_choice = str(prefilter_cfg.get("len_rel_ref", "width")).lower()
-    pdf_width = pdf_size[0]
-    pdf_height = pdf_size[1]
-    svg_width = svg_size[0]
-    svg_height = svg_size[1]
+
+    valid_refs = {"width", "height", "diagonal"}
+    if ref_choice not in valid_refs:
+        raise ValueError(
+            "prefilter.len_rel_ref muss 'width', 'height' oder 'diagonal' sein"
+        )
+
+    pdf_width, pdf_height = pdf_size
+    svg_width, svg_height = svg_size
+
     if ref_choice == "diagonal":
         pdf_ref = diag_pdf
         svg_ref = diag_svg
@@ -307,7 +314,8 @@ def calibrate(
     filter_duration = perf_counter() - filter_start
 
     log.debug(
-        "[calib] Segmentlängenfilter: rel=%.4f → pdf>=%.3f (%d/%d), svg>=%.3f (%d/%d) in %.3fs",
+        "[calib] Segmentlängenfilter (ref=%s): rel=%.4f → pdf>=%.3fpx (%d/%d), svg>=%.3fpx (%d/%d) in %.3fs",
+        ref_choice,
         min_len_rel,
         pdf_min_len,
         len(pdf_segs),
