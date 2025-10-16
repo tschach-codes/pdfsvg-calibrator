@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import logging
 import math
 import sys
 import traceback
@@ -147,6 +148,23 @@ class Logger:
         if self.console is not None:
             return self.console.status(message)
         return _PlainStatus(self, message)
+
+
+class _LoggingBridge(logging.Handler):
+    def __init__(self, cli_logger: Logger, level: int) -> None:
+        super().__init__(level)
+        self._cli_logger = cli_logger
+
+    def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
+        msg = self.format(record)
+        if record.levelno >= logging.ERROR:
+            self._cli_logger.error(msg)
+        elif record.levelno >= logging.WARNING:
+            self._cli_logger.warn(msg)
+        elif record.levelno >= logging.INFO:
+            self._cli_logger.info(msg)
+        else:
+            self._cli_logger.debug(msg)
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
@@ -361,6 +379,17 @@ def run(
     rng_seed: Optional[int] = typer.Option(None, "--rng-seed", help="Zufalls-Seed überschreiben"),
 ) -> None:
     logger = Logger(verbose=verbose)
+
+    log_level = logging.DEBUG if verbose else logging.INFO
+    package_logger = logging.getLogger("pdfsvg_calibrator")
+    package_logger.setLevel(log_level)
+    package_logger.propagate = False
+    for handler in list(package_logger.handlers):
+        if isinstance(handler, _LoggingBridge):
+            package_logger.removeHandler(handler)
+    bridge = _LoggingBridge(logger, log_level)
+    bridge.setFormatter(logging.Formatter("%(message)s"))
+    package_logger.addHandler(bridge)
 
     try:
         logger.step("Konfiguration laden")
