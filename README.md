@@ -23,7 +23,7 @@
      ```
 
 ## 60-Sekunden-Schnellstart
-1. **PDF bereitstellen** – Legen Sie Ihre Zeichnung oder Ihren Plan als einzelne PDF-Datei ab. Exportieren Sie (falls nicht vorhanden) eine vektorbasierte SVG der gleichen Seite in denselben Ordner.
+1. **PDF bereitstellen** – Legen Sie Ihre Zeichnung oder Ihren Plan als einzelne PDF-Datei ab. Ohne `--svg` exportiert das Tool die gewählte Seite automatisch als SVG nach `--outdir`.
 2. **Befehl ausführen** – Ersetzen Sie die Platzhalter und starten Sie den Lauf:
    ```bash
    pdfsvg-calibrate run plan.pdf --page 0 --outdir out
@@ -37,6 +37,7 @@
 ### Was zeigt die Konsole?
 Nach einem erfolgreichen Lauf erscheint eine Zusammenfassung mit:
 - Modellparametern (`rot`, `sx`, `sy`, `tx`, `ty`), erkannte Spiegelungen und Qualitätskennzahlen (Score, RMSE, P95, Median).
+- Einer zusätzlichen Zeile mit dem Gesamtoffset `|t|` und einem tolerierten Grenzwert sowie dem mittleren Skalierungsfaktor.
 - Einer 5-zeiligen Tabelle: ID, Achse (H/V), Längen, Verhältnis, relativer Fehler, PASS/FAIL-Flag (`Pass01`), Vertrauenswert und Hinweise (z. B. „no match“).
 - Einer Liste der erzeugten Dateien (`SVG`, `PDF`, `CSV`) sowie etwaiger Warnungen (z. B. zu wenig Segmente).
 
@@ -46,7 +47,7 @@ Nach einem erfolgreichen Lauf erscheint eine Zusammenfassung mit:
 - `*_check.csv` – Kann in Excel geöffnet werden; enthält Modellwerte (Zeile 1) und darunter pro Linie ID, Achse, Längen, Verhältnis, relativer Fehler, PASS/FAIL und Confidence.
 
 ## Troubleshooting
-- **SVG wird als Raster erkannt** – Stellen Sie sicher, dass Ihr Export vektorbasiert ist. In Illustrator/Inkscape Exportoption „Text/Objekte beibehalten“ verwenden. Raster-SVGs enthalten keine Linien und führen zu „SVG enthält keine Vektoren“.
+- **Keine Vektoren gefunden** – Enthält die PDF-Seite nur Rastergrafiken, erzeugt der automatische Export zwar eine SVG-Datei, die Analyse findet jedoch keine Linien und bricht mit „SVG enthält keine Vektoren“ ab.
 - **„Zu wenig Segmente“** – Erhöhen Sie die Zeichnungsqualität oder lockern Sie `straight_max_dev_rel`/`angle_tol_deg` in der Konfiguration, damit mehr Linien zugelassen werden. Alternativ prüfen Sie, ob im PDF Linien wirklich exakt horizontal/vertikal sind.
 - **180°-Rotation** – Das Tool testet 0° und 180°. Wenn das Ergebnis gespiegelt wirkt, aktivieren Sie weitere Rotationen über `rot_degrees` (z. B. `[0, 90, 180, 270]`).
 - **Y-Achse wirkt vertauscht** – Negative Skalen (`sx < 0`/`sy < 0`) werden als „flip“ in der Zusammenfassung gemeldet. Passen Sie ggf. die SVG-Export-Einstellungen (z. B. Ursprung oben links) an.

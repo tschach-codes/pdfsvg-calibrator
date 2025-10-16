@@ -315,15 +315,29 @@ def load_pdf_segments(
 def convert_pdf_to_svg_if_needed(
     pdf_path: str, page_index: int, outdir: str
 ) -> str:
+    """Export a PDF page to SVG via PyMuPDF if no explicit SVG was provided."""
+
     base = os.path.splitext(os.path.basename(pdf_path))[0]
     svg_out = os.path.join(outdir, f"{base}_p{page_index:03d}.svg")
     os.makedirs(outdir, exist_ok=True)
-    if not os.path.exists(svg_out):
-        raise FileNotFoundError(
-            "No SVG found. Please export a vector SVG to:\n"
-            f"  {svg_out}\n"
-            "Hook an external converter if desired."
-        )
+
+    doc = fitz.open(pdf_path)
+    try:
+        if page_index < 0 or page_index >= doc.page_count:
+            raise ValueError(
+                f"Seite {page_index} existiert nicht (gültig: 0..{doc.page_count - 1})."
+            )
+        page = doc.load_page(page_index)
+        height = page.rect.height
+        matrix = fitz.Matrix(1, -1)
+        matrix.pretranslate(0, -height)
+        svg_xml = page.get_svg_image(matrix=matrix, text_as_path=False)
+    finally:
+        doc.close()
+
+    with open(svg_out, "w", encoding="utf-8") as fh:
+        fh.write(svg_xml)
+
     return svg_out
 
 
