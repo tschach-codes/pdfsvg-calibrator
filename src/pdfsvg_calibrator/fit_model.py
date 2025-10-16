@@ -24,6 +24,7 @@ class SegGrid:
     max_x: float
     max_y: float
     cells: Dict[Tuple[int, int], List[Segment]]
+    avg_segments_per_cell: float
 
     def query(self, x: float, y: float) -> Sequence[Segment]:
         if not self.cells:
@@ -49,17 +50,55 @@ def build_seg_grid(svg_segs: Sequence[Segment], cell_size: float) -> SegGrid:
     max_x = max(max(seg.x1, seg.x2) for seg in svg_segs)
     min_y = min(min(seg.y1, seg.y2) for seg in svg_segs)
     max_y = max(max(seg.y1, seg.y2) for seg in svg_segs)
+    width = max_x - min_x
+    height = max_y - min_y
+
+    def populate(size: float) -> Dict[Tuple[int, int], List[Segment]]:
+        inv = 1.0 / size
+        grid_cells: Dict[Tuple[int, int], List[Segment]] = {}
+        for seg in svg_segs:
+            sx0 = math.floor((min(seg.x1, seg.x2) - min_x) * inv)
+            sx1 = math.floor((max(seg.x1, seg.x2) - min_x) * inv)
+            sy0 = math.floor((min(seg.y1, seg.y2) - min_y) * inv)
+            sy1 = math.floor((max(seg.y1, seg.y2) - min_y) * inv)
+            for ix in range(int(sx0), int(sx1) + 1):
+                for iy in range(int(sy0), int(sy1) + 1):
+                    grid_cells.setdefault((ix, iy), []).append(seg)
+        return grid_cells
+
+    max_attempts = 6
+    target_avg = 40.0
+    min_cell_size = max(width, height) / 2048.0 if max(width, height) > 0 else cell_size
+    avg_segments = 0.0
     cells: Dict[Tuple[int, int], List[Segment]] = {}
-    inv = 1.0 / cell_size
-    for seg in svg_segs:
-        sx0 = math.floor((min(seg.x1, seg.x2) - min_x) * inv)
-        sx1 = math.floor((max(seg.x1, seg.x2) - min_x) * inv)
-        sy0 = math.floor((min(seg.y1, seg.y2) - min_y) * inv)
-        sy1 = math.floor((max(seg.y1, seg.y2) - min_y) * inv)
-        for ix in range(int(sx0), int(sx1) + 1):
-            for iy in range(int(sy0), int(sy1) + 1):
-                cells.setdefault((ix, iy), []).append(seg)
-    return SegGrid(cell_size=cell_size, min_x=min_x, min_y=min_y, max_x=max_x, max_y=max_y, cells=cells)
+
+    for attempt in range(max_attempts):
+        cells = populate(cell_size)
+        cell_count = len(cells)
+        if cell_count:
+            avg_segments = sum(len(v) for v in cells.values()) / cell_count
+        else:
+            avg_segments = 0.0
+        log.debug(
+            "[calib] Chamfer-Grid Versuch %d: cell=%.3f, Zellen=%d, Ø %.1f Segmente/Zelle",
+            attempt + 1,
+            cell_size,
+            cell_count,
+            avg_segments,
+        )
+        if avg_segments <= target_avg or cell_size <= min_cell_size:
+            break
+        cell_size *= 0.5
+
+    return SegGrid(
+        cell_size=cell_size,
+        min_x=min_x,
+        min_y=min_y,
+        max_x=max_x,
+        max_y=max_y,
+        cells=cells,
+        avg_segments_per_cell=avg_segments,
+    )
 
 
 def _segment_length(seg: Segment) -> float:
@@ -211,10 +250,11 @@ def calibrate(
     svg_grid = build_seg_grid(svg_segs, grid_cell)
     grid_duration = perf_counter() - grid_start
     log.debug(
-        "[calib] Chamfer-Grid gebaut: cell=%.3f (%d Segmente, %d Rasterzellen) in %.3fs",
-        grid_cell,
+        "[calib] Chamfer-Grid gebaut: cell=%.3f (%d Segmente, %d Rasterzellen, Ø %.1f Segmente/Zelle) in %.3fs",
+        svg_grid.cell_size,
         len(svg_segs),
         len(svg_grid.cells),
+        svg_grid.avg_segments_per_cell,
         grid_duration,
     )
 
