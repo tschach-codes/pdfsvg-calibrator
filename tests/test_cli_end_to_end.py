@@ -74,18 +74,28 @@ def _run_cli(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 def _write_config(path: Path, extra: str = "") -> None:
     base = textwrap.dedent(
         """
+        orientation:
+          enabled: false
         rot_degrees: [0]
         angle_tol_deg: 6.0
         curve_tol_rel: 0.001
         straight_max_dev_rel: 0.0015
         straight_max_angle_spread_deg: 3.0
         merge:
+          enable: true
           gap_max_rel: 0.01
-          off_tol_rel: 0.003
-        grid_cell_rel: 0.02
+          offset_tol_rel: 0.003
+        grid:
+          initial_cell_rel: 0.02
+          final_cell_rel: 0.02
         chamfer:
           sigma_rel: 0.004
           hard_mul: 3.0
+        refine:
+          max_iters: 60
+          max_samples: 1500
+          scale_max_dev_rel: 0.02
+          trans_max_dev_px: 8.0
         ransac:
           iters: 60
           refine_scale_step: 0.002
