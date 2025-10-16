@@ -71,7 +71,12 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
         "scale_max_dev_rel": 0.02,
         "trans_max_dev_px": 10.0,
     },
-    "ransac": {"iters": 120, "refine_scale_step": 0.004, "refine_trans_px": 3.0},
+    "ransac": {
+        "iters": 120,
+        "refine_scale_step": 0.004,
+        "refine_trans_px": 3.0,
+        "patience": 60,
+    },
     "verify": {
         "pick_k": 5,
         "diversity_rel": 0.10,
@@ -95,7 +100,7 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
         "direction": 0.2,
         "neighbors": 0.1,
     },
-    "sampling": {"step_rel": 0.02, "max_points": 5000},
+    "sampling": {"step_rel": 0.03, "max_points": 1500},
 }
 
 
