@@ -90,3 +90,32 @@ def test_select_lines_support_prefers_stronger_matches():
     assert unsupported not in selected
     assert info["had_enough_V"] is False
     assert any("vertical" in note.lower() for note in info["notes"])
+
+
+def test_select_lines_prefilter_limits_scoring():
+    horizontals = [
+        Segment(0.0, float(idx) * 20.0, length, float(idx) * 20.0)
+        for idx, length in enumerate((120.0, 160.0, 200.0, 240.0, 280.0, 320.0))
+    ]
+    verticals = [
+        Segment(float(idx) * 20.0, 0.0, float(idx) * 20.0, length)
+        for idx, length in enumerate((120.0, 160.0, 200.0, 240.0, 280.0, 320.0))
+    ]
+    pdf_segments = horizontals + verticals
+    svg_segments = [Segment(s.x1, s.y1, s.x2, s.y2) for s in pdf_segments]
+
+    cfg = _base_cfg()
+    cfg["verify"]["pick_k"] = 3
+    cfg["verify"]["max_candidates_per_axis"] = 3
+    cfg["rng_seed"] = 1234
+
+    selected, info = select_lines(pdf_segments, _model(), svg_segments, cfg)
+
+    assert len(selected) == 3
+    assert info["scored_candidates"] == {"H": 3, "V": 3}
+    assert info["prefilter_dropped"] == {"H": 3, "V": 3}
+    # Ensure the selected segments respect the requested pick count and contain
+    # candidates from both axes after the prefiltering.
+    h_sel, v_sel = classify_hv(selected)
+    assert len(h_sel) >= 1
+    assert len(v_sel) >= 1
