@@ -8,6 +8,7 @@ from typing import Iterable, Sequence, Tuple
 import numpy as np
 
 from .types import Segment
+from .metrics import Timer
 
 log = logging.getLogger(__name__)
 
@@ -108,56 +109,57 @@ def rasterize_segments(
 ) -> np.ndarray:
     """Rasterize segments into a float32 mask using anti-aliased drawing."""
 
-    width, height = _ensure_size_tuple(size)
-    img = np.zeros((height, width), dtype=np.float32)
-    seg_arr = _segments_to_array(segments)
-    if seg_arr.size == 0:
+    with Timer("orientation.rasterize"):
+        width, height = _ensure_size_tuple(size)
+        img = np.zeros((height, width), dtype=np.float32)
+        seg_arr = _segments_to_array(segments)
+        if seg_arr.size == 0:
+            return img
+
+        xs = seg_arr[:, [0, 2]]
+        ys = seg_arr[:, [1, 3]]
+        min_x = float(xs.min())
+        max_x = float(xs.max())
+        min_y = float(ys.min())
+        max_y = float(ys.max())
+        span_x = max(max_x - min_x, 1e-9)
+        span_y = max(max_y - min_y, 1e-9)
+
+        norm = seg_arr.copy()
+        norm[:, [0, 2]] = (norm[:, [0, 2]] - min_x) / span_x
+        norm[:, [1, 3]] = (norm[:, [1, 3]] - min_y) / span_y
+        norm = np.clip(norm, 0.0, 1.0)
+        norm = _apply_flip_and_rotation(norm, flip, rot_deg)
+
+        for x1, y1, x2, y2 in norm:
+            length = math.hypot((x2 - x1) * width, (y2 - y1) * height)
+            samples = max(int(length * 3), 1)
+            ts = np.linspace(0.0, 1.0, samples, dtype=np.float64)
+            xs_line = x1 + (x2 - x1) * ts
+            ys_line = y1 + (y2 - y1) * ts
+            xs_line = np.clip(xs_line, 0.0, 1.0)
+            ys_line = np.clip(ys_line, 0.0, 1.0)
+            px = xs_line * (width - 1)
+            py = ys_line * (height - 1)
+            ix0 = np.floor(px).astype(int)
+            iy0 = np.floor(py).astype(int)
+            ix1 = np.clip(ix0 + 1, 0, width - 1)
+            iy1 = np.clip(iy0 + 1, 0, height - 1)
+            dx = px - ix0
+            dy = py - iy0
+
+            w00 = (1.0 - dx) * (1.0 - dy)
+            w10 = dx * (1.0 - dy)
+            w01 = (1.0 - dx) * dy
+            w11 = dx * dy
+
+            np.add.at(img, (iy0, ix0), w00)
+            np.add.at(img, (iy0, ix1), w10)
+            np.add.at(img, (iy1, ix0), w01)
+            np.add.at(img, (iy1, ix1), w11)
+
+        np.clip(img, 0.0, 1.0, out=img)
         return img
-
-    xs = seg_arr[:, [0, 2]]
-    ys = seg_arr[:, [1, 3]]
-    min_x = float(xs.min())
-    max_x = float(xs.max())
-    min_y = float(ys.min())
-    max_y = float(ys.max())
-    span_x = max(max_x - min_x, 1e-9)
-    span_y = max(max_y - min_y, 1e-9)
-
-    norm = seg_arr.copy()
-    norm[:, [0, 2]] = (norm[:, [0, 2]] - min_x) / span_x
-    norm[:, [1, 3]] = (norm[:, [1, 3]] - min_y) / span_y
-    norm = np.clip(norm, 0.0, 1.0)
-    norm = _apply_flip_and_rotation(norm, flip, rot_deg)
-
-    for x1, y1, x2, y2 in norm:
-        length = math.hypot((x2 - x1) * width, (y2 - y1) * height)
-        samples = max(int(length * 3), 1)
-        ts = np.linspace(0.0, 1.0, samples, dtype=np.float64)
-        xs_line = x1 + (x2 - x1) * ts
-        ys_line = y1 + (y2 - y1) * ts
-        xs_line = np.clip(xs_line, 0.0, 1.0)
-        ys_line = np.clip(ys_line, 0.0, 1.0)
-        px = xs_line * (width - 1)
-        py = ys_line * (height - 1)
-        ix0 = np.floor(px).astype(int)
-        iy0 = np.floor(py).astype(int)
-        ix1 = np.clip(ix0 + 1, 0, width - 1)
-        iy1 = np.clip(iy0 + 1, 0, height - 1)
-        dx = px - ix0
-        dy = py - iy0
-
-        w00 = (1.0 - dx) * (1.0 - dy)
-        w10 = dx * (1.0 - dy)
-        w01 = (1.0 - dx) * dy
-        w11 = dx * dy
-
-        np.add.at(img, (iy0, ix0), w00)
-        np.add.at(img, (iy0, ix1), w10)
-        np.add.at(img, (iy1, ix0), w01)
-        np.add.at(img, (iy1, ix1), w11)
-
-    np.clip(img, 0.0, 1.0, out=img)
-    return img
 
 
 def _parabolic_offset(f_m1: float, f_0: float, f_p1: float) -> float:
@@ -170,50 +172,51 @@ def _parabolic_offset(f_m1: float, f_0: float, f_p1: float) -> float:
 def phase_correlation(img_a: np.ndarray, img_b: np.ndarray) -> Tuple[float, float, float]:
     """Return (dx, dy, response) using FFT-based phase correlation."""
 
-    if img_a.shape != img_b.shape:
-        raise ValueError("images must share the same shape")
-    if img_a.ndim != 2:
-        raise ValueError("images must be 2-D arrays")
+    with Timer("orientation.phase"):
+        if img_a.shape != img_b.shape:
+            raise ValueError("images must share the same shape")
+        if img_a.ndim != 2:
+            raise ValueError("images must be 2-D arrays")
 
-    fa = np.fft.fft2(img_a)
-    fb = np.fft.fft2(img_b)
-    product = fa * np.conj(fb)
-    magnitude = np.abs(product)
-    magnitude[magnitude == 0.0] = 1.0
-    cross_power = product / magnitude
-    corr = np.fft.ifft2(cross_power)
-    corr_mag = np.abs(corr)
-    peak_index = np.unravel_index(np.argmax(corr_mag), corr_mag.shape)
-    peak_value = float(corr_mag[peak_index])
+        fa = np.fft.fft2(img_a)
+        fb = np.fft.fft2(img_b)
+        product = fa * np.conj(fb)
+        magnitude = np.abs(product)
+        magnitude[magnitude == 0.0] = 1.0
+        cross_power = product / magnitude
+        corr = np.fft.ifft2(cross_power)
+        corr_mag = np.abs(corr)
+        peak_index = np.unravel_index(np.argmax(corr_mag), corr_mag.shape)
+        peak_value = float(corr_mag[peak_index])
 
-    height, width = img_a.shape
-    py, px = peak_index
+        height, width = img_a.shape
+        py, px = peak_index
 
-    px_m1 = (px - 1) % width
-    px_p1 = (px + 1) % width
-    py_m1 = (py - 1) % height
-    py_p1 = (py + 1) % height
+        px_m1 = (px - 1) % width
+        px_p1 = (px + 1) % width
+        py_m1 = (py - 1) % height
+        py_p1 = (py + 1) % height
 
-    offset_x = _parabolic_offset(
-        float(corr_mag[py, px_m1]),
-        float(corr_mag[py, px]),
-        float(corr_mag[py, px_p1]),
-    )
-    offset_y = _parabolic_offset(
-        float(corr_mag[py_m1, px]),
-        float(corr_mag[py, px]),
-        float(corr_mag[py_p1, px]),
-    )
+        offset_x = _parabolic_offset(
+            float(corr_mag[py, px_m1]),
+            float(corr_mag[py, px]),
+            float(corr_mag[py, px_p1]),
+        )
+        offset_y = _parabolic_offset(
+            float(corr_mag[py_m1, px]),
+            float(corr_mag[py, px]),
+            float(corr_mag[py_p1, px]),
+        )
 
-    shift_x = float(px + offset_x)
-    shift_y = float(py + offset_y)
+        shift_x = float(px + offset_x)
+        shift_y = float(py + offset_y)
 
-    if shift_x > width / 2.0:
-        shift_x -= width
-    if shift_y > height / 2.0:
-        shift_y -= height
+        if shift_x > width / 2.0:
+            shift_x -= width
+        if shift_y > height / 2.0:
+            shift_y -= height
 
-    return shift_x, shift_y, peak_value
+        return shift_x, shift_y, peak_value
 
 
 def _fourier_shift(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
@@ -246,53 +249,54 @@ def pick_flip_and_rot(
     if not svg_segments:
         raise ValueError("SVG segments are required")
 
-    pdf_norm = _augment_with_unit_frame(
-        _segments_to_array(list(_normalize_segments(pdf_segments, page_size_pdf)))
-    )
-    svg_norm = _augment_with_unit_frame(
-        _segments_to_array(list(_normalize_segments(svg_segments, page_size_svg)))
-    )
+    with Timer("orientation.total"):
+        pdf_norm = _augment_with_unit_frame(
+            _segments_to_array(list(_normalize_segments(pdf_segments, page_size_pdf)))
+        )
+        svg_norm = _augment_with_unit_frame(
+            _segments_to_array(list(_normalize_segments(svg_segments, page_size_svg)))
+        )
 
-    raster_size = DEFAULT_RASTER_SIZE
-    pdf_image = rasterize_segments(pdf_norm, raster_size, (1.0, 1.0), 0)
+        raster_size = DEFAULT_RASTER_SIZE
+        pdf_image = rasterize_segments(pdf_norm, raster_size, (1.0, 1.0), 0)
 
-    best_score = -math.inf
-    best_flip = (1.0, 1.0)
-    best_rot = 0
-    best_shift = (0.0, 0.0)
+        best_score = -math.inf
+        best_flip = (1.0, 1.0)
+        best_rot = 0
+        best_shift = (0.0, 0.0)
 
-    for rot_deg in _ROTATIONS:
-        for flip in _FLIPS:
-            svg_image = rasterize_segments(svg_norm, raster_size, flip, rot_deg)
-            if DEFAULT_USE_PHASE_CORRELATION:
-                dx, dy, response = phase_correlation(pdf_image, svg_image)
-                shifted_svg = _fourier_shift(svg_image, -dx, -dy)
-                score = _normalized_overlap(pdf_image, shifted_svg) * response
-            else:
-                dx = dy = 0.0
-                score = _normalized_overlap(pdf_image, svg_image)
+        for rot_deg in _ROTATIONS:
+            for flip in _FLIPS:
+                svg_image = rasterize_segments(svg_norm, raster_size, flip, rot_deg)
+                if DEFAULT_USE_PHASE_CORRELATION:
+                    dx, dy, response = phase_correlation(pdf_image, svg_image)
+                    shifted_svg = _fourier_shift(svg_image, -dx, -dy)
+                    score = _normalized_overlap(pdf_image, shifted_svg) * response
+                else:
+                    dx = dy = 0.0
+                    score = _normalized_overlap(pdf_image, svg_image)
 
-            if score > best_score:
-                best_score = score
-                best_flip = flip
-                best_rot = rot_deg
-                best_shift = (dx, dy)
+                if score > best_score:
+                    best_score = score
+                    best_flip = flip
+                    best_rot = rot_deg
+                    best_shift = (dx, dy)
 
-    width, height = _ensure_size_tuple(raster_size)
-    oriented_width = page_size_svg[0] if best_rot % 180 == 0 else page_size_svg[1]
-    oriented_height = page_size_svg[1] if best_rot % 180 == 0 else page_size_svg[0]
-    dx_norm = best_shift[0] / float(max(width, 1))
-    dy_norm = best_shift[1] / float(max(height, 1))
-    tx0 = -dx_norm * oriented_width
-    ty0 = -dy_norm * oriented_height
+        width, height = _ensure_size_tuple(raster_size)
+        oriented_width = page_size_svg[0] if best_rot % 180 == 0 else page_size_svg[1]
+        oriented_height = page_size_svg[1] if best_rot % 180 == 0 else page_size_svg[0]
+        dx_norm = best_shift[0] / float(max(width, 1))
+        dy_norm = best_shift[1] / float(max(height, 1))
+        tx0 = -dx_norm * oriented_width
+        ty0 = -dy_norm * oriented_height
 
-    log.debug(
-        "[orient] best rot=%d flip=%s score=%.4f shift=(%.2f, %.2f)px",
-        best_rot,
-        best_flip,
-        best_score,
-        best_shift[0],
-        best_shift[1],
-    )
+        log.debug(
+            "[orient] best rot=%d flip=%s score=%.4f shift=(%.2f, %.2f)px",
+            best_rot,
+            best_flip,
+            best_score,
+            best_shift[0],
+            best_shift[1],
+        )
 
-    return best_flip, best_rot, tx0, ty0
+        return best_flip, best_rot, tx0, ty0
