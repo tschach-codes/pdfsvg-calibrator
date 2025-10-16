@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from .geom import classify_hv
 from .thirdparty.hungarian import solve as hungarian_solve
 from .types import Match, Model, Segment
 
+
+log = logging.getLogger(__name__)
 
 @dataclass
 class _SegmentInfo:
@@ -116,6 +118,12 @@ def _apply_model(model: Model, x: float, y: float) -> Tuple[float, float]:
     else:
         raise ValueError(f"Unsupported rotation: {model.rot_deg}")
     return model.sx * rx + model.tx, model.sy * ry + model.ty
+
+
+def _transform_segment(seg: Segment, model: Model) -> Segment:
+    x1, y1 = _apply_model(model, seg.x1, seg.y1)
+    x2, y2 = _apply_model(model, seg.x2, seg.y2)
+    return Segment(x1=x1, y1=y1, x2=x2, y2=y2)
 
 
 class SegmentGrid:
@@ -324,7 +332,7 @@ def candidate_cost(
 ) -> float:
     verify_cfg = cfg.get("verify", {})
     dir_tol_deg = float(verify_cfg.get("dir_tol_deg", 6.0))
-    radius = float(verify_cfg.get("radius_px", 1.0))
+    radius = float(verify_cfg.get("radius_px", 80.0))
     dir_term, within_tol = _direction_term(pdf_seg_T, svg_seg, dir_tol_deg)
     if not within_tol:
         return float("inf")
@@ -496,9 +504,24 @@ def select_lines(
     else:
         rng = None
 
-    h_segs, v_segs = classify_hv(
-        pdf_segs,
-        angle_tol_deg=verify_cfg.get("dir_tol_deg", cfg.get("angle_tol_deg", 6.0)),
+    angle_tol_deg = float(verify_cfg.get("angle_tol_deg", 4.0))
+    h_segs: List[Segment] = []
+    v_segs: List[Segment] = []
+    for seg in pdf_segs:
+        if _segment_length(seg) == 0:
+            continue
+        seg_T = _transform_segment(seg, model)
+        axis = _is_axis_aligned(seg_T, angle_tol_deg)
+        if axis == "H":
+            h_segs.append(seg)
+        elif axis == "V":
+            v_segs.append(seg)
+
+    log.debug(
+        "[verify] selection tol=%.2f° -> H=%d, V=%d",
+        angle_tol_deg,
+        len(h_segs),
+        len(v_segs),
     )
 
     max_candidates_per_axis = verify_cfg.get("max_candidates_per_axis")
@@ -652,7 +675,8 @@ def match_lines(
     cost_weights = cfg.get("cost_weights", {})
     dir_tol_deg = float(verify_cfg.get("dir_tol_deg", cfg.get("angle_tol_deg", 6.0)))
     tol_rel = float(verify_cfg.get("tol_rel", 0.01))
-    radius_px = float(verify_cfg.get("radius_px", 1.0))
+    radius_px = float(verify_cfg.get("radius_px", 80.0))
+    angle_tol_deg = float(verify_cfg.get("angle_tol_deg", 4.0))
     _, _, _, _, diag_svg = _bbox_and_diag(svg_segs)
     neighbor_radius = float(neighbors_cfg.get("radius_rel", 0.06)) * diag_svg
     if neighbor_radius <= 0:
@@ -668,14 +692,33 @@ def match_lines(
     pdf_infos = _prepare_segment_infos(
         transformed_pdf,
         neighbor_radius,
-        dir_tol_deg,
+        angle_tol_deg,
         use_grid=fast_signature,
     )
     svg_infos = _prepare_segment_infos(
         svg_segs,
         neighbor_radius,
-        dir_tol_deg,
+        angle_tol_deg,
         use_grid=fast_signature,
+    )
+
+    pdf_axis_counts = {
+        "H": sum(1 for info in pdf_infos if info.axis == "H"),
+        "V": sum(1 for info in pdf_infos if info.axis == "V"),
+    }
+    svg_axis_counts = {
+        "H": sum(1 for info in svg_infos if info.axis == "H"),
+        "V": sum(1 for info in svg_infos if info.axis == "V"),
+    }
+    log.debug(
+        "[verify] match tol=%.2f° dir_tol=%.2f° radius=%.1fpx -> PDF(H=%d, V=%d) SVG(H=%d, V=%d)",
+        angle_tol_deg,
+        dir_tol_deg,
+        radius_px,
+        pdf_axis_counts["H"],
+        pdf_axis_counts["V"],
+        svg_axis_counts["H"],
+        svg_axis_counts["V"],
     )
 
     svg_axis_map = {idx: info.axis for idx, info in enumerate(svg_infos)}
