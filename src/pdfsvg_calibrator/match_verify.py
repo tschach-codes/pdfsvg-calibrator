@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from statistics import median
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .geom import classify_hv
 from .thirdparty.hungarian import solve as hungarian_solve
@@ -147,7 +147,7 @@ class SegmentGrid:
     def _cell_index(self, value: float, offset: float) -> int:
         return int(math.floor((value - offset) / self.cell_size))
 
-    def query(self, x: float, y: float, radius: float) -> Sequence[Segment]:
+    def query_indices(self, x: float, y: float, radius: float) -> List[int]:
         if not self._segments:
             return []
         if radius <= 0:
@@ -156,23 +156,30 @@ class SegmentGrid:
         ix = self._cell_index(x, self.min_x)
         iy = self._cell_index(y, self.min_y)
         seen: set[int] = set()
-        results: List[Segment] = []
+        indices: List[int] = []
         for dx in range(-reach, reach + 1):
             for dy in range(-reach, reach + 1):
                 for idx in self._cells.get((ix + dx, iy + dy), []):
                     if idx not in seen:
                         seen.add(idx)
-                        results.append(self._segments[idx])
-        if not results:
-            return self._segments
-        return results
+                        indices.append(idx)
+        if not indices:
+            return list(range(len(self._segments)))
+        return indices
+
+    def query(self, x: float, y: float, radius: float) -> Sequence[Segment]:
+        indices = self.query_indices(x, y, radius)
+        if not indices:
+            return []
+        return [self._segments[idx] for idx in indices]
 
 
 def neighbor_signature(
     ref_seg: Segment,
-    all_segs: Sequence[Segment],
+    all_segs: Union[Sequence[Segment], SegmentGrid],
     radius: float,
     angle_tol_deg: float,
+    neighbor_indices: Optional[Sequence[int]] = None,
 ) -> List[Tuple[float, float, float]]:
     length_ref = _segment_length(ref_seg)
     if length_ref == 0:
@@ -182,7 +189,29 @@ def neighbor_signature(
     features: List[Tuple[float, float, float]] = []
     radius = max(radius, 0.0)
     center_ref = _segment_center(ref_seg)
-    for seg in all_segs:
+    if isinstance(all_segs, SegmentGrid):
+        segments_seq: Sequence[Segment] = all_segs.segments
+        if neighbor_indices is None:
+            cx, cy = center_ref
+            indices = all_segs.query_indices(cx, cy, radius)
+        else:
+            indices = list(neighbor_indices)
+        candidates: Iterable[Segment] = (
+            segments_seq[idx]
+            for idx in indices
+            if 0 <= idx < len(segments_seq)
+        )
+    else:
+        segments_seq = all_segs
+        if neighbor_indices is None:
+            candidates = iter(segments_seq)
+        else:
+            candidates = (
+                segments_seq[idx]
+                for idx in neighbor_indices
+                if 0 <= idx < len(segments_seq)
+            )
+    for seg in candidates:
         if seg is ref_seg:
             continue
         if radius > 0:
@@ -320,13 +349,32 @@ def _prepare_segment_infos(
     segments: Sequence[Segment],
     radius: float,
     angle_tol_deg: float,
+    *,
+    use_grid: bool = True,
 ) -> List[_SegmentInfo]:
     infos: List[_SegmentInfo] = []
+    if not segments:
+        return infos
+    grid: Optional[SegmentGrid] = None
+    if use_grid and radius > 0 and len(segments) > 1:
+        min_x, min_y, max_x, max_y, _ = _bbox_and_diag(segments)
+        cell_size = max(radius * 0.5, 1.0)
+        grid = SegmentGrid(segments, cell_size, (min_x, min_y, max_x, max_y))
     for seg in segments:
         length = _segment_length(seg)
         axis = _is_axis_aligned(seg, angle_tol_deg)
         center = _segment_center(seg)
-        signature = neighbor_signature(seg, segments, radius, angle_tol_deg)
+        if grid is not None:
+            neighbor_ids = grid.query_indices(center[0], center[1], radius)
+            signature = neighbor_signature(
+                seg,
+                grid,
+                radius,
+                angle_tol_deg,
+                neighbor_indices=neighbor_ids,
+            )
+        else:
+            signature = neighbor_signature(seg, segments, radius, angle_tol_deg)
         infos.append(_SegmentInfo(seg, axis, length, center, signature))
     return infos
 
@@ -564,6 +612,7 @@ def match_lines(
     neighbor_radius = float(neighbors_cfg.get("radius_rel", 0.06)) * diag_svg
     if neighbor_radius <= 0:
         neighbor_radius = radius_px
+    fast_signature = bool(neighbors_cfg.get("fast_signature", True))
 
     transformed_pdf: List[Segment] = []
     for seg in pdf_lines:
@@ -571,8 +620,18 @@ def match_lines(
         x2, y2 = _apply_model(model, seg.x2, seg.y2)
         transformed_pdf.append(Segment(x1, y1, x2, y2))
 
-    pdf_infos = _prepare_segment_infos(transformed_pdf, neighbor_radius, dir_tol_deg)
-    svg_infos = _prepare_segment_infos(svg_segs, neighbor_radius, dir_tol_deg)
+    pdf_infos = _prepare_segment_infos(
+        transformed_pdf,
+        neighbor_radius,
+        dir_tol_deg,
+        use_grid=fast_signature,
+    )
+    svg_infos = _prepare_segment_infos(
+        svg_segs,
+        neighbor_radius,
+        dir_tol_deg,
+        use_grid=fast_signature,
+    )
 
     svg_axis_map = {idx: info.axis for idx, info in enumerate(svg_infos)}
 

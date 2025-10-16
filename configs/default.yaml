@@ -27,6 +27,7 @@ verify:
   tol_rel: 0.01
 neighbors:
   use: true
+  fast_signature: true
   radius_rel: 0.06
   dt: 0.03
   dtheta_deg: 8.0

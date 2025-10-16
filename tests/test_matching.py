@@ -23,6 +23,7 @@ def make_config(max_cost: float | None = None) -> dict:
         },
         "neighbors": {
             "use": True,
+            "fast_signature": True,
             "radius_rel": 0.6,
             "dt": 0.2,
             "dtheta_deg": 5.0,
