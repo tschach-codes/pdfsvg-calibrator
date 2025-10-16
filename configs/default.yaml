@@ -1,34 +1,47 @@
+orientation:
+  enabled: true
+  raster_size: 512
+  use_phase_correlation: true
 rot_degrees: [0, 180]
 angle_tol_deg: 6.0
 curve_tol_rel: 0.001
-straight_max_dev_rel: 0.002
-straight_max_angle_spread_deg: 4.0
-min_seg_length_rel: 0.1
-min_len_raw: 6.0
-curve_tol_rel: 0.001
 straight_max_dev_rel: 0.0015
 straight_max_angle_spread_deg: 3.0
+min_seg_length_rel: 0.1
+min_len_raw: 6.0
+prefilter:
+  len_rel_ref: diagonal
 merge:
-  gap_max_rel: 0.01
-  off_tol_rel: 0.003
-grid_cell_rel: 0.02
+  enable: true
+  collinear_angle_tol_deg: 3.0
+  gap_max_rel: 0.003
+  offset_tol_rel: 0.002
+grid:
+  initial_cell_rel: 0.05
+  final_cell_rel: 0.02
 chamfer:
   sigma_rel: 0.004
   hard_mul: 3.0
+refine:
+  max_iters: 120
+  max_samples: 1500
+  scale_max_dev_rel: 0.02
+  trans_max_dev_px: 10
 ransac:
-  iters: 900
+  iters: 120
   refine_scale_step: 0.004
-  refine_trans_px: 3
+  refine_trans_px: 3.0
   max_no_improve: 250
 sampling:
-  step_rel: 0.03
-  max_points: 3000
+  step_rel: 0.02
+  max_points: 5000
 verify:
   pick_k: 5
   diversity_rel: 0.10
   radius_px: 80
   dir_tol_deg: 6.0
   tol_rel: 0.01
+  angle_tol_deg: 4.0
 neighbors:
   use: true
   fast_signature: true

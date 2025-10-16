@@ -269,11 +269,28 @@ def calibrate(
     if diag_pdf == 0.0 or diag_svg == 0.0:
         raise ValueError("Seitendiagonalen dürfen nicht 0 sein")
 
+    prefilter_cfg = cfg.get("prefilter", {})
+    if prefilter_cfg and not isinstance(prefilter_cfg, dict):
+        raise ValueError("prefilter config muss ein Mapping sein")
     min_len_rel = float(cfg.get("min_seg_length_rel", 0.0))
+    ref_choice = "width"
+    if isinstance(prefilter_cfg, dict):
+        ref_choice = str(prefilter_cfg.get("len_rel_ref", "width")).lower()
     pdf_width = pdf_size[0]
+    pdf_height = pdf_size[1]
     svg_width = svg_size[0]
-    pdf_min_len = min_len_rel * (pdf_width if pdf_width > 0.0 else diag_pdf)
-    svg_min_len = min_len_rel * (svg_width if svg_width > 0.0 else diag_svg)
+    svg_height = svg_size[1]
+    if ref_choice == "diagonal":
+        pdf_ref = diag_pdf
+        svg_ref = diag_svg
+    elif ref_choice == "height":
+        pdf_ref = pdf_height if pdf_height > 0.0 else diag_pdf
+        svg_ref = svg_height if svg_height > 0.0 else diag_svg
+    else:
+        pdf_ref = pdf_width if pdf_width > 0.0 else diag_pdf
+        svg_ref = svg_width if svg_width > 0.0 else diag_svg
+    pdf_min_len = min_len_rel * pdf_ref
+    svg_min_len = min_len_rel * svg_ref
 
     filter_start = perf_counter()
 
@@ -301,7 +318,17 @@ def calibrate(
         filter_duration,
     )
 
-    grid_cell = cfg.get("grid_cell_rel", 0.02) * diag_svg
+    grid_cfg = cfg.get("grid", {})
+    if grid_cfg and not isinstance(grid_cfg, dict):
+        raise ValueError("grid config muss ein Mapping sein")
+    grid_cell_rel = float(cfg.get("grid_cell_rel", 0.02))
+    initial_cell_rel = grid_cell_rel
+    final_cell_rel = grid_cell_rel
+    if isinstance(grid_cfg, dict):
+        initial_cell_rel = float(grid_cfg.get("initial_cell_rel", grid_cell_rel))
+        final_cell_rel = float(grid_cfg.get("final_cell_rel", initial_cell_rel))
+
+    grid_cell = initial_cell_rel * diag_svg
     grid_start = perf_counter()
     svg_grid = build_seg_grid(svg_segs, grid_cell)
     grid_duration = perf_counter() - grid_start
@@ -319,13 +346,29 @@ def calibrate(
     hard = sigma * chamfer_cfg.get("hard_mul", 3.0)
 
     sampling_cfg = cfg.get("sampling", {})
-    step = sampling_cfg.get("step_rel", 0.03) * diag_pdf
-    max_pts = max(1, int(sampling_cfg.get("max_points", 3000)))
+    if sampling_cfg and not isinstance(sampling_cfg, dict):
+        raise ValueError("sampling config muss ein Mapping sein")
+    step_rel = 0.03
+    if isinstance(sampling_cfg, dict):
+        step_rel = float(sampling_cfg.get("step_rel", step_rel))
+    step = step_rel * diag_pdf
+    max_pts_default = 3000
+    if isinstance(sampling_cfg, dict):
+        max_pts_default = int(sampling_cfg.get("max_points", max_pts_default))
+
+    refine_cfg = cfg.get("refine", {})
+    if refine_cfg and not isinstance(refine_cfg, dict):
+        raise ValueError("refine config muss ein Mapping sein")
+    max_pts = max_pts_default
+    if isinstance(refine_cfg, dict):
+        max_pts = max(1, int(min(max_pts_default, refine_cfg.get("max_samples", max_pts_default))))
+    else:
+        max_pts = max(1, max_pts_default)
 
     ransac_cfg = cfg.get("ransac", {})
     iters = int(ransac_cfg.get("iters", 900))
-    refine_scale_step = ransac_cfg.get("refine_scale_step", 0.004)
-    refine_trans_px = ransac_cfg.get("refine_trans_px", 3.0)
+    refine_scale_step = float(ransac_cfg.get("refine_scale_step", 0.004))
+    refine_trans_px = float(ransac_cfg.get("refine_trans_px", 3.0))
     max_no_improve = int(ransac_cfg.get("max_no_improve", 250))
     if max_no_improve < 0:
         max_no_improve = 0
@@ -342,6 +385,33 @@ def calibrate(
     enable_chamfer_stats = bool(
         debug_cfg.get("chamfer_stats", log.isEnabledFor(logging.DEBUG))
     )
+
+    orientation_cfg = cfg.get("orientation", {})
+    if orientation_cfg and not isinstance(orientation_cfg, dict):
+        raise ValueError("orientation config muss ein Mapping sein")
+    flip_xy = None
+    if isinstance(orientation_cfg, dict):
+        flip_val = orientation_cfg.get("flip_xy")
+        if flip_val is not None:
+            try:
+                fx, fy = float(flip_val[0]), float(flip_val[1])
+                flip_xy = (1.0 if fx >= 0 else -1.0, 1.0 if fy >= 0 else -1.0)
+            except Exception as exc:  # pragma: no cover - defensive
+                raise ValueError("orientation.flip_xy muss ein Paar aus Zahlen sein") from exc
+
+    scale_seed = None
+    trans_seed = None
+    scale_max_dev_rel = 0.0
+    trans_max_dev_px = 0.0
+    if isinstance(refine_cfg, dict):
+        seed_val = refine_cfg.get("scale_seed")
+        if seed_val is not None:
+            scale_seed = (float(seed_val[0]), float(seed_val[1]))
+        trans_val = refine_cfg.get("trans_seed")
+        if trans_val is not None:
+            trans_seed = (float(trans_val[0]), float(trans_val[1]))
+        scale_max_dev_rel = abs(float(refine_cfg.get("scale_max_dev_rel", 0.0)))
+        trans_max_dev_px = float(refine_cfg.get("trans_max_dev_px", 0.0))
 
     chamfer_stats = {"calls": 0, "time": 0.0}
 
@@ -381,11 +451,24 @@ def calibrate(
     best_model: Model | None = None
     best_score = -math.inf
     best_params: Tuple[int, float, float, float, float] | None = None
+    total_iters = 0
     center_pdf = (pdf_size[0] * 0.5, pdf_size[1] * 0.5)
     rot_degrees = cfg.get("rot_degrees", [0, 180])
     offsets = [0.0]
     if refine_trans_px > 0.0:
         offsets = [-refine_trans_px, 0.0, refine_trans_px]
+
+    if flip_xy is not None:
+        sign_x_options = (flip_xy[0],)
+        sign_y_options = (flip_xy[1],)
+    else:
+        sign_x_options = (-1.0, 1.0)
+        sign_y_options = (-1.0, 1.0)
+
+    scale_tol_x = scale_tol_y = None
+    if scale_seed is not None and scale_max_dev_rel > 0.0:
+        scale_tol_x = max(abs(scale_seed[0]) * scale_max_dev_rel, scale_max_dev_rel * 0.01)
+        scale_tol_y = max(abs(scale_seed[1]) * scale_max_dev_rel, scale_max_dev_rel * 0.01)
 
     iter_log_interval = int(debug_cfg.get("iter_log_interval", 50))
     if iter_log_interval <= 0:
@@ -464,14 +547,27 @@ def calibrate(
             msh = _segment_midpoint(sh)
             msv = _segment_midpoint(sv)
 
-            for sign_x in (-1.0, 1.0):
+            for sign_x in sign_x_options:
                 sx = sign_x * base_sx
-                for sign_y in (-1.0, 1.0):
+                if scale_seed is not None and scale_tol_x is not None:
+                    if abs(sx - scale_seed[0]) > scale_tol_x:
+                        continue
+                for sign_y in sign_y_options:
                     sy = sign_y * base_sy
+                    if scale_seed is not None and scale_tol_y is not None:
+                        if abs(sy - scale_seed[1]) > scale_tol_y:
+                            continue
                     tx_candidates = [msh[0] - sx * mph[0], msv[0] - sx * mpv[0]]
                     ty_candidates = [msh[1] - sy * mph[1], msv[1] - sy * mpv[1]]
                     tx = sum(tx_candidates) / len(tx_candidates)
                     ty = sum(ty_candidates) / len(ty_candidates)
+
+                    if trans_seed is not None and trans_max_dev_px > 0.0:
+                        if (
+                            abs(tx - trans_seed[0]) > trans_max_dev_px
+                            or abs(ty - trans_seed[1]) > trans_max_dev_px
+                        ):
+                            continue
 
                     score = eval_chamfer(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
                     if score > rot_best_score:
@@ -485,14 +581,26 @@ def calibrate(
                         sx_ref = sx * (1.0 + dk * refine_scale_step)
                         if abs(sx_ref) < 1e-9:
                             continue
+                        if scale_seed is not None and scale_tol_x is not None:
+                            if abs(sx_ref - scale_seed[0]) > scale_tol_x:
+                                continue
                         for dl in (-2, -1, 0, 1, 2):
                             sy_ref = sy * (1.0 + dl * refine_scale_step)
                             if abs(sy_ref) < 1e-9:
                                 continue
+                            if scale_seed is not None and scale_tol_y is not None:
+                                if abs(sy_ref - scale_seed[1]) > scale_tol_y:
+                                    continue
                             for dx in offsets:
                                 for dy in offsets:
                                     tx_ref = tx + dx
                                     ty_ref = ty + dy
+                                    if trans_seed is not None and trans_max_dev_px > 0.0:
+                                        if (
+                                            abs(tx_ref - trans_seed[0]) > trans_max_dev_px
+                                            or abs(ty_ref - trans_seed[1]) > trans_max_dev_px
+                                        ):
+                                            continue
                                     score_ref = eval_chamfer(
                                         pts_pdf,
                                         sx_ref,
@@ -578,6 +686,7 @@ def calibrate(
             calls,
             duration,
         )
+        total_iters += executed_iters
 
     if best_params is None or best_score <= 0.0:
         total_duration = perf_counter() - start_total
@@ -592,7 +701,7 @@ def calibrate(
     best_rot, best_sx, best_sy, best_tx, best_ty = best_params
 
     full_grid_start = perf_counter()
-    svg_grid_full = build_seg_grid(svg_segs_all, grid_cell)
+    svg_grid_full = build_seg_grid(svg_segs_all, final_cell_rel * diag_svg)
     full_grid_duration = perf_counter() - full_grid_start
     if min_len_rel > 0.0:
         log.debug(
@@ -650,13 +759,20 @@ def calibrate(
     )
 
     total_duration = perf_counter() - start_total
-    log.debug(
-        "[calib] abgeschlossen in %.3fs – rot=%s, score=%.6f, Chamfer=%d Aufrufe (%.3fs)",
-        total_duration,
+    total_ms = total_duration * 1000.0
+    chamfer_ms = chamfer_stats["time"] * 1000.0
+    log.info(
+        "[calib] abgeschlossen rot=%s score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer)",
         best_model.rot_deg,
         best_model.score,
+        best_model.sx,
+        best_model.sy,
+        best_model.tx,
+        best_model.ty,
+        total_iters,
         chamfer_stats["calls"],
-        chamfer_stats["time"],
+        total_ms,
+        chamfer_ms,
     )
 
     return best_model

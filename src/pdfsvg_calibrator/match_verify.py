@@ -382,8 +382,15 @@ def _prepare_segment_infos(
 def build_seg_grid(svg_segments: Sequence[Segment], cfg: dict, diag_hint: float) -> SegmentGrid:
     _, _, _, _, diag_svg = _bbox_and_diag(svg_segments)
     diag_ref = diag_svg if diag_svg > 0 else diag_hint
-    cell_rel = cfg.get("grid_cell_rel", 0.02)
-    cell_size = max(diag_ref * cell_rel, 1.0 if diag_ref == 0 else 1e-6)
+    grid_cfg = cfg.get("grid", {})
+    if grid_cfg and not isinstance(grid_cfg, dict):
+        raise ValueError("grid config muss ein Mapping sein")
+    cell_rel = cfg.get("grid_cell_rel")
+    if isinstance(grid_cfg, dict):
+        cell_rel = grid_cfg.get("final_cell_rel", grid_cfg.get("initial_cell_rel", cell_rel))
+    if cell_rel is None:
+        cell_rel = 0.02
+    cell_size = max(diag_ref * float(cell_rel), 1.0 if diag_ref == 0 else 1e-6)
     min_x, min_y, max_x, max_y, _ = _bbox_and_diag(svg_segments)
     return SegmentGrid(svg_segments, cell_size, (min_x, min_y, max_x, max_y))
 
