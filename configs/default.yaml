@@ -19,6 +19,10 @@ ransac:
   iters: 900
   refine_scale_step: 0.004
   refine_trans_px: 3
+  max_no_improve: 250
+sampling:
+  step_rel: 0.03
+  max_points: 3000
 verify:
   pick_k: 5
   diversity_rel: 0.10
