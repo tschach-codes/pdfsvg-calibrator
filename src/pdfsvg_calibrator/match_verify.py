@@ -419,6 +419,14 @@ def select_lines(
             diag_pdf = 1.0
     local_cfg = dict(cfg)
     local_cfg["_diag_pdf"] = diag_pdf
+    sampling_cfg = dict(cfg.get("sampling", {}))
+    sampling_max_override = verify_cfg.get("sampling_max_points")
+    if sampling_max_override is not None:
+        sampling_cfg["max_points"] = min(
+            int(sampling_cfg.get("max_points", sampling_max_override)),
+            int(sampling_max_override),
+        )
+    local_cfg["sampling"] = sampling_cfg
 
     svg_grid = build_seg_grid(svg_segs, cfg, diag_pdf)
 
@@ -433,7 +441,28 @@ def select_lines(
     else:
         rng = None
 
-    h_segs, v_segs = classify_hv(pdf_segs, angle_tol_deg=verify_cfg.get("dir_tol_deg", cfg.get("angle_tol_deg", 6.0)))
+    h_segs, v_segs = classify_hv(
+        pdf_segs,
+        angle_tol_deg=verify_cfg.get("dir_tol_deg", cfg.get("angle_tol_deg", 6.0)),
+    )
+
+    max_candidates_per_axis = verify_cfg.get("max_candidates_per_axis")
+    limit_adjusted = False
+    prefilter_dropped: Dict[str, int] = {"H": 0, "V": 0}
+    if max_candidates_per_axis is not None:
+        limit = max(int(max_candidates_per_axis), pick_k)
+        if limit > int(max_candidates_per_axis):
+            limit_adjusted = True
+        filtered_axis: Dict[str, List[Segment]] = {}
+        for axis, seg_list in (("H", h_segs), ("V", v_segs)):
+            if limit <= 0 or len(seg_list) <= limit:
+                filtered_axis[axis] = list(seg_list)
+                continue
+            sorted_by_length = sorted(seg_list, key=_segment_length, reverse=True)
+            filtered_axis[axis] = sorted_by_length[:limit]
+            prefilter_dropped[axis] = len(seg_list) - len(filtered_axis[axis])
+        h_segs = filtered_axis["H"]
+        v_segs = filtered_axis["V"]
 
     candidates: List[Candidate] = []
     axis_lists: Dict[str, List[Candidate]] = {"H": [], "V": []}
@@ -458,6 +487,7 @@ def select_lines(
 
     for cand_list in axis_lists.values():
         cand_list.sort(key=_sort_key)
+    scored_per_axis: Dict[str, int] = {axis: len(cands) for axis, cands in axis_lists.items()}
     all_sorted = sorted(candidates, key=_sort_key)
 
     had_enough_h = len(axis_lists["H"]) >= 2
@@ -537,12 +567,20 @@ def select_lines(
         notes.append("No eligible candidates after classification.")
     if not diversity_enforced and len(selected) >= min(pick_k, len(all_sorted)):
         notes.append("Diversity threshold relaxed to reach requested count.")
+    if prefilter_dropped["H"]:
+        notes.append(f"Prefilter dropped {prefilter_dropped['H']} horizontal candidates.")
+    if prefilter_dropped["V"]:
+        notes.append(f"Prefilter dropped {prefilter_dropped['V']} vertical candidates.")
+    if limit_adjusted:
+        notes.append("max_candidates_per_axis raised to satisfy pick_k diversity requirement.")
 
     info = {
         "had_enough_H": had_enough_h,
         "had_enough_V": had_enough_v,
         "diversity_enforced": diversity_enforced,
         "notes": notes,
+        "scored_candidates": dict(scored_per_axis),
+        "prefilter_dropped": dict(prefilter_dropped),
     }
 
     return [cand.seg for cand in selected], info
