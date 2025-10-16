@@ -137,7 +137,12 @@ def calibrate(
             float(refine_cfg.get("trans_max_dev_px", 0.0)),
             float(refine_cfg.get("scale_max_dev_rel", 0.0)) * 100.0,
         )
-        log.info("Seed scale sx=%.6f sy=%.6f, clamp ±%.2f%%", sx0, sy0, scale_window * 100.0)
+        log.info(
+            "Seed scale sx=%.6f sy=%.6f, clamp ±%.2f%%",
+            sx0,
+            sy0,
+            scale_window_base_val * 100.0,
+        )
 
     cfg_local["rot_degrees"] = [rot_deg]
 

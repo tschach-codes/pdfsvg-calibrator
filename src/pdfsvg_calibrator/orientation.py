@@ -29,8 +29,15 @@ def _ensure_size_tuple(size: int | Sequence[int]) -> Tuple[int, int]:
 
 
 def _segments_to_array(segments: Sequence[Segment | Sequence[float]]) -> np.ndarray:
+    if isinstance(segments, np.ndarray):
+        arr = np.asarray(segments, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != 4:
+            raise ValueError("segments must be Nx4 array-like entries")
+        return arr
+
     if not segments:
         return np.zeros((0, 4), dtype=np.float32)
+
     first = segments[0]
     if isinstance(first, Segment):
         arr = np.array(
