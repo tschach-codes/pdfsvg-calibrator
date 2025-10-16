@@ -240,10 +240,40 @@ def calibrate(
     if not svg_segs:
         raise ValueError("Keine SVG-Segmente für die Kalibrierung übergeben")
 
+    pdf_segs_all = list(pdf_segs)
+    svg_segs_all = list(svg_segs)
+
     diag_pdf = math.hypot(*pdf_size)
     diag_svg = math.hypot(*svg_size)
     if diag_pdf == 0.0 or diag_svg == 0.0:
         raise ValueError("Seitendiagonalen dürfen nicht 0 sein")
+
+    min_len_rel = float(cfg.get("min_seg_length_rel", 0.0))
+    pdf_width = pdf_size[0]
+    svg_width = svg_size[0]
+    pdf_min_len = min_len_rel * (pdf_width if pdf_width > 0.0 else diag_pdf)
+    svg_min_len = min_len_rel * (svg_width if svg_width > 0.0 else diag_svg)
+
+    pdf_segs = _filter_by_length(pdf_segs_all, pdf_min_len)
+    if not pdf_segs:
+        pdf_segs = pdf_segs_all
+        pdf_min_len = 0.0
+
+    svg_segs = _filter_by_length(svg_segs_all, svg_min_len)
+    if not svg_segs:
+        svg_segs = svg_segs_all
+        svg_min_len = 0.0
+
+    if min_len_rel > 0.0:
+        log.debug(
+            "[calib] Segmentlängenfilter aktiv: pdf>=%.3f (nutze %d/%d), svg>=%.3f (nutze %d/%d)",
+            pdf_min_len,
+            len(pdf_segs),
+            len(pdf_segs_all),
+            svg_min_len,
+            len(svg_segs),
+            len(svg_segs_all),
+        )
 
     grid_cell = cfg.get("grid_cell_rel", 0.02) * diag_svg
     grid_start = perf_counter()
@@ -321,6 +351,7 @@ def calibrate(
 
     best_model: Model | None = None
     best_score = -math.inf
+    best_params: Tuple[int, float, float, float, float] | None = None
     center_pdf = (pdf_size[0] * 0.5, pdf_size[1] * 0.5)
     rot_degrees = cfg.get("rot_degrees", [0, 180])
     offsets = [0.0]
@@ -428,12 +459,6 @@ def calibrate(
                                         rot_best_score = score_ref
 
                     if best_local[4] > best_score:
-                        rmse, p95, median = residual_stats(
-                            pts_pdf,
-                            Model(rot_deg=rot_deg, sx=best_local[0], sy=best_local[1], tx=best_local[2], ty=best_local[3], score=best_local[4], rmse=0.0, p95=0.0, median=0.0),
-                            svg_grid,
-                            hard,
-                        )
                         best_score = best_local[4]
                         best_model = Model(
                             rot_deg=rot_deg,
@@ -442,9 +467,16 @@ def calibrate(
                             tx=best_local[2],
                             ty=best_local[3],
                             score=best_local[4],
-                            rmse=rmse,
-                            p95=p95,
-                            median=median,
+                            rmse=0.0,
+                            p95=0.0,
+                            median=0.0,
+                        )
+                        best_params = (
+                            rot_deg,
+                            best_local[0],
+                            best_local[1],
+                            best_local[2],
+                            best_local[3],
                         )
             if (iter_idx + 1) % iter_log_interval == 0:
                 calls = chamfer_stats["calls"] - chamfer_calls_before
@@ -473,7 +505,7 @@ def calibrate(
             duration,
         )
 
-    if best_model is None or best_model.score <= 0.0:
+    if best_params is None or best_score <= 0.0:
         total_duration = perf_counter() - start_total
         log.debug(
             "[calib] keine Lösung gefunden (%.3fs, Chamfer=%d Aufrufe, %.3fs)",
@@ -482,6 +514,66 @@ def calibrate(
             chamfer_stats["time"],
         )
         raise RuntimeError("Keine gültige Kalibrierung gefunden – zu wenig Struktur oder rot_degrees prüfen")
+
+    best_rot, best_sx, best_sy, best_tx, best_ty = best_params
+
+    full_grid_start = perf_counter()
+    svg_grid_full = build_seg_grid(svg_segs_all, grid_cell)
+    full_grid_duration = perf_counter() - full_grid_start
+    if min_len_rel > 0.0:
+        log.debug(
+            "[calib] Vollständiges Chamfer-Grid für Ergebnis aufgebaut: cell=%.3f (%d Segmente, %d Rasterzellen, Ø %.1f Segmente/Zelle) in %.3fs",
+            svg_grid_full.cell_size,
+            len(svg_segs_all),
+            len(svg_grid_full.cells),
+            svg_grid_full.avg_segments_per_cell,
+            full_grid_duration,
+        )
+
+    rotated_pdf_full = [_rotate_segment(seg, best_rot, center_pdf) for seg in pdf_segs_all]
+    pts_pdf_full = sample_points_on_segments(rotated_pdf_full, step, max_pts)
+    if not pts_pdf_full:
+        raise ValueError("Es konnten keine Stichprobenpunkte aus den vollständigen PDF-Segmenten generiert werden")
+
+    final_score = chamfer_score(
+        pts_pdf_full,
+        best_sx,
+        best_sy,
+        best_tx,
+        best_ty,
+        svg_grid_full,
+        sigma,
+        hard,
+    )
+
+    rmse, p95, median = residual_stats(
+        pts_pdf_full,
+        Model(
+            rot_deg=best_rot,
+            sx=best_sx,
+            sy=best_sy,
+            tx=best_tx,
+            ty=best_ty,
+            score=final_score,
+            rmse=0.0,
+            p95=0.0,
+            median=0.0,
+        ),
+        svg_grid_full,
+        hard,
+    )
+
+    best_model = Model(
+        rot_deg=best_rot,
+        sx=best_sx,
+        sy=best_sy,
+        tx=best_tx,
+        ty=best_ty,
+        score=final_score,
+        rmse=rmse,
+        p95=p95,
+        median=median,
+    )
 
     total_duration = perf_counter() - start_total
     log.debug(
