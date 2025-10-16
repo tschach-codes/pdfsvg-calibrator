@@ -92,22 +92,34 @@ def calibrate(
     if svg_w == 0 or svg_h == 0:
         raise ValueError("svg_size must contain positive values")
 
-    seed_sx = flip_xy[0] * (svg_w / pdf_w)
-    seed_sy = flip_xy[1] * (svg_h / pdf_h)
+    sx0 = svg_w / pdf_w
+    sy0 = svg_h / pdf_h
+    seed_sx = flip_xy[0] * sx0
+    seed_sy = flip_xy[1] * sy0
 
     refine_cfg = cfg_local.setdefault("refine", {})  # type: ignore[assignment]
     if not isinstance(refine_cfg, dict):
         raise ValueError("refine config must be a mapping")
-    if use_orientation:
-        refine_cfg.setdefault("scale_seed", (seed_sx, seed_sy))
-        refine_cfg.setdefault("trans_seed", (tx0, ty0))
-    else:
-        refine_cfg.pop("scale_seed", None)
-        refine_cfg.pop("trans_seed", None)
-    refine_cfg.setdefault("scale_max_dev_rel", 0.02)
+    scale_window_val = refine_cfg.get("scale_max_dev_rel", 0.02)
+    scale_window = abs(float(scale_window_val))
+    refine_cfg["scale_max_dev_rel"] = scale_window
     refine_cfg.setdefault("trans_max_dev_px", 10.0)
     refine_cfg.setdefault("max_iters", 120)
     refine_cfg.setdefault("max_samples", 1500)
+    if use_orientation:
+        refine_cfg.setdefault("scale_seed", (seed_sx, seed_sy))
+        refine_cfg.setdefault("trans_seed", (tx0, ty0))
+        refine_cfg.setdefault(
+            "scale_abs_bounds",
+            (
+                (sx0 * (1.0 - scale_window), sx0 * (1.0 + scale_window)),
+                (sy0 * (1.0 - scale_window), sy0 * (1.0 + scale_window)),
+            ),
+        )
+    else:
+        refine_cfg.pop("scale_seed", None)
+        refine_cfg.pop("trans_seed", None)
+        refine_cfg.pop("scale_abs_bounds", None)
 
     if use_orientation:
         log.info(
@@ -117,6 +129,7 @@ def calibrate(
             float(refine_cfg.get("trans_max_dev_px", 0.0)),
             float(refine_cfg.get("scale_max_dev_rel", 0.0)) * 100.0,
         )
+        log.info("Seed scale sx=%.6f sy=%.6f, clamp ±%.2f%%", sx0, sy0, scale_window * 100.0)
 
     cfg_local["rot_degrees"] = [rot_deg]
 
@@ -126,7 +139,7 @@ def calibrate(
     ransac_cfg.setdefault("iters", refine_cfg.get("max_iters", 120))
     if "refine_scale_step" not in ransac_cfg:
         scale_window = float(refine_cfg.get("scale_max_dev_rel", 0.02))
-        ransac_cfg["refine_scale_step"] = max(scale_window / 4.0, 1e-4)
+        ransac_cfg["refine_scale_step"] = max(scale_window / 10.0, 1e-4)
     if "refine_trans_px" not in ransac_cfg:
         trans_window = float(refine_cfg.get("trans_max_dev_px", 10.0))
         ransac_cfg["refine_trans_px"] = max(trans_window / 3.0, 0.5)
