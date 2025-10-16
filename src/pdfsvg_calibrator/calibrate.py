@@ -74,9 +74,9 @@ def calibrate(
         orientation_cfg["rot_deg"] = rot_deg
         orientation_cfg["translation"] = (tx0, ty0)
         log.info(
-            "[orient] flip=%s rot=%d° seed_trans=(%.2f, %.2f)",
-            flip_xy,
+            "Orientation: rot=%d, flip=%s, seed_t=(%.2f, %.2f))",
             rot_deg,
+            flip_xy,
             tx0,
             ty0,
         )

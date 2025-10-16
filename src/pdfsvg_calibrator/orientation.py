@@ -14,8 +14,8 @@ log = logging.getLogger(__name__)
 DEFAULT_RASTER_SIZE: Tuple[int, int] = (512, 512)
 DEFAULT_USE_PHASE_CORRELATION: bool = True
 
-_FOUR_ROTATIONS = (0, 90, 180, 270)
 _FLIPS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
+_ROTATIONS = (0, 180)
 
 
 def _ensure_size_tuple(size: int | Sequence[int]) -> Tuple[int, int]:
@@ -27,24 +27,20 @@ def _ensure_size_tuple(size: int | Sequence[int]) -> Tuple[int, int]:
     return int(seq[0]), int(seq[1])
 
 
-def _apply_flip_and_rotation(
-    x: float, y: float, flip: Tuple[float, float], rot_deg: int
-) -> Tuple[float, float]:
-    cx = 0.5
-    cy = 0.5
-    # flip around center
-    x = cx + flip[0] * (x - cx)
-    y = cy + flip[1] * (y - cy)
-    if rot_deg % 360 == 0:
-        return x, y
-    rad = math.radians(rot_deg % 360)
-    cos_a = math.cos(rad)
-    sin_a = math.sin(rad)
-    tx = x - cx
-    ty = y - cy
-    rx = cos_a * tx - sin_a * ty
-    ry = sin_a * tx + cos_a * ty
-    return rx + cx, ry + cy
+def _segments_to_array(segments: Sequence[Segment | Sequence[float]]) -> np.ndarray:
+    if not segments:
+        return np.zeros((0, 4), dtype=np.float32)
+    first = segments[0]
+    if isinstance(first, Segment):
+        arr = np.array(
+            [[seg.x1, seg.y1, seg.x2, seg.y2] for seg in segments],
+            dtype=np.float32,
+        )
+    else:
+        arr = np.asarray(segments, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != 4:
+            raise ValueError("segments must be Nx4 array-like entries")
+    return arr.astype(np.float32, copy=False)
 
 
 def _normalize_segments(
@@ -65,79 +61,176 @@ def _normalize_segments(
         )
 
 
+def _augment_with_unit_frame(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return np.array(
+            [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]],
+            dtype=np.float32,
+        )
+    frame = np.array([[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+    return np.vstack([arr, frame])
+
+
+def _apply_flip_and_rotation(
+    coords: np.ndarray,
+    flip: Tuple[float, float],
+    rot_deg: int,
+) -> np.ndarray:
+    if coords.size == 0:
+        return coords
+    cx = 0.5
+    cy = 0.5
+    arr = coords.copy()
+    arr[:, [0, 2]] = cx + flip[0] * (arr[:, [0, 2]] - cx)
+    arr[:, [1, 3]] = cy + flip[1] * (arr[:, [1, 3]] - cy)
+    angle = rot_deg % 360
+    if angle == 0:
+        return arr
+    rad = math.radians(angle)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    for idx in range(arr.shape[0]):
+        for j in (0, 2):
+            tx = arr[idx, j] - cx
+            ty = arr[idx, j + 1] - cy
+            rx = cos_a * tx - sin_a * ty
+            ry = sin_a * tx + cos_a * ty
+            arr[idx, j] = rx + cx
+            arr[idx, j + 1] = ry + cy
+    return arr
+
+
 def rasterize_segments(
-    segments: Sequence[Segment],
+    segments: Sequence[Segment | Sequence[float]],
     size: Tuple[int, int] | int = (512, 512),
     flip: Tuple[float, float] = (1.0, 1.0),
     rot_deg: int = 0,
 ) -> np.ndarray:
-    """Rasterize ``segments`` into a binary image.
-
-    Parameters
-    ----------
-    segments:
-        Segment list normalised to the unit square (0..1).
-    size:
-        Raster size either as a scalar or (width, height) tuple.
-    flip:
-        Flip applied around the image centre for x/y axes (1 or -1).
-    rot_deg:
-        Rotation in degrees applied after flipping.
-    """
+    """Rasterize segments into a float32 mask using anti-aliased drawing."""
 
     width, height = _ensure_size_tuple(size)
     img = np.zeros((height, width), dtype=np.float32)
-    if not segments:
+    seg_arr = _segments_to_array(segments)
+    if seg_arr.size == 0:
         return img
 
-    for seg in segments:
-        x1 = float(seg.x1)
-        y1 = float(seg.y1)
-        x2 = float(seg.x2)
-        y2 = float(seg.y2)
-        x1, y1 = _apply_flip_and_rotation(x1, y1, flip, rot_deg)
-        x2, y2 = _apply_flip_and_rotation(x2, y2, flip, rot_deg)
-        num = max(int(math.hypot((x2 - x1) * width, (y2 - y1) * height) * 2), 1)
-        t_values = np.linspace(0.0, 1.0, num=num, dtype=np.float64)
-        xs_line = x1 + (x2 - x1) * t_values
-        ys_line = y1 + (y2 - y1) * t_values
-        ix = np.clip(np.round(xs_line * (width - 1)), 0, width - 1).astype(int)
-        iy = np.clip(np.round(ys_line * (height - 1)), 0, height - 1).astype(int)
-        img[iy, ix] = 1.0
+    xs = seg_arr[:, [0, 2]]
+    ys = seg_arr[:, [1, 3]]
+    min_x = float(xs.min())
+    max_x = float(xs.max())
+    min_y = float(ys.min())
+    max_y = float(ys.max())
+    span_x = max(max_x - min_x, 1e-9)
+    span_y = max(max_y - min_y, 1e-9)
 
+    norm = seg_arr.copy()
+    norm[:, [0, 2]] = (norm[:, [0, 2]] - min_x) / span_x
+    norm[:, [1, 3]] = (norm[:, [1, 3]] - min_y) / span_y
+    norm = np.clip(norm, 0.0, 1.0)
+    norm = _apply_flip_and_rotation(norm, flip, rot_deg)
+
+    for x1, y1, x2, y2 in norm:
+        length = math.hypot((x2 - x1) * width, (y2 - y1) * height)
+        samples = max(int(length * 3), 1)
+        ts = np.linspace(0.0, 1.0, samples, dtype=np.float64)
+        xs_line = x1 + (x2 - x1) * ts
+        ys_line = y1 + (y2 - y1) * ts
+        xs_line = np.clip(xs_line, 0.0, 1.0)
+        ys_line = np.clip(ys_line, 0.0, 1.0)
+        px = xs_line * (width - 1)
+        py = ys_line * (height - 1)
+        ix0 = np.floor(px).astype(int)
+        iy0 = np.floor(py).astype(int)
+        ix1 = np.clip(ix0 + 1, 0, width - 1)
+        iy1 = np.clip(iy0 + 1, 0, height - 1)
+        dx = px - ix0
+        dy = py - iy0
+
+        w00 = (1.0 - dx) * (1.0 - dy)
+        w10 = dx * (1.0 - dy)
+        w01 = (1.0 - dx) * dy
+        w11 = dx * dy
+
+        np.add.at(img, (iy0, ix0), w00)
+        np.add.at(img, (iy0, ix1), w10)
+        np.add.at(img, (iy1, ix0), w01)
+        np.add.at(img, (iy1, ix1), w11)
+
+    np.clip(img, 0.0, 1.0, out=img)
     return img
 
 
-def _phase_correlation_fft(img_a: np.ndarray, img_b: np.ndarray) -> Tuple[float, float, float]:
+def _parabolic_offset(f_m1: float, f_0: float, f_p1: float) -> float:
+    denom = f_m1 - 2.0 * f_0 + f_p1
+    if abs(denom) < 1e-12:
+        return 0.0
+    return 0.5 * (f_m1 - f_p1) / denom
+
+
+def phase_correlation(img_a: np.ndarray, img_b: np.ndarray) -> Tuple[float, float, float]:
+    """Return (dx, dy, response) using FFT-based phase correlation."""
+
     if img_a.shape != img_b.shape:
         raise ValueError("images must share the same shape")
     if img_a.ndim != 2:
         raise ValueError("images must be 2-D arrays")
+
     fa = np.fft.fft2(img_a)
     fb = np.fft.fft2(img_b)
     product = fa * np.conj(fb)
     magnitude = np.abs(product)
-    magnitude[magnitude == 0] = 1.0
+    magnitude[magnitude == 0.0] = 1.0
     cross_power = product / magnitude
     corr = np.fft.ifft2(cross_power)
     corr_mag = np.abs(corr)
     peak_index = np.unravel_index(np.argmax(corr_mag), corr_mag.shape)
     peak_value = float(corr_mag[peak_index])
-    shift_y = float(peak_index[0])
-    shift_x = float(peak_index[1])
+
     height, width = img_a.shape
-    if shift_x > width / 2:
+    py, px = peak_index
+
+    px_m1 = (px - 1) % width
+    px_p1 = (px + 1) % width
+    py_m1 = (py - 1) % height
+    py_p1 = (py + 1) % height
+
+    offset_x = _parabolic_offset(
+        float(corr_mag[py, px_m1]),
+        float(corr_mag[py, px]),
+        float(corr_mag[py, px_p1]),
+    )
+    offset_y = _parabolic_offset(
+        float(corr_mag[py_m1, px]),
+        float(corr_mag[py, px]),
+        float(corr_mag[py_p1, px]),
+    )
+
+    shift_x = float(px + offset_x)
+    shift_y = float(py + offset_y)
+
+    if shift_x > width / 2.0:
         shift_x -= width
-    if shift_y > height / 2:
+    if shift_y > height / 2.0:
         shift_y -= height
+
     return shift_x, shift_y, peak_value
 
 
-def phase_correlation(img_a: np.ndarray, img_b: np.ndarray) -> Tuple[float, float]:
-    """Compute phase correlation shift between two 2-D images."""
+def _fourier_shift(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    if img.size == 0:
+        return img
+    height, width = img.shape
+    ky = np.fft.fftfreq(height)
+    kx = np.fft.fftfreq(width)
+    phase = np.exp(-2j * np.pi * (ky[:, None] * dy + kx[None, :] * dx))
+    shifted = np.fft.ifft2(np.fft.fft2(img) * phase)
+    return shifted.real.astype(np.float32, copy=False)
 
-    shift_x, shift_y, _ = _phase_correlation_fft(img_a, img_b)
-    return shift_x, shift_y
+
+def _normalized_overlap(img_a: np.ndarray, img_b: np.ndarray) -> float:
+    num = float(np.sum(img_a * img_b))
+    denom = math.sqrt(float(np.sum(img_a**2) * np.sum(img_b**2))) + 1e-9
+    return num / denom
 
 
 def pick_flip_and_rot(
@@ -146,14 +239,21 @@ def pick_flip_and_rot(
     page_size_pdf: Tuple[float, float],
     page_size_svg: Tuple[float, float],
 ) -> Tuple[Tuple[float, float], int, float, float]:
-    """Pick flip and rotation candidate via raster correlation."""
+    """Evaluate hypotheses and return the best (flip, rot, tx, ty)."""
 
-    if not pdf_segments or not svg_segments:
-        raise ValueError("Both PDF and SVG segments are required")
+    if not pdf_segments:
+        raise ValueError("PDF segments are required")
+    if not svg_segments:
+        raise ValueError("SVG segments are required")
+
+    pdf_norm = _augment_with_unit_frame(
+        _segments_to_array(list(_normalize_segments(pdf_segments, page_size_pdf)))
+    )
+    svg_norm = _augment_with_unit_frame(
+        _segments_to_array(list(_normalize_segments(svg_segments, page_size_svg)))
+    )
 
     raster_size = DEFAULT_RASTER_SIZE
-    pdf_norm = list(_normalize_segments(pdf_segments, page_size_pdf))
-    svg_norm = list(_normalize_segments(svg_segments, page_size_svg))
     pdf_image = rasterize_segments(pdf_norm, raster_size, (1.0, 1.0), 0)
 
     best_score = -math.inf
@@ -161,15 +261,17 @@ def pick_flip_and_rot(
     best_rot = 0
     best_shift = (0.0, 0.0)
 
-    for rot_deg in _FOUR_ROTATIONS:
+    for rot_deg in _ROTATIONS:
         for flip in _FLIPS:
             svg_image = rasterize_segments(svg_norm, raster_size, flip, rot_deg)
             if DEFAULT_USE_PHASE_CORRELATION:
-                dx, dy, score = _phase_correlation_fft(pdf_image, svg_image)
+                dx, dy, response = phase_correlation(pdf_image, svg_image)
+                shifted_svg = _fourier_shift(svg_image, -dx, -dy)
+                score = _normalized_overlap(pdf_image, shifted_svg) * response
             else:
-                diff = np.sum(np.abs(pdf_image - svg_image))
-                score = -float(diff)
                 dx = dy = 0.0
+                score = _normalized_overlap(pdf_image, svg_image)
+
             if score > best_score:
                 best_score = score
                 best_flip = flip
@@ -185,9 +287,9 @@ def pick_flip_and_rot(
     ty0 = -dy_norm * oriented_height
 
     log.debug(
-        "[orient] pick flip=%s rot=%d score=%.3f shift_px=(%.1f, %.1f)",
-        best_flip,
+        "[orient] best rot=%d flip=%s score=%.4f shift=(%.2f, %.2f)px",
         best_rot,
+        best_flip,
         best_score,
         best_shift[0],
         best_shift[1],
