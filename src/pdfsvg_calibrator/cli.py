@@ -194,6 +194,22 @@ def _renumber_matches(matches: Sequence[Match]) -> List[Match]:
     return [replace(match, id=index) for index, match in enumerate(matches, start=1)]
 
 
+def _alignment_diagnostics(model: Model, svg_size: Tuple[float, float]) -> Dict[str, float | bool]:
+    diag = math.hypot(*svg_size)
+    tol = max(diag * 0.002, 0.5)
+    shift = math.hypot(model.tx, model.ty)
+    scale_avg = 0.5 * (abs(model.sx) + abs(model.sy))
+    return {
+        "diag": diag,
+        "tol": tol,
+        "shift": shift,
+        "tx": model.tx,
+        "ty": model.ty,
+        "scale_avg": scale_avg,
+        "flipped": model.sx * model.sy < 0,
+    }
+
+
 def _format_float(value: Optional[float], digits: int) -> str:
     if value is None:
         return "-"
@@ -262,6 +278,7 @@ def _summarize(
     outputs: Mapping[str, Path],
     line_info: Mapping[str, Any],
     extra_warnings: Iterable[str],
+    alignment: Mapping[str, Any] | None,
 ) -> None:
     headers, rows = _build_summary_table(matches)
     flip_notes: List[str] = []
@@ -275,6 +292,10 @@ def _summarize(
         f"Flips: {flip_text}",
         f"Score={model.score:.4f} | RMSE={model.rmse:.4f} | P95={model.p95:.4f} | Median={model.median:.4f}",
     ]
+    if alignment is not None:
+        summary_lines.append(
+            "Shift |t|={shift:.3f}px (tol {tol:.3f}px) | avg scale={scale_avg:.6f}".format(**alignment)
+        )
 
     warnings: List[str] = list(line_info.get("notes", []))
     warnings.extend(extra_warnings)
@@ -379,6 +400,23 @@ def run(
         with logger.status("Kalibrierung läuft"):
             model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg)
 
+        alignment = _alignment_diagnostics(model, svg_size)
+
+        alignment_warnings: List[str] = []
+        if model.rot_deg % 360 != 0:
+            alignment_warnings.append(
+                f"Rotation {model.rot_deg}° erkannt – automatische Exporte erwarten 0°."
+            )
+        if alignment.get("flipped"):
+            alignment_warnings.append(
+                "Automatisch erzeugte SVG wirkt gespiegelt (sx*sy < 0)."
+            )
+        if alignment.get("shift", 0.0) > alignment.get("tol", 0.0):
+            alignment_warnings.append(
+                "Automatischer SVG-Export wirkt verschoben: "
+                f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px."
+            )
+
         logger.step("Top-Linien auswählen")
         with logger.status("Linienauswahl"):
             pdf_lines, line_info = select_lines(pdf_segs, model, svg_segs, cfg)
@@ -389,7 +427,7 @@ def run(
             raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
         matches = _renumber_matches(raw_matches)
 
-        extra_warnings: List[str] = []
+        extra_warnings: List[str] = alignment_warnings
         if len(matches) < 5:
             extra_warnings.append(f"Nur {len(matches)} Linien verfügbar – verbleibende Slots bleiben leer.")
         if any(match.svg_seg is None for match in matches):
@@ -409,7 +447,7 @@ def run(
             "CSV": report_csv,
         }
 
-        _summarize(logger, model, matches, outputs, line_info, extra_warnings)
+        _summarize(logger, model, matches, outputs, line_info, extra_warnings, alignment)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         _handle_known_exception(logger, exc, prefix="Fehler")
         raise typer.Exit(code=2) from exc

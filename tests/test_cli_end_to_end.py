@@ -121,7 +121,6 @@ def _write_config(path: Path, extra: str = "") -> None:
 
 def test_cli_happy_path(tmp_path: Path) -> None:
     pdf_path = tmp_path / "calibration.pdf"
-    svg_path = tmp_path / "calibration.svg"
     outdir = tmp_path / "out"
     cfg_path = tmp_path / "config.yaml"
 
@@ -135,7 +134,6 @@ def test_cli_happy_path(tmp_path: Path) -> None:
     ]
 
     _write_pdf(pdf_path, segments)
-    _write_svg(svg_path, segments)
     _write_config(cfg_path)
 
     result = _run_cli(
@@ -148,8 +146,6 @@ def test_cli_happy_path(tmp_path: Path) -> None:
             str(cfg_path),
             "--outdir",
             str(outdir),
-            "--svg",
-            str(svg_path),
             "--rng-seed",
             "7",
         ],
@@ -166,19 +162,15 @@ def test_cli_happy_path(tmp_path: Path) -> None:
     assert (outdir / "calibration_p000_overlay_lines.svg").exists()
     assert (outdir / "calibration_p000_overlay_lines.pdf").exists()
     assert (outdir / "calibration_p000_check.csv").exists()
+    assert (outdir / "calibration_p000.svg").exists()
 
 
-def test_cli_raster_svg(tmp_path: Path) -> None:
+def test_cli_without_vectors_fails(tmp_path: Path) -> None:
     pdf_path = tmp_path / "empty.pdf"
-    svg_path = tmp_path / "empty.svg"
     outdir = tmp_path / "out"
     cfg_path = tmp_path / "config.yaml"
 
-    _write_pdf(pdf_path, [(10.0, 10.0, 190.0, 10.0)])
-    svg_path.write_text(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"200\"><image href=\"foo.png\" x=\"0\" y=\"0\" width=\"200\" height=\"200\" /></svg>",
-        encoding="utf-8",
-    )
+    _write_pdf(pdf_path, [])
     _write_config(cfg_path)
 
     result = _run_cli(
@@ -191,8 +183,6 @@ def test_cli_raster_svg(tmp_path: Path) -> None:
             str(cfg_path),
             "--outdir",
             str(outdir),
-            "--svg",
-            str(svg_path),
         ],
         cwd=tmp_path,
     )

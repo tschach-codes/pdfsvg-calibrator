@@ -5,7 +5,7 @@ Das Tool sucht eine affine Abbildung der Form `X = sx * x + tx`, `Y = sy * y + t
 
 ## Pipeline von A→Z
 1. **Konfiguration laden** – `cli.run()` lädt YAML + Defaults, setzt optionalen RNG-Seed und erzwingt Nachbarschaftsnutzung.【F:src/pdfsvg_calibrator/cli.py†L323-L355】
-2. **Eingaben prüfen** – Falls kein SVG-Pfad angegeben ist, wird ein Export erwartet; Dateien werden validiert.【F:src/pdfsvg_calibrator/cli.py†L356-L363】
+2. **Eingaben prüfen & SVG exportieren** – Ohne expliziten SVG-Pfad wird die gewünschte Seite automatisch via PyMuPDF nach `outdir` exportiert.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L316-L332】【F:src/pdfsvg_calibrator/cli.py†L356-L374】
 3. **PDF analysieren** – `load_pdf_segments()` extrahiert Vektorzeichnungen, approximiert Kurven, filtert nicht-lineare Pfade via TLS und liefert Segmentliste + Seitengröße.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L235-L310】
 4. **SVG analysieren** – `load_svg_segments()` parst die Datei transformationsbewusst, liefert Segmentliste + Maße.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L378-L392】【F:src/pdfsvg_calibrator/svg_path.py†L14-L190】
 5. **Kalibrierung** – `fit_model.calibrate()` baut ein Chamfer-Grid, sampelt PDF-Linien, führt RANSAC über H/V-Segmente aus und verfeinert die besten Kandidaten.【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
