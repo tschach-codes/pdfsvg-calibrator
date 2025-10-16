@@ -105,6 +105,21 @@ def _segment_length(seg: Segment) -> float:
     return math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
 
 
+def _filter_by_length(segs: Sequence[Segment], min_length: float) -> List[Segment]:
+    """Return only segments with a length greater or equal than ``min_length``.
+
+    The calibration requires that only sufficiently long segments take part in
+    the alignment step.  The caller passes the absolute minimum length which is
+    typically derived from a relative threshold (e.g. 10% of the plan width).
+    When the threshold is ``0`` or negative we simply keep the original input.
+    """
+
+    if min_length <= 0.0:
+        return list(segs)
+
+    return [seg for seg in segs if _segment_length(seg) >= min_length]
+
+
 def _segment_midpoint(seg: Segment) -> Tuple[float, float]:
     return ((seg.x1 + seg.x2) * 0.5, (seg.y1 + seg.y2) * 0.5)
 
