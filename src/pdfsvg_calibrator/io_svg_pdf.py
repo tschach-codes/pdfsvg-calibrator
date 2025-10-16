@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 import xml.etree.ElementTree as ET
+from time import perf_counter
 from typing import List, Sequence, Tuple
 
 import fitz
@@ -10,6 +12,9 @@ import fitz
 from .geom import fit_straight_segment
 from .svg_path import parse_svg_segments
 from .types import Segment
+
+
+log = logging.getLogger(__name__)
 
 
 def _angle_spread_deg(points: Sequence[Tuple[float, float]]) -> float:
@@ -241,6 +246,14 @@ def load_pdf_segments(
         width = float(page.rect.width)
         height = float(page.rect.height)
         diag = math.hypot(width, height) or 1.0
+        parse_start = perf_counter()
+        log.debug(
+            "[pdf] Seite %d: Größe=(%.2f×%.2f), Diagonale=%.2f",
+            page_index,
+            width,
+            height,
+            diag,
+        )
 
         curve_tol_rel = cfg.get("curve_tol_rel", 0.001)
         straight_max_dev_rel = cfg.get("straight_max_dev_rel", 0.002)
@@ -251,13 +264,20 @@ def load_pdf_segments(
 
         segments: List[Segment] = []
         drawings = page.get_drawings()
-        for drawing in drawings:
+        log.debug("[pdf] Seite %d: %d drawings geladen", page_index, len(drawings))
+
+        total_subpaths = 0
+        total_items = 0
+        for draw_idx, drawing in enumerate(drawings, start=1):
+            segs_before = len(segments)
             path = drawing.get("path")
             if path:
+                total_subpaths += len(path)
                 for subpath in path:
                     _process_commands(subpath, segments, curve_tol, max_dev, angle_spread_max)
             items = drawing.get("items")
             if items:
+                total_items += len(items)
                 pseudo_commands: List[Tuple] = []
                 for item in items:
                     if not item:
@@ -306,6 +326,28 @@ def load_pdf_segments(
                     _process_commands(
                         pseudo_commands, segments, curve_tol, max_dev, angle_spread_max
                     )
+
+            produced = len(segments) - segs_before
+            if produced:
+                log.debug(
+                    "[pdf] Seite %d: drawing #%d erzeugte %d Segmente (path=%d, items=%d)",
+                    page_index,
+                    draw_idx,
+                    produced,
+                    len(path) if path else 0,
+                    len(items) if items else 0,
+                )
+
+        duration = perf_counter() - parse_start
+        log.debug(
+            "[pdf] Seite %d: %d Segmente aus %d drawings (%d Subpfade, %d Items) in %.3fs",
+            page_index,
+            len(segments),
+            len(drawings),
+            total_subpaths,
+            total_items,
+            duration,
+        )
 
         return segments, (width, height)
     finally:

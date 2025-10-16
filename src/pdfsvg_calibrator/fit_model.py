@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
 from .geom import classify_hv
 from .types import Model, Segment
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -190,6 +195,7 @@ def calibrate(
     svg_size: Tuple[float, float],
     cfg: dict,
 ) -> Model:
+    start_total = perf_counter()
     if not pdf_segs:
         raise ValueError("Keine PDF-Segmente für die Kalibrierung übergeben")
     if not svg_segs:
@@ -201,7 +207,16 @@ def calibrate(
         raise ValueError("Seitendiagonalen dürfen nicht 0 sein")
 
     grid_cell = cfg.get("grid_cell_rel", 0.02) * diag_svg
+    grid_start = perf_counter()
     svg_grid = build_seg_grid(svg_segs, grid_cell)
+    grid_duration = perf_counter() - grid_start
+    log.debug(
+        "[calib] Chamfer-Grid gebaut: cell=%.3f (%d Segmente, %d Rasterzellen) in %.3fs",
+        grid_cell,
+        len(svg_segs),
+        len(svg_grid.cells),
+        grid_duration,
+    )
 
     chamfer_cfg = cfg.get("chamfer", {})
     sigma = chamfer_cfg.get("sigma_rel", 0.004) * diag_svg
@@ -224,6 +239,46 @@ def calibrate(
     svg_h, svg_v = classify_hv(list(svg_segs), angle_tol)
     _ensure_hv_non_empty("SVG", svg_h, svg_v)
 
+    debug_cfg = cfg.get("debug", {})
+    enable_chamfer_stats = bool(
+        debug_cfg.get("chamfer_stats", log.isEnabledFor(logging.DEBUG))
+    )
+
+    chamfer_stats = {"calls": 0, "time": 0.0}
+
+    if enable_chamfer_stats:
+
+        def eval_chamfer(
+            pts_pdf: Sequence[Tuple[float, float]],
+            sx: float,
+            sy: float,
+            tx: float,
+            ty: float,
+            svg_grid: SegGrid,
+            sigma: float,
+            hard: float,
+        ) -> float:
+            start = perf_counter()
+            try:
+                return chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+            finally:
+                chamfer_stats["calls"] += 1
+                chamfer_stats["time"] += perf_counter() - start
+
+    else:
+
+        def eval_chamfer(
+            pts_pdf: Sequence[Tuple[float, float]],
+            sx: float,
+            sy: float,
+            tx: float,
+            ty: float,
+            svg_grid: SegGrid,
+            sigma: float,
+            hard: float,
+        ) -> float:
+            return chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+
     best_model: Model | None = None
     best_score = -math.inf
     center_pdf = (pdf_size[0] * 0.5, pdf_size[1] * 0.5)
@@ -232,16 +287,42 @@ def calibrate(
     if refine_trans_px > 0.0:
         offsets = [-refine_trans_px, 0.0, refine_trans_px]
 
+    iter_log_interval = int(debug_cfg.get("iter_log_interval", 50))
+    if iter_log_interval <= 0:
+        iter_log_interval = 50
+
     for rot_deg in rot_degrees:
+        rot_start = perf_counter()
         rotated_pdf = [_rotate_segment(seg, rot_deg, center_pdf) for seg in pdf_segs]
         pdf_h, pdf_v = classify_hv(rotated_pdf, angle_tol)
         _ensure_hv_non_empty("PDF", pdf_h, pdf_v)
+
+        log.debug(
+            "[calib] rot=%s klassifiziert (%d horizontale, %d vertikale Segmente)",
+            rot_deg,
+            len(pdf_h),
+            len(pdf_v),
+        )
 
         pts_pdf = sample_points_on_segments(rotated_pdf, step, max_pts)
         if not pts_pdf:
             raise ValueError("Es konnten keine Stichprobenpunkte aus den PDF-Segmenten generiert werden")
 
-        for _ in range(iters):
+        log.debug(
+            "[calib] rot=%s Sampling: %d Punkte (step=%.3f, max=%d)",
+            rot_deg,
+            len(pts_pdf),
+            step,
+            max_pts,
+        )
+
+        chamfer_calls_before = chamfer_stats["calls"]
+        chamfer_time_before = chamfer_stats["time"]
+        executed_iters = 0
+        rot_best_score = -math.inf
+
+        for iter_idx in range(iters):
+            executed_iters += 1
             ph = rng.choice(pdf_h)
             pv = rng.choice(pdf_v)
             sh = rng.choice(svg_h)
@@ -271,7 +352,9 @@ def calibrate(
                     tx = sum(tx_candidates) / len(tx_candidates)
                     ty = sum(ty_candidates) / len(ty_candidates)
 
-                    score = chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+                    score = eval_chamfer(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+                    if score > rot_best_score:
+                        rot_best_score = score
                     if score <= best_score:
                         continue
 
@@ -289,9 +372,20 @@ def calibrate(
                                 for dy in offsets:
                                     tx_ref = tx + dx
                                     ty_ref = ty + dy
-                                    score_ref = chamfer_score(pts_pdf, sx_ref, sy_ref, tx_ref, ty_ref, svg_grid, sigma, hard)
+                                    score_ref = eval_chamfer(
+                                        pts_pdf,
+                                        sx_ref,
+                                        sy_ref,
+                                        tx_ref,
+                                        ty_ref,
+                                        svg_grid,
+                                        sigma,
+                                        hard,
+                                    )
                                     if score_ref > best_local[4]:
                                         best_local = (sx_ref, sy_ref, tx_ref, ty_ref, score_ref)
+                                    if score_ref > rot_best_score:
+                                        rot_best_score = score_ref
 
                     if best_local[4] > best_score:
                         rmse, p95, median = residual_stats(
@@ -312,8 +406,51 @@ def calibrate(
                             p95=p95,
                             median=median,
                         )
+            if (iter_idx + 1) % iter_log_interval == 0:
+                calls = chamfer_stats["calls"] - chamfer_calls_before
+                duration = chamfer_stats["time"] - chamfer_time_before
+                log.debug(
+                    "[calib] rot=%s Iteration %d/%d – rot_best=%s, global_best=%s, Chamfer=%d Aufrufe (%.3fs)",
+                    rot_deg,
+                    iter_idx + 1,
+                    iters,
+                    "-inf" if rot_best_score == -math.inf else f"{rot_best_score:.6f}",
+                    "-inf" if best_score == -math.inf else f"{best_score:.6f}",
+                    calls,
+                    duration,
+                )
+
+        calls = chamfer_stats["calls"] - chamfer_calls_before
+        duration = chamfer_stats["time"] - chamfer_time_before
+        rot_duration = perf_counter() - rot_start
+        log.debug(
+            "[calib] rot=%s fertig nach %.3fs – %d Iterationen, best=%s, Chamfer=%d (%.3fs)",
+            rot_deg,
+            rot_duration,
+            executed_iters,
+            "-inf" if rot_best_score == -math.inf else f"{rot_best_score:.6f}",
+            calls,
+            duration,
+        )
 
     if best_model is None or best_model.score <= 0.0:
+        total_duration = perf_counter() - start_total
+        log.debug(
+            "[calib] keine Lösung gefunden (%.3fs, Chamfer=%d Aufrufe, %.3fs)",
+            total_duration,
+            chamfer_stats["calls"],
+            chamfer_stats["time"],
+        )
         raise RuntimeError("Keine gültige Kalibrierung gefunden – zu wenig Struktur oder rot_degrees prüfen")
+
+    total_duration = perf_counter() - start_total
+    log.debug(
+        "[calib] abgeschlossen in %.3fs – rot=%s, score=%.6f, Chamfer=%d Aufrufe (%.3fs)",
+        total_duration,
+        best_model.rot_deg,
+        best_model.score,
+        chamfer_stats["calls"],
+        chamfer_stats["time"],
+    )
 
     return best_model
