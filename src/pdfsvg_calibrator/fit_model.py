@@ -403,6 +403,7 @@ def calibrate(
     trans_seed = None
     scale_max_dev_rel = 0.0
     trans_max_dev_px = 0.0
+    scale_abs_bounds: Tuple[Tuple[float, float], Tuple[float, float]] | None = None
     if isinstance(refine_cfg, dict):
         seed_val = refine_cfg.get("scale_seed")
         if seed_val is not None:
@@ -412,6 +413,22 @@ def calibrate(
             trans_seed = (float(trans_val[0]), float(trans_val[1]))
         scale_max_dev_rel = abs(float(refine_cfg.get("scale_max_dev_rel", 0.0)))
         trans_max_dev_px = float(refine_cfg.get("trans_max_dev_px", 0.0))
+        bounds_val = refine_cfg.get("scale_abs_bounds")
+        if bounds_val is not None:
+            try:
+                bx = bounds_val[0]
+                by = bounds_val[1]
+                sx_min = float(bx[0])
+                sx_max = float(bx[1])
+                sy_min = float(by[0])
+                sy_max = float(by[1])
+            except Exception as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    "refine.scale_abs_bounds must be ((sx_min, sx_max), (sy_min, sy_max))"
+                ) from exc
+            if sx_min > sx_max or sy_min > sy_max:
+                raise ValueError("refine.scale_abs_bounds min values must not exceed max values")
+            scale_abs_bounds = ((sx_min, sx_max), (sy_min, sy_max))
 
     chamfer_stats = {"calls": 0, "time": 0.0}
 
@@ -549,11 +566,19 @@ def calibrate(
 
             for sign_x in sign_x_options:
                 sx = sign_x * base_sx
+                if scale_abs_bounds is not None:
+                    sx_abs = abs(sx)
+                    if sx_abs < scale_abs_bounds[0][0] or sx_abs > scale_abs_bounds[0][1]:
+                        continue
                 if scale_seed is not None and scale_tol_x is not None:
                     if abs(sx - scale_seed[0]) > scale_tol_x:
                         continue
                 for sign_y in sign_y_options:
                     sy = sign_y * base_sy
+                    if scale_abs_bounds is not None:
+                        sy_abs = abs(sy)
+                        if sy_abs < scale_abs_bounds[1][0] or sy_abs > scale_abs_bounds[1][1]:
+                            continue
                     if scale_seed is not None and scale_tol_y is not None:
                         if abs(sy - scale_seed[1]) > scale_tol_y:
                             continue
@@ -581,6 +606,10 @@ def calibrate(
                         sx_ref = sx * (1.0 + dk * refine_scale_step)
                         if abs(sx_ref) < 1e-9:
                             continue
+                        if scale_abs_bounds is not None:
+                            sx_abs = abs(sx_ref)
+                            if sx_abs < scale_abs_bounds[0][0] or sx_abs > scale_abs_bounds[0][1]:
+                                continue
                         if scale_seed is not None and scale_tol_x is not None:
                             if abs(sx_ref - scale_seed[0]) > scale_tol_x:
                                 continue
@@ -588,6 +617,10 @@ def calibrate(
                             sy_ref = sy * (1.0 + dl * refine_scale_step)
                             if abs(sy_ref) < 1e-9:
                                 continue
+                            if scale_abs_bounds is not None:
+                                sy_abs = abs(sy_ref)
+                                if sy_abs < scale_abs_bounds[1][0] or sy_abs > scale_abs_bounds[1][1]:
+                                    continue
                             if scale_seed is not None and scale_tol_y is not None:
                                 if abs(sy_ref - scale_seed[1]) > scale_tol_y:
                                     continue
