@@ -319,13 +319,16 @@ def calibrate(
     hard = sigma * chamfer_cfg.get("hard_mul", 3.0)
 
     sampling_cfg = cfg.get("sampling", {})
-    step = sampling_cfg.get("step_rel", 0.02) * diag_pdf
-    max_pts = max(1, int(sampling_cfg.get("max_points", 5000)))
+    step = sampling_cfg.get("step_rel", 0.03) * diag_pdf
+    max_pts = max(1, int(sampling_cfg.get("max_points", 3000)))
 
     ransac_cfg = cfg.get("ransac", {})
     iters = int(ransac_cfg.get("iters", 900))
     refine_scale_step = ransac_cfg.get("refine_scale_step", 0.004)
     refine_trans_px = ransac_cfg.get("refine_trans_px", 3.0)
+    max_no_improve = int(ransac_cfg.get("max_no_improve", 250))
+    if max_no_improve < 0:
+        max_no_improve = 0
 
     rng_seed = cfg.get("rng_seed")
     rng = random.Random(rng_seed)
@@ -424,20 +427,23 @@ def calibrate(
         )
 
         log.debug(
-            "[calib] rot=%s RANSAC: %d Iterationen, refine_scale_step=%.4f, refine_trans_px=%.3f",
+            "[calib] rot=%s RANSAC: %d Iterationen, refine_scale_step=%.4f, refine_trans_px=%.3f, max_no_improve=%s",
             rot_deg,
             iters,
             refine_scale_step,
             refine_trans_px,
+            "∞" if max_no_improve == 0 else max_no_improve,
         )
 
         chamfer_calls_before = chamfer_stats["calls"]
         chamfer_time_before = chamfer_stats["time"]
         executed_iters = 0
         rot_best_score = -math.inf
+        iters_without_improve = 0
 
         for iter_idx in range(iters):
             executed_iters += 1
+            improved_iter = False
             ph = rng.choice(pdf_h)
             pv = rng.choice(pdf_v)
             sh = rng.choice(svg_h)
@@ -522,6 +528,7 @@ def calibrate(
                             best_local[2],
                             best_local[3],
                         )
+                        improved_iter = True
                         log.debug(
                             "[calib] rot=%s neues globales Maximum: score=%.6f, sx=%.6f, sy=%.6f, tx=%.3f, ty=%.3f (Iter %d)",
                             rot_deg,
@@ -532,6 +539,19 @@ def calibrate(
                             best_local[3],
                             iter_idx + 1,
                         )
+            if improved_iter:
+                iters_without_improve = 0
+            else:
+                iters_without_improve += 1
+                if max_no_improve and iters_without_improve >= max_no_improve:
+                    log.debug(
+                        "[calib] rot=%s Abbruch nach %d Iterationen (davon %d ohne Verbesserung, max_no_improve=%d)",
+                        rot_deg,
+                        executed_iters,
+                        iters_without_improve,
+                        max_no_improve,
+                    )
+                    break
             if (iter_idx + 1) % iter_log_interval == 0:
                 calls = chamfer_stats["calls"] - chamfer_calls_before
                 duration = chamfer_stats["time"] - chamfer_time_before
