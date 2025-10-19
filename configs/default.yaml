@@ -16,6 +16,10 @@ merge:
   collinear_angle_tol_deg: 3.0
   gap_max_rel: 0.003
   offset_tol_rel: 0.002
+  thresholds:
+    collinear_angle_tol_deg: 3.0
+    gap_max_rel: 0.003
+    offset_tol_rel: 0.002
 grid:
   initial_cell_rel: 0.05
   final_cell_rel: 0.02

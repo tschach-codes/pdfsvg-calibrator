@@ -5,7 +5,7 @@ import re
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from lxml import etree as ET
@@ -629,9 +629,17 @@ def _merge_collinear_segments(segments: List[Segment], diag: float, cfg: dict) -
     if len(segments) < 2:
         return segments
 
-    angle_tol = float(merge_cfg.get("collinear_angle_tol_deg", 3.0))
-    gap_tol = float(merge_cfg.get("gap_max_rel", 0.003)) * diag
-    offset_tol = float(merge_cfg.get("offset_tol_rel", 0.002)) * diag
+    thresholds = merge_cfg.get("thresholds")
+    if isinstance(thresholds, Mapping):
+        angle_tol = float(
+            thresholds.get("collinear_angle_tol_deg", merge_cfg.get("collinear_angle_tol_deg", 3.0))
+        )
+        gap_tol = float(thresholds.get("gap_max_rel", merge_cfg.get("gap_max_rel", 0.003))) * diag
+        offset_tol = float(thresholds.get("offset_tol_rel", merge_cfg.get("offset_tol_rel", 0.002))) * diag
+    else:
+        angle_tol = float(merge_cfg.get("collinear_angle_tol_deg", 3.0))
+        gap_tol = float(merge_cfg.get("gap_max_rel", 0.003)) * diag
+        offset_tol = float(merge_cfg.get("offset_tol_rel", 0.002)) * diag
 
     angles: List[Optional[float]] = []
     for seg in segments:
