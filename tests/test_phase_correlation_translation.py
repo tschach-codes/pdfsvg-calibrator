@@ -19,8 +19,8 @@ def test_phase_correlation_recovers_integer_shift() -> None:
     shifted = np.roll(base, shift_y, axis=0)
     shifted = np.roll(shifted, shift_x, axis=1)
 
-    dx, dy, response = phase_correlation(base, shifted)
+    du, dv, response = phase_correlation(shifted, base)
 
-    assert abs(dx + shift_x) <= 1.0
-    assert abs(dy + shift_y) <= 1.0
+    assert abs(du + shift_x) <= 1.0
+    assert abs(dv + shift_y) <= 1.0
     assert response > 0.1

@@ -176,18 +176,18 @@ def _parabolic_offset(f_m1: float, f_0: float, f_p1: float) -> float:
     return 0.5 * (f_m1 - f_p1) / denom
 
 
-def phase_correlation(img_a: np.ndarray, img_b: np.ndarray) -> Tuple[float, float, float]:
-    """Return (dx, dy, response) using FFT-based phase correlation."""
+def phase_correlation(img_moving: np.ndarray, img_fixed: np.ndarray) -> Tuple[float, float, float]:
+    """Return the shift (du, dv, response) that aligns ``img_moving`` to ``img_fixed``."""
 
     with Timer("orientation.phase"):
-        if img_a.shape != img_b.shape:
+        if img_moving.shape != img_fixed.shape:
             raise ValueError("images must share the same shape")
-        if img_a.ndim != 2:
+        if img_moving.ndim != 2:
             raise ValueError("images must be 2-D arrays")
 
-        fa = np.fft.fft2(img_a)
-        fb = np.fft.fft2(img_b)
-        product = fa * np.conj(fb)
+        fa = np.fft.fft2(img_moving)
+        fb = np.fft.fft2(img_fixed)
+        product = fb * np.conj(fa)
         magnitude = np.abs(product)
         magnitude[magnitude == 0.0] = 1.0
         cross_power = product / magnitude
@@ -196,7 +196,7 @@ def phase_correlation(img_a: np.ndarray, img_b: np.ndarray) -> Tuple[float, floa
         peak_index = np.unravel_index(np.argmax(corr_mag), corr_mag.shape)
         peak_value = float(corr_mag[peak_index])
 
-        height, width = img_a.shape
+        height, width = img_moving.shape
         py, px = peak_index
 
         px_m1 = (px - 1) % width
@@ -271,39 +271,73 @@ def pick_flip_and_rot(
         best_flip = (1.0, 1.0)
         best_rot = 0
         best_shift = (0.0, 0.0)
+        best_response = 0.0
 
         for rot_deg in _ROTATIONS:
             for flip in _FLIPS:
                 svg_image = rasterize_segments(svg_norm, raster_size, flip, rot_deg)
                 if DEFAULT_USE_PHASE_CORRELATION:
-                    dx, dy, response = phase_correlation(pdf_image, svg_image)
-                    shifted_svg = _fourier_shift(svg_image, -dx, -dy)
+                    du, dv, response = phase_correlation(svg_image, pdf_image)
+                    shifted_svg = _fourier_shift(svg_image, du, dv)
                     score = _normalized_overlap(pdf_image, shifted_svg) * response
                 else:
-                    dx = dy = 0.0
-                    score = _normalized_overlap(pdf_image, svg_image)
+                    du = dv = 0.0
+                    response = _normalized_overlap(pdf_image, svg_image)
+                    score = response
 
                 if score > best_score:
                     best_score = score
                     best_flip = flip
                     best_rot = rot_deg
-                    best_shift = (dx, dy)
+                    best_shift = (du, dv)
+                    best_response = response
+
+        if DEFAULT_USE_PHASE_CORRELATION:
+            svg_best = rasterize_segments(svg_norm, raster_size, best_flip, best_rot)
+            du, dv, best_response = phase_correlation(svg_best, pdf_image)
+            best_shift = (du, dv)
+        else:
+            svg_best = rasterize_segments(svg_norm, raster_size, best_flip, best_rot)
+            best_shift = (0.0, 0.0)
+            best_response = _normalized_overlap(pdf_image, svg_best)
 
         width, height = _ensure_size_tuple(raster_size)
-        oriented_width = page_size_svg[0] if best_rot % 180 == 0 else page_size_svg[1]
-        oriented_height = page_size_svg[1] if best_rot % 180 == 0 else page_size_svg[0]
-        dx_norm = best_shift[0] / float(max(width, 1))
-        dy_norm = best_shift[1] / float(max(height, 1))
-        tx0 = -dx_norm * oriented_width
-        ty0 = -dy_norm * oriented_height
+        page_w, page_h = page_size_svg
+        scale_x = page_w / float(width) if width > 0 else 0.0
+        scale_y = page_h / float(height) if height > 0 else 0.0
+        dx_doc = best_shift[0] * scale_x
+        dy_doc = -best_shift[1] * scale_y
+        doc_shift = np.array([dx_doc, dy_doc], dtype=np.float64)
+
+        angle_rad = math.radians(best_rot % 360)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        rot_matrix = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
+        flip_matrix = np.array(
+            [[best_flip[0], 0.0], [0.0, best_flip[1]]], dtype=np.float64
+        )
+        M = flip_matrix @ rot_matrix
+        t_seed = M.T @ doc_shift
+        tx0 = float(t_seed[0])
+        ty0 = float(t_seed[1])
 
         log.debug(
-            "[orient] best rot=%d flip=%s score=%.4f shift=(%.2f, %.2f)px",
+            "[orient] best rot=%d flip=%s score=%.4f response=%.4f shift=(%.2f, %.2f)px",
             best_rot,
             best_flip,
             best_score,
+            best_response,
             best_shift[0],
             best_shift[1],
+        )
+        log.info(
+            "[orient] phase du=%.2fpx dv=%.2fpx -> doc=(%.2f, %.2f) units -> t_seed=(%.2f, %.2f)",
+            best_shift[0],
+            best_shift[1],
+            dx_doc,
+            dy_doc,
+            tx0,
+            ty0,
         )
 
         return best_flip, best_rot, tx0, ty0
