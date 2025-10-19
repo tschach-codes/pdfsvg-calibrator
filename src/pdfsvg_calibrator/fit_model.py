@@ -452,6 +452,8 @@ def calibrate(
             scale_abs_bounds = ((sx_min, sx_max), (sy_min, sy_max))
 
     chamfer_stats = {"calls": 0, "time": 0.0}
+    num_evals = 0
+    current_iter_evaluated = False
 
     def eval_chamfer(
         pts_pdf: Sequence[Tuple[float, float]],
@@ -463,10 +465,13 @@ def calibrate(
         sigma: float,
         hard: float,
     ) -> float:
+        nonlocal current_iter_evaluated, num_evals
         with Timer("chamfer.total") as timer:
             score = chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
         chamfer_stats["calls"] += 1
         chamfer_stats["time"] += timer.duration
+        num_evals += 1
+        current_iter_evaluated = True
         if tracker is not None:
             tracker.increment("chamfer.calls")
         return score
@@ -549,9 +554,93 @@ def calibrate(
         rot_best_score = -math.inf
         iters_without_improve = 0
 
+        if scale_seed is not None and trans_seed is not None:
+            sx_seed = scale_seed[0]
+            sy_seed = scale_seed[1]
+            if scale_abs_bounds is not None:
+                sx_abs = abs(sx_seed)
+                sy_abs = abs(sy_seed)
+                within_bounds = (
+                    scale_abs_bounds[0][0] <= sx_abs <= scale_abs_bounds[0][1]
+                    and scale_abs_bounds[1][0] <= sy_abs <= scale_abs_bounds[1][1]
+                )
+            else:
+                within_bounds = True
+            if within_bounds:
+                tx_seed, ty_seed = trans_seed
+                seed_score = eval_chamfer(
+                    pts_pdf,
+                    sx_seed,
+                    sy_seed,
+                    tx_seed,
+                    ty_seed,
+                    svg_grid,
+                    sigma,
+                    hard,
+                )
+                rot_best_score = max(rot_best_score, seed_score)
+                if seed_score > best_score_coarse:
+                    fine_score = seed_score
+                    if final_cell_rel != initial_cell_rel:
+                        if svg_grid_fine is None:
+                            fine_grid_start = perf_counter()
+                            svg_grid_fine = build_seg_grid(
+                                svg_segs, final_cell_rel * diag_svg
+                            )
+                            fine_grid_duration = perf_counter() - fine_grid_start
+                            log.debug(
+                                "[calib] Feines Chamfer-Grid aufgebaut: cell=%.3f (%d Segmente, %d Rasterzellen, Ø %.1f Segmente/Zelle) in %.3fs",
+                                svg_grid_fine.cell_size,
+                                len(svg_segs),
+                                len(svg_grid_fine.cells),
+                                svg_grid_fine.avg_segments_per_cell,
+                                fine_grid_duration,
+                            )
+                        fine_score = eval_chamfer(
+                            pts_pdf,
+                            sx_seed,
+                            sy_seed,
+                            tx_seed,
+                            ty_seed,
+                            svg_grid_fine,
+                            sigma,
+                            hard,
+                        )
+                    best_score_coarse = seed_score
+                    best_score_fine = fine_score
+                    best_model = Model(
+                        rot_deg=rot_deg,
+                        sx=sx_seed,
+                        sy=sy_seed,
+                        tx=tx_seed,
+                        ty=ty_seed,
+                        score=fine_score,
+                        rmse=0.0,
+                        p95=0.0,
+                        median=0.0,
+                    )
+                    best_params = (
+                        rot_deg,
+                        sx_seed,
+                        sy_seed,
+                        tx_seed,
+                        ty_seed,
+                    )
+                    log.debug(
+                        "[calib] rot=%s Seed-Hypothese score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f",
+                        rot_deg,
+                        fine_score,
+                        sx_seed,
+                        sy_seed,
+                        tx_seed,
+                        ty_seed,
+                    )
+                current_iter_evaluated = False
+
         for iter_idx in range(iters):
             executed_iters += 1
             improved_iter = False
+            current_iter_evaluated = False
             ph = rng.choice(pdf_h)
             pv = rng.choice(pdf_v)
             sh = rng.choice(svg_h)
@@ -716,9 +805,9 @@ def calibrate(
                         )
             if improved_iter:
                 iters_without_improve = 0
-            else:
+            elif current_iter_evaluated:
                 iters_without_improve += 1
-                if patience and iters_without_improve >= patience:
+                if patience and num_evals > 0 and iters_without_improve >= patience:
                     log.debug(
                         "[calib] rot=%s Abbruch nach %d Iterationen (davon %d ohne Verbesserung, patience=%d)",
                         rot_deg,
@@ -758,8 +847,9 @@ def calibrate(
     if best_params is None or best_score_fine <= 0.0:
         total_duration = perf_counter() - start_total
         log.debug(
-            "[calib] keine Lösung gefunden (%.3fs, Chamfer=%d Aufrufe, %.3fs)",
+            "[calib] keine Lösung gefunden (%.3fs, Evals=%d, Chamfer=%d Aufrufe, %.3fs)",
             total_duration,
+            num_evals,
             chamfer_stats["calls"],
             chamfer_stats["time"],
         )
@@ -832,7 +922,7 @@ def calibrate(
     if tracker is not None:
         samples_total = int(tracker.get_count("sampling.points"))
     log.info(
-        "[calib] abgeschlossen rot=%s score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer, Samples=%d)",
+        "[calib] abgeschlossen rot=%s score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Evals=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer, Samples=%d)",
         best_model.rot_deg,
         best_model.score,
         best_model.sx,
@@ -840,6 +930,7 @@ def calibrate(
         best_model.tx,
         best_model.ty,
         total_iters,
+        num_evals,
         chamfer_stats["calls"],
         total_ms,
         chamfer_ms,
