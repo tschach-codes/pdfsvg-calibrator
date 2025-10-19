@@ -579,7 +579,7 @@ def calibrate(
                     if sx_abs < scale_abs_bounds[0][0] or sx_abs > scale_abs_bounds[0][1]:
                         continue
                 if scale_seed is not None and scale_tol_x is not None:
-                    if abs(sx - scale_seed[0]) > scale_tol_x:
+                    if abs(abs(sx) - scale_seed[0]) > scale_tol_x:
                         continue
                 for sign_y in sign_y_options:
                     sy = sign_y * base_sy
@@ -588,7 +588,7 @@ def calibrate(
                         if sy_abs < scale_abs_bounds[1][0] or sy_abs > scale_abs_bounds[1][1]:
                             continue
                     if scale_seed is not None and scale_tol_y is not None:
-                        if abs(sy - scale_seed[1]) > scale_tol_y:
+                        if abs(abs(sy) - scale_seed[1]) > scale_tol_y:
                             continue
                     tx_candidates = [msh[0] - sx * mph[0], msv[0] - sx * mpv[0]]
                     ty_candidates = [msh[1] - sy * mph[1], msv[1] - sy * mpv[1]]
@@ -619,7 +619,7 @@ def calibrate(
                             if sx_abs < scale_abs_bounds[0][0] or sx_abs > scale_abs_bounds[0][1]:
                                 continue
                         if scale_seed is not None and scale_tol_x is not None:
-                            if abs(sx_ref - scale_seed[0]) > scale_tol_x:
+                            if abs(abs(sx_ref) - scale_seed[0]) > scale_tol_x:
                                 continue
                         for dl in (-2, -1, 0, 1, 2):
                             sy_ref = sy * (1.0 + dl * refine_scale_step)
@@ -630,7 +630,7 @@ def calibrate(
                                 if sy_abs < scale_abs_bounds[1][0] or sy_abs > scale_abs_bounds[1][1]:
                                     continue
                             if scale_seed is not None and scale_tol_y is not None:
-                                if abs(sy_ref - scale_seed[1]) > scale_tol_y:
+                                if abs(abs(sy_ref) - scale_seed[1]) > scale_tol_y:
                                     continue
                             for dx in offsets:
                                 for dy in offsets:

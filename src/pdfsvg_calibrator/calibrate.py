@@ -95,8 +95,8 @@ def calibrate(
 
     sx0 = svg_w / pdf_w
     sy0 = svg_h / pdf_h
-    seed_sx = flip_xy[0] * sx0
-    seed_sy = flip_xy[1] * sy0
+    seed_sx = sx0
+    seed_sy = sy0
 
     refine_cfg = cfg_local.setdefault("refine", {})  # type: ignore[assignment]
     if not isinstance(refine_cfg, dict):
