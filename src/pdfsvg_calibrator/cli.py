@@ -260,19 +260,80 @@ def _renumber_matches(matches: Sequence[Match]) -> List[Match]:
     return [replace(match, id=index) for index, match in enumerate(matches, start=1)]
 
 
-def _alignment_diagnostics(model: Model, svg_size: Tuple[float, float]) -> Dict[str, float | bool]:
+def _alignment_diagnostics(
+    model: Model, svg_size: Tuple[float, float], config: Mapping[str, Any]
+) -> Dict[str, Any]:
     diag = math.hypot(*svg_size)
-    tol = max(diag * 0.002, 0.5)
+    tol_auto = max(diag * 0.002, 0.5)
+    refine_cfg = config.get("refine", {}) if isinstance(config, Mapping) else {}
+    trans_tol_cfg = abs(float(refine_cfg.get("trans_max_dev_px", 0.0) or 0.0))
+    scale_tol_cfg = abs(float(refine_cfg.get("scale_max_dev_rel", 0.0) or 0.0))
+    if trans_tol_cfg > 0.0:
+        tol_used = trans_tol_cfg
+        tol_source = "refine.trans_max_dev_px"
+    else:
+        tol_used = tol_auto
+        tol_source = "auto (0.2% diag, ≥0.5px)"
+
     shift = math.hypot(model.tx, model.ty)
     scale_avg = 0.5 * (abs(model.sx) + abs(model.sy))
+    flip_x = model.sx < 0
+    flip_y = model.sy < 0
+    rot_norm = model.rot_deg % 360
+    det_negative = (model.sx * model.sy) < 0
+
+    if flip_x and flip_y:
+        flip_label = "XY"
+    elif flip_x:
+        flip_label = "X"
+    elif flip_y:
+        flip_label = "Y"
+    else:
+        flip_label = "none"
+
+    bounds_parts: List[str] = []
+    if scale_tol_cfg > 0.0:
+        bounds_parts.append(f"scale±{scale_tol_cfg:.4f} rel (refine.scale_max_dev_rel)")
+    if trans_tol_cfg > 0.0:
+        bounds_parts.append(f"trans±{trans_tol_cfg:.3f}px (refine.trans_max_dev_px)")
+    else:
+        bounds_parts.append(f"trans≤{tol_auto:.3f}px (auto)")
+
+    header_lines = [
+        (
+            f"rot={rot_norm}° | flips={flip_label} | "
+            f"sx={model.sx:.6f} | sy={model.sy:.6f}"
+        ),
+        (
+            f"tx={model.tx:.3f}px | ty={model.ty:.3f}px | "
+            f"|t|={shift:.3f}px (tol {tol_used:.3f}px via {tol_source})"
+        ),
+        "Bounds: " + (", ".join(bounds_parts) if bounds_parts else "n/a"),
+    ]
+
+    shift_exceeds = shift > (tol_used + 1e-6)
+    if shift_exceeds:
+        header_lines.append("⚠ Shift exceeds tolerance – verify SVG export origin.")
+
     return {
         "diag": diag,
-        "tol": tol,
+        "tol": tol_used,
+        "tol_auto": tol_auto,
+        "tol_config": trans_tol_cfg,
+        "tol_source": tol_source,
+        "scale_tol_rel": scale_tol_cfg if scale_tol_cfg > 0.0 else None,
         "shift": shift,
         "tx": model.tx,
         "ty": model.ty,
         "scale_avg": scale_avg,
-        "flipped": model.sx * model.sy < 0,
+        "flip_x": flip_x,
+        "flip_y": flip_y,
+        "flip_label": flip_label,
+        "rot_norm": rot_norm,
+        "det_negative": det_negative,
+        "shift_exceeds": shift_exceeds,
+        "header_lines": header_lines,
+        "bounds": header_lines[2] if len(header_lines) >= 3 else None,
     }
 
 
@@ -347,21 +408,26 @@ def _summarize(
     alignment: Mapping[str, Any] | None,
 ) -> None:
     headers, rows = _build_summary_table(matches)
-    flip_notes: List[str] = []
-    if model.sx < 0:
-        flip_notes.append("horizontal flip (sx < 0)")
-    if model.sy < 0:
-        flip_notes.append("vertical flip (sy < 0)")
-    flip_text = ", ".join(flip_notes) if flip_notes else "none"
+    flip_label = "XY" if model.sx < 0 and model.sy < 0 else "X" if model.sx < 0 else "Y" if model.sy < 0 else "none"
     summary_lines = [
-        f"Model rot={model.rot_deg}° | sx={model.sx:.6f} sy={model.sy:.6f} tx={model.tx:.3f} ty={model.ty:.3f}",
-        f"Flips: {flip_text}",
+        (
+            f"Model rot={model.rot_deg % 360}° | flips={flip_label} | "
+            f"sx={model.sx:.6f} sy={model.sy:.6f} tx={model.tx:.3f} ty={model.ty:.3f}"
+        ),
         f"Score={model.score:.4f} | RMSE={model.rmse:.4f} | P95={model.p95:.4f} | Median={model.median:.4f}",
     ]
     if alignment is not None:
+        tol_source = alignment.get("tol_source", "config")
         summary_lines.append(
-            "Shift |t|={shift:.3f}px (tol {tol:.3f}px) | avg scale={scale_avg:.6f}".format(**alignment)
+            "Shift |t|={shift:.3f}px (tol {tol:.3f}px via {tol_source}) | avg scale={scale_avg:.6f}".format(
+                **alignment
+            )
         )
+        header_lines = alignment.get("header_lines")
+        if header_lines and len(header_lines) >= 3:
+            summary_lines.append(header_lines[2])
+        if alignment.get("shift_exceeds"):
+            summary_lines.append("⚠ Shift exceeds tolerance – verify SVG export origin.")
 
     warnings: List[str] = list(line_info.get("notes", []))
     warnings.extend(extra_warnings)
@@ -629,21 +695,37 @@ def run(
                 with logger.status("Kalibrierung läuft"):
                     model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg)
 
-                alignment = _alignment_diagnostics(model, svg_size)
+                alignment = _alignment_diagnostics(model, svg_size, cfg)
 
                 alignment_warnings: List[str] = []
-                if model.rot_deg % 360 != 0:
+                rot_norm = alignment.get("rot_norm", model.rot_deg % 360)
+                if rot_norm != 0 and not alignment.get("det_negative", False):
                     alignment_warnings.append(
-                        f"Rotation {model.rot_deg}° erkannt – automatische Exporte erwarten 0°."
+                        f"Rotation {rot_norm}° erkannt – automatische Exporte erwarten 0°."
                     )
-                if alignment.get("flipped"):
-                    alignment_warnings.append(
-                        "Automatisch erzeugte SVG wirkt gespiegelt (sx*sy < 0)."
-                    )
+                if alignment.get("flip_x") or alignment.get("flip_y"):
+                    axes: List[str] = []
+                    if alignment.get("flip_x"):
+                        axes.append("horizontal (sx < 0)")
+                    if alignment.get("flip_y"):
+                        axes.append("vertical (sy < 0)")
+                    axis_desc = " & ".join(axes) if axes else "unbekannt"
+                    if alignment.get("det_negative", False):
+                        alignment_warnings.append(
+                            "Automatisch erzeugte SVG wirkt gespiegelt: "
+                            f"{axis_desc}."
+                        )
+                    else:
+                        alignment_warnings.append(
+                            "SVG-Export enthält Flip(s): "
+                            f"{axis_desc}."
+                        )
                 if alignment.get("shift", 0.0) > alignment.get("tol", 0.0):
+                    tol_source = alignment.get("tol_source", "config")
                     alignment_warnings.append(
                         "Automatischer SVG-Export wirkt verschoben: "
-                        f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px."
+                        f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px (Grenze {tol_source}). "
+                        "Bitte Ursprung der SVG-Exportdatei prüfen."
                     )
 
                 logger.step("Top-Linien auswählen")
@@ -679,17 +761,32 @@ def run(
                                 page,
                                 model,
                                 matches,
+                                alignment,
                             )
                         )
                 with logger.status("PDF-Overlay"):
                     with Timer("io.overlay_pdf"):
                         overlay_pdf = Path(
-                            write_pdf_overlay(str(pdf), page, str(outdir), matches)
+                            write_pdf_overlay(
+                                str(pdf),
+                                page,
+                                str(outdir),
+                                model,
+                                matches,
+                                alignment,
+                            )
                         )
                 with logger.status("CSV-Bericht"):
                     with Timer("io.report_csv"):
                         report_csv = Path(
-                            write_report_csv(str(outdir), str(pdf), page, model, matches)
+                            write_report_csv(
+                                str(outdir),
+                                str(pdf),
+                                page,
+                                model,
+                                matches,
+                                alignment,
+                            )
                         )
 
                 outputs = {

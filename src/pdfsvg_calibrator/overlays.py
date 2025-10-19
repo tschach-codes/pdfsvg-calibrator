@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import math
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import fitz
 from lxml import etree
@@ -55,6 +55,45 @@ def _normalize_matches(matches: Sequence[Match]) -> Dict[int, Match]:
     return {match.id: match for match in matches}
 
 
+def _metadata_lines(model: Model, alignment: Mapping[str, Any] | None) -> Tuple[List[str], bool]:
+    if alignment is None:
+        shift = math.hypot(model.tx, model.ty)
+        lines = [
+            (
+                f"rot={model.rot_deg % 360}° | flips={'XY' if model.sx < 0 and model.sy < 0 else 'X' if model.sx < 0 else 'Y' if model.sy < 0 else 'none'} "
+                f"| sx={model.sx:.6f} | sy={model.sy:.6f}"
+            ),
+            (
+                f"tx={model.tx:.3f}px | ty={model.ty:.3f}px | |t|={shift:.3f}px"
+            ),
+        ]
+        return lines, False
+
+    header_lines = alignment.get("header_lines")
+    if header_lines:
+        return list(header_lines), bool(alignment.get("shift_exceeds"))
+
+    rot_norm = alignment.get("rot_norm", model.rot_deg % 360)
+    flip_label = alignment.get("flip_label")
+    if not flip_label:
+        flip_label = (
+            "XY" if model.sx < 0 and model.sy < 0 else "X" if model.sx < 0 else "Y" if model.sy < 0 else "none"
+        )
+    shift = alignment.get("shift", math.hypot(model.tx, model.ty))
+    tol = alignment.get("tol")
+    tol_source = alignment.get("tol_source", "config")
+    lines = [
+        f"rot={rot_norm}° | flips={flip_label} | sx={model.sx:.6f} | sy={model.sy:.6f}",
+        f"tx={model.tx:.3f}px | ty={model.ty:.3f}px | |t|={shift:.3f}px",
+    ]
+    if tol is not None:
+        lines[1] += f" (tol {tol:.3f}px via {tol_source})"
+    bounds = alignment.get("bounds")
+    if isinstance(bounds, str) and bounds:
+        lines.append(bounds)
+    return lines, bool(alignment.get("shift_exceeds"))
+
+
 def _pdf_hex_to_rgb(color: str) -> Tuple[float, float, float]:
     color = color.lstrip("#")
     if len(color) != 6:
@@ -96,6 +135,7 @@ def write_svg_overlay(
     page_index: int,
     model: Model,
     matches: Sequence[Match],
+    alignment: Optional[Mapping[str, Any]] = None,
 ) -> str:
     tree = etree.parse(svg_path)
     root = tree.getroot()
@@ -113,6 +153,50 @@ def write_svg_overlay(
         id="CHECK_LINES",
         style="pointer-events:none;paint-order:stroke;font-family:'DejaVu Sans',Arial,sans-serif",
     )
+
+    metadata_lines, highlight = _metadata_lines(model, alignment)
+    if metadata_lines:
+        meta_group = etree.SubElement(
+            overlay_group,
+            tag_g,
+            id="CHECK_METADATA",
+        )
+        base_x = 18.0
+        base_y = 18.0
+        padding_x = 12.0
+        padding_y = 8.0
+        line_height = 16.0
+        max_chars = max(len(line) for line in metadata_lines)
+        rect_width = padding_x * 2 + max_chars * 6.4
+        rect_height = padding_y * 2 + len(metadata_lines) * line_height
+        etree.SubElement(
+            meta_group,
+            tag_rect,
+            x=_format_float(base_x, 3),
+            y=_format_float(base_y, 3),
+            width=_format_float(rect_width, 3),
+            height=_format_float(rect_height, 3),
+            rx="6.0",
+            ry="6.0",
+            fill=LABEL_BG,
+            stroke=LABEL_STROKE,
+            **{"stroke-width": "0.8", "opacity": "0.96"},
+        )
+        for idx, line in enumerate(metadata_lines):
+            color = "#D32F2F" if highlight and "⚠" in line else "#000000"
+            text_node = etree.SubElement(
+                meta_group,
+                tag_text,
+                x=_format_float(base_x + padding_x, 3),
+                y=_format_float(base_y + padding_y + idx * line_height, 3),
+                fill=color,
+                **{
+                    "font-size": "12",
+                    "text-anchor": "start",
+                    "dominant-baseline": "hanging",
+                },
+            )
+            text_node.text = line
 
     matches_by_id = _normalize_matches(matches)
 
@@ -233,7 +317,9 @@ def write_pdf_overlay(
     pdf_path: str,
     page_index: int,
     outdir: str,
+    model: Model,
     matches: Sequence[Match],
+    alignment: Optional[Mapping[str, Any]] = None,
 ) -> str:
     os.makedirs(outdir, exist_ok=True)
     base = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -290,6 +376,39 @@ def write_pdf_overlay(
                 color=(0.0, 0.0, 0.0),
             )
 
+        metadata_lines, highlight = _metadata_lines(model, alignment)
+        if metadata_lines:
+            base_x = 18.0
+            base_y = 18.0
+            padding_x = 10.0
+            padding_y = 6.0
+            line_height = 12.5
+            max_chars = max(len(line) for line in metadata_lines)
+            rect_width = padding_x * 2 + max_chars * 5.6
+            rect_height = padding_y * 2 + len(metadata_lines) * line_height
+            rect = fitz.Rect(
+                base_x,
+                base_y,
+                base_x + rect_width,
+                base_y + rect_height,
+            )
+            page.draw_rect(
+                rect,
+                color=_pdf_hex_to_rgb(LABEL_STROKE),
+                fill=_pdf_hex_to_rgb(LABEL_BG),
+                width=0.7,
+                overlay=True,
+            )
+            text = "\n".join(metadata_lines)
+            page.insert_textbox(
+                rect,
+                text,
+                fontsize=9.5,
+                fontname="helv",
+                lineheight=1.05,
+                color=(0.0, 0.0, 0.0),
+            )
+
         out_doc.save(out_pdf)
     finally:
         src_doc.close()
@@ -306,6 +425,7 @@ def write_report_csv(
     page_index: int,
     model: Model,
     matches: Sequence[Match],
+    alignment: Optional[Mapping[str, Any]] = None,
 ) -> str:
     os.makedirs(outdir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(basename_or_pdf))[0]
@@ -324,6 +444,12 @@ def write_report_csv(
         "p95",
         "median",
         "calibration_notes",
+        "flip_xy",
+        "shift_abs",
+        "shift_tol_px",
+        "shift_tol_source",
+        "scale_tol_rel",
+        "bounds",
         "id",
         "axis",
         "pdf_len",
@@ -372,6 +498,12 @@ def write_report_csv(
                     "p95": _format_float(model.p95, 4),
                     "median": _format_float(model.median, 4),
                     "calibration_notes": "; ".join(model.quality_notes),
+                    "flip_xy": alignment.get("flip_label") if alignment else ("XY" if model.sx < 0 and model.sy < 0 else "X" if model.sx < 0 else "Y" if model.sy < 0 else "none"),
+                    "shift_abs": _format_float(alignment.get("shift") if alignment else math.hypot(model.tx, model.ty), 3),
+                    "shift_tol_px": _format_float(alignment.get("tol") if alignment else None, 3),
+                    "shift_tol_source": alignment.get("tol_source", "") if alignment else "",
+                    "scale_tol_rel": _format_float(alignment.get("scale_tol_rel") if alignment else None, 4),
+                    "bounds": alignment.get("bounds", "") if alignment else "",
                     "id": idx,
                     "axis": axis,
                     "pdf_len": _format_float(pdf_len, 3),

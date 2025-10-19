@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
 import pytest
 from lxml import etree
 
+from pdfsvg_calibrator.cli import HARDCODED_DEFAULTS, _alignment_diagnostics
 from pdfsvg_calibrator.overlays import (
     write_pdf_overlay,
     write_report_csv,
@@ -119,13 +123,16 @@ def sample_svg(tmp_path: Path) -> Path:
 
 
 def test_write_svg_overlay(sample_svg: Path, sample_pdf: Path, tmp_path: Path) -> None:
+    model = _make_model()
+    alignment = _alignment_diagnostics(model, (200.0, 200.0), HARDCODED_DEFAULTS)
     out_path = write_svg_overlay(
         str(sample_svg),
         str(tmp_path),
         str(sample_pdf),
         page_index=0,
-        model=_make_model(),
+        model=model,
         matches=_make_matches(),
+        alignment=alignment,
     )
     assert os.path.exists(out_path)
 
@@ -148,34 +155,64 @@ def test_write_svg_overlay(sample_svg: Path, sample_pdf: Path, tmp_path: Path) -
     lines = group.findall(line_tag)
     assert len(lines) == 10
 
-    labels = [node for node in group if node.tag == label_tag]
+    labels = [
+        node
+        for node in group
+        if node.tag == label_tag and node.get("id", "").startswith("label_")
+    ]
     assert len(labels) == 5
     texts = [child.text for node in labels for child in node if child.tag == text_tag]
     assert any(text == "3 (no match)" for text in texts)
 
+    meta_group = (
+        group.find(f"{label_tag}[@id='CHECK_METADATA']")
+        if ns
+        else group.find("g[@id='CHECK_METADATA']")
+    )
+    if meta_group is None:
+        meta_group = next((node for node in group if getattr(node, "attrib", {}).get("id") == "CHECK_METADATA"), None)
+    assert meta_group is not None
+    meta_texts = [
+        child.text
+        for child in meta_group
+        if child.tag == text_tag and child.text is not None
+    ]
+    assert any("rot=" in text for text in meta_texts)
+    assert any("|t|=" in text for text in meta_texts)
+
 
 def test_write_pdf_overlay(sample_pdf: Path, tmp_path: Path) -> None:
+    model = _make_model()
+    alignment = _alignment_diagnostics(model, (200.0, 200.0), HARDCODED_DEFAULTS)
     out_path = write_pdf_overlay(
         str(sample_pdf),
         page_index=0,
         outdir=str(tmp_path),
+        model=model,
         matches=_make_matches(),
+        alignment=alignment,
     )
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 0
 
     doc = fitz.open(out_path)
     assert doc.page_count == 1
+    text = doc[0].get_text()
+    assert "rot=" in text
+    assert "Bounds:" in text
     doc.close()
 
 
 def test_write_report_csv(sample_pdf: Path, tmp_path: Path) -> None:
+    model = _make_model()
+    alignment = _alignment_diagnostics(model, (200.0, 200.0), HARDCODED_DEFAULTS)
     out_path = write_report_csv(
         str(tmp_path),
         str(sample_pdf),
         page_index=0,
-        model=_make_model(),
+        model=model,
         matches=_make_matches(),
+        alignment=alignment,
     )
     assert os.path.exists(out_path)
 
@@ -192,11 +229,17 @@ def test_write_report_csv(sample_pdf: Path, tmp_path: Path) -> None:
             "ty",
             "score",
             "rmse",
-        "p95",
-        "median",
-        "calibration_notes",
-        "id",
-        "axis",
+            "p95",
+            "median",
+            "calibration_notes",
+            "flip_xy",
+            "shift_abs",
+            "shift_tol_px",
+            "shift_tol_source",
+            "scale_tol_rel",
+            "bounds",
+            "id",
+            "axis",
             "pdf_len",
             "svg_len",
             "ratio",
@@ -210,6 +253,11 @@ def test_write_report_csv(sample_pdf: Path, tmp_path: Path) -> None:
     assert len(rows) == 5
 
     assert all(row["calibration_notes"] == "" for row in rows)
+
+    for row in rows:
+        assert row["flip_xy"] == "none"
+        assert row["shift_abs"] != "-"
+        assert row["bounds"].startswith("Bounds:")
 
     row1 = next(row for row in rows if row["id"] == "1")
     assert pytest.approx(float(row1["ratio"])) == 1.1
