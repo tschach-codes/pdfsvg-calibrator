@@ -5,6 +5,7 @@ import importlib.util
 import logging
 import math
 import sys
+import textwrap
 import traceback
 from dataclasses import replace
 from pathlib import Path
@@ -66,6 +67,11 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
         "gap_max_rel": 0.003,
         "offset_tol_rel": 0.002,
         "off_tol_rel": 0.002,
+        "thresholds": {
+            "collinear_angle_tol_deg": 3.0,
+            "gap_max_rel": 0.003,
+            "offset_tol_rel": 0.002,
+        },
     },
     "grid": {"initial_cell_rel": 0.05, "final_cell_rel": 0.02},
     "chamfer": {"sigma_rel": 0.004, "hard_mul": 3.0},
@@ -212,6 +218,19 @@ def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[st
         else:
             result[key] = value
     return result
+
+
+def _set_nested(config: MutableMapping[str, Any], path: Sequence[str], value: Any) -> None:
+    if not path:
+        return
+    cursor: MutableMapping[str, Any] = config
+    for key in path[:-1]:
+        next_value = cursor.get(key)
+        if not isinstance(next_value, MutableMapping):
+            next_value = {}
+            cursor[key] = next_value
+        cursor = next_value
+    cursor[path[-1]] = value
 
 
 def _load_config_with_defaults(path: Path, rng_seed: Optional[int]) -> Dict[str, Any]:
@@ -429,6 +448,93 @@ def run(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Ausführliche Ausgaben"),
     rng_seed: Optional[int] = typer.Option(None, "--rng-seed", help="Zufalls-Seed überschreiben"),
+    orientation_enabled: Optional[bool] = typer.Option(
+        None,
+        "--orientation-enabled/--no-orientation-enabled",
+        help="Automatische Orientierungserkennung aktivieren/deaktivieren",
+    ),
+    orientation_raster_size: Optional[int] = typer.Option(
+        None,
+        "--orientation-raster-size",
+        min=64,
+        help="Rasterauflösung für die Orientierungserkennung überschreiben",
+    ),
+    refine_max_iters: Optional[int] = typer.Option(
+        None,
+        "--refine-max-iters",
+        min=1,
+        help="Maximale Iterationen der Feinabstimmung",
+    ),
+    refine_max_samples: Optional[int] = typer.Option(
+        None,
+        "--refine-max-samples",
+        min=1,
+        help="Maximale Samples für die Feinabstimmung",
+    ),
+    refine_scale_max_dev_rel: Optional[float] = typer.Option(
+        None,
+        "--refine-scale-max-dev-rel",
+        min=0.0,
+        help="Relative Skalenabweichung für die Feinabstimmung",
+    ),
+    refine_trans_max_dev_px: Optional[float] = typer.Option(
+        None,
+        "--refine-trans-max-dev-px",
+        min=0.0,
+        help="Maximale Translation in Pixeln für die Feinabstimmung",
+    ),
+    grid_initial_cell_rel: Optional[float] = typer.Option(
+        None,
+        "--grid-initial-cell-rel",
+        min=0.0,
+        help="Relativer Anfangswert der Gitterzelle",
+    ),
+    grid_final_cell_rel: Optional[float] = typer.Option(
+        None,
+        "--grid-final-cell-rel",
+        min=0.0,
+        help="Relativer Endwert der Gitterzelle",
+    ),
+    prefilter_len_rel_ref: Optional[str] = typer.Option(
+        None,
+        "--prefilter-len-ref",
+        help="Referenzmaß für Längenfilterung (width/height/diagonal)",
+    ),
+    merge_enabled: Optional[bool] = typer.Option(
+        None,
+        "--merge-enabled/--merge-disabled",
+        help="Kolliniare SVG-Segmente zusammenführen",
+    ),
+    merge_collinear_angle_tol_deg: Optional[float] = typer.Option(
+        None,
+        "--merge-collinear-angle-deg",
+        min=0.0,
+        help="Winkel-Toleranz für Kolliniare-Merges",
+    ),
+    merge_gap_max_rel: Optional[float] = typer.Option(
+        None,
+        "--merge-gap-rel",
+        min=0.0,
+        help="Maximaler Abstand (relativ zur Diagonale) beim Mergen",
+    ),
+    merge_offset_tol_rel: Optional[float] = typer.Option(
+        None,
+        "--merge-offset-rel",
+        min=0.0,
+        help="Maximale Versatz-Toleranz (relativ zur Diagonale) beim Mergen",
+    ),
+    verify_angle_tol_deg: Optional[float] = typer.Option(
+        None,
+        "--verify-angle-tol-deg",
+        min=0.0,
+        help="Winkel-Toleranz für die Verifikation",
+    ),
+    verify_radius_px: Optional[float] = typer.Option(
+        None,
+        "--verify-radius-px",
+        min=0.0,
+        help="Suchradius in Pixel für die Verifikation",
+    ),
 ) -> None:
     logger = Logger(verbose=verbose)
 
@@ -458,6 +564,40 @@ def run(
 
                 neighbors = cfg.setdefault("neighbors", {})
                 neighbors["use"] = True
+
+                overrides: List[Tuple[Tuple[str, ...], Any]] = [
+                    (("orientation", "enabled"), orientation_enabled),
+                    (("orientation", "raster_size"), orientation_raster_size),
+                    (("refine", "max_iters"), refine_max_iters),
+                    (("refine", "max_samples"), refine_max_samples),
+                    (("refine", "scale_max_dev_rel"), refine_scale_max_dev_rel),
+                    (("refine", "trans_max_dev_px"), refine_trans_max_dev_px),
+                    (("grid", "initial_cell_rel"), grid_initial_cell_rel),
+                    (("grid", "final_cell_rel"), grid_final_cell_rel),
+                    (("prefilter", "len_rel_ref"),
+                     prefilter_len_rel_ref.lower() if prefilter_len_rel_ref is not None else None),
+                    (("merge", "enable"), merge_enabled),
+                    (("merge", "collinear_angle_tol_deg"), merge_collinear_angle_tol_deg),
+                    (("merge", "gap_max_rel"), merge_gap_max_rel),
+                    (("merge", "offset_tol_rel"), merge_offset_tol_rel),
+                    (("merge", "thresholds", "collinear_angle_tol_deg"), merge_collinear_angle_tol_deg),
+                    (("merge", "thresholds", "gap_max_rel"), merge_gap_max_rel),
+                    (("merge", "thresholds", "offset_tol_rel"), merge_offset_tol_rel),
+                    (("verify", "angle_tol_deg"), verify_angle_tol_deg),
+                    (("verify", "radius_px"), verify_radius_px),
+                ]
+
+                for path, value in overrides:
+                    if value is None:
+                        continue
+                    _set_nested(cfg, path, value)
+
+                config_yaml = yaml.safe_dump(
+                    cfg,
+                    sort_keys=False,
+                    default_flow_style=False,
+                ).strip()
+                logger.info("Aktive Konfiguration:\n" + textwrap.indent(config_yaml, "  "))
 
                 if svg is not None:
                     svg_path = svg.resolve()
