@@ -113,6 +113,32 @@ def calibrate(
     def _timed(key: str):
         return timer(stats, key) if stats is not None else nullcontext()
 
+    coarse_cfg_raw = cfg_local.get("coarse")
+    scale_window_limit: float | None = None
+    trans_window_limit: float | None = None
+    angle_window_limit: float | None = None
+    if isinstance(coarse_cfg_raw, Mapping):
+        refine_windows_cfg = coarse_cfg_raw.get("refine_windows")
+        if isinstance(refine_windows_cfg, Mapping):
+            try:
+                scale_window_limit = abs(float(refine_windows_cfg.get("scale_rel")))
+            except (TypeError, ValueError):
+                scale_window_limit = None
+            try:
+                trans_window_limit = abs(float(refine_windows_cfg.get("shift_px")))
+            except (TypeError, ValueError):
+                trans_window_limit = None
+            try:
+                angle_window_limit = abs(float(refine_windows_cfg.get("angle_deg")))
+            except (TypeError, ValueError):
+                angle_window_limit = None
+    if angle_window_limit is not None:
+        try:
+            current_angle_tol = float(cfg_local.get("angle_tol_deg", 6.0))
+        except (TypeError, ValueError):
+            current_angle_tol = 6.0
+        cfg_local["angle_tol_deg"] = min(current_angle_tol, angle_window_limit)
+
     if use_orientation:
         seed_before = stats.get("Seed", 0.0) if stats is not None else 0.0
         with _timed("Orientation"):
@@ -193,6 +219,10 @@ def calibrate(
         raise ValueError("refine config must be a mapping")
     scale_window_base_val = abs(float(refine_cfg.get("scale_max_dev_rel", 0.02)))
     trans_window_base = abs(float(refine_cfg.get("trans_max_dev_px", 8.0)))
+    if scale_window_limit is not None:
+        scale_window_base_val = min(scale_window_base_val, scale_window_limit)
+    if trans_window_limit is not None:
+        trans_window_base = min(trans_window_base, trans_window_limit)
     trans_window_initial = trans_window_base
     if use_orientation and orientation_result is not None:
         overlap = float(orientation_result.get("overlap", 0.0))
@@ -212,6 +242,10 @@ def calibrate(
         *,
         max_iters: int | None = None,
     ) -> None:
+        if scale_window_limit is not None:
+            scale_window = min(scale_window, scale_window_limit)
+        if trans_window_limit is not None:
+            trans_window = min(trans_window, trans_window_limit)
         refine_cfg["scale_max_dev_rel"] = scale_window
         refine_cfg["trans_max_dev_px"] = trans_window
         refine_cfg["max_iters"] = max_iters if max_iters is not None else max_iters_base
@@ -257,7 +291,6 @@ def calibrate(
         trans_window = float(refine_cfg.get("trans_max_dev_px", 8.0))
         ransac_cfg["refine_trans_px"] = max(trans_window / 3.0, 0.5)
 
-    coarse_cfg_raw = cfg_local.get("coarse")
     if isinstance(coarse_cfg_raw, Mapping):
         bbox_pdf = (0.0, 0.0, float(pdf_w), float(pdf_h))
         bbox_svg = (0.0, 0.0, float(svg_w), float(svg_h))
@@ -507,8 +540,55 @@ def calibrate(
         )
         return model
 
-    with _timed("Refine"):
-        model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+    def _run_refine() -> Model:
+        return _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+
+    model: Model | None = None
+    refine_fallback_used = False
+    while True:
+        try:
+            with _timed("Refine"):
+                model = _run_refine()
+        except RuntimeError as exc:
+            message = str(exc)
+            if (
+                refine_fallback_used
+                or "Keine gültige Kalibrierung gefunden" not in message
+            ):
+                raise
+            refine_fallback_used = True
+            try:
+                current_scale_window = abs(
+                    float(refine_cfg.get("scale_max_dev_rel", scale_window_base_val))
+                )
+            except (TypeError, ValueError):
+                current_scale_window = scale_window_base_val
+            try:
+                current_trans_window = abs(
+                    float(refine_cfg.get("trans_max_dev_px", trans_window_base))
+                )
+            except (TypeError, ValueError):
+                current_trans_window = trans_window_base
+            log.info("[refine] expand windows and retry")
+            _apply_refine_window(current_scale_window * 2.0, current_trans_window * 2.0)
+            try:
+                updated_scale_window = float(
+                    refine_cfg.get("scale_max_dev_rel", current_scale_window)
+                )
+            except (TypeError, ValueError):
+                updated_scale_window = current_scale_window
+            try:
+                updated_trans_window = float(
+                    refine_cfg.get("trans_max_dev_px", current_trans_window)
+                )
+            except (TypeError, ValueError):
+                updated_trans_window = current_trans_window
+            ransac_cfg["refine_scale_step"] = max(updated_scale_window / 10.0, 1e-4)
+            ransac_cfg["refine_trans_px"] = max(updated_trans_window / 3.0, 0.5)
+            continue
+        break
+
+    assert model is not None
 
     with _timed("Verify"):
         model = _apply_distmap_metrics(model)
