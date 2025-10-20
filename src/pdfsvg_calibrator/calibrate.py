@@ -6,7 +6,12 @@ import logging
 from typing import Dict, Mapping, Sequence, Tuple
 
 from .fit_model import calibrate as _calibrate_ransac
-from .orientation import DEFAULT_RASTER_SIZE, DEFAULT_USE_PHASE_CORRELATION, pick_flip_and_rot
+from .orientation import (
+    DEFAULT_MIN_ACCEPT_SCORE,
+    DEFAULT_RASTER_SIZE,
+    DEFAULT_USE_PHASE_CORRELATION,
+    pick_flip_and_rot,
+)
 from .types import Model, Segment
 from .metrics import Timer
 
@@ -49,6 +54,8 @@ def calibrate(
         raise ValueError("orientation.raster_size must be an int or length-2 sequence") from exc
 
     use_phase = bool(orientation_cfg.get("use_phase_correlation", DEFAULT_USE_PHASE_CORRELATION))
+    min_accept_score = float(orientation_cfg.get("min_accept_score", DEFAULT_MIN_ACCEPT_SCORE))
+    orientation_cfg["min_accept_score"] = min_accept_score
 
     flip_xy = (1.0, 1.0)
     rot_deg = cfg_local.get("rot_degrees", [0])  # type: ignore[assignment]
@@ -65,15 +72,29 @@ def calibrate(
 
         orientation_module.DEFAULT_RASTER_SIZE = raster_tuple
         orientation_module.DEFAULT_USE_PHASE_CORRELATION = use_phase
-        flip_xy, rot_deg, tx0, ty0 = pick_flip_and_rot(
+        orientation_module.DEFAULT_MIN_ACCEPT_SCORE = min_accept_score
+        orientation_result = pick_flip_and_rot(
             pdf_segments,
             svg_segments,
             pdf_size,
             svg_size,
         )
+        flip_xy, rot_deg, tx0, ty0 = orientation_result
         orientation_cfg["flip_xy"] = flip_xy
         orientation_cfg["rot_deg"] = rot_deg
         orientation_cfg["translation"] = (tx0, ty0)
+        orientation_cfg["score"] = orientation_result.score
+        orientation_cfg["overlap"] = orientation_result.overlap
+        orientation_cfg["path"] = orientation_result.path
+        orientation_cfg["primary_score"] = orientation_result.primary_score
+        orientation_cfg["primary_overlap"] = orientation_result.primary_overlap
+        if orientation_result.fallback_score is not None:
+            orientation_cfg["fallback_score"] = orientation_result.fallback_score
+        if orientation_result.fallback_overlap is not None:
+            orientation_cfg["fallback_overlap"] = orientation_result.fallback_overlap
+        orientation_cfg["widen_trans_window"] = orientation_result.widen_trans_window
+        if orientation_result.trans_window_hint_px is not None:
+            orientation_cfg["trans_window_hint_px"] = orientation_result.trans_window_hint_px
         log.info(
             "Orientation: rot=%d, flip=%s, seed_t=(%.2f, %.2f))",
             rot_deg,
@@ -103,6 +124,11 @@ def calibrate(
         raise ValueError("refine config must be a mapping")
     scale_window_base_val = abs(float(refine_cfg.get("scale_max_dev_rel", 0.02)))
     trans_window_base = abs(float(refine_cfg.get("trans_max_dev_px", 10.0)))
+    trans_window_initial = trans_window_base
+    if use_orientation:
+        hint = orientation_cfg.get("trans_window_hint_px")
+        if isinstance(hint, (int, float)):
+            trans_window_initial = max(trans_window_initial, float(hint))
     max_iters_base = int(refine_cfg.get("max_iters", 120))
     refine_cfg.setdefault("max_samples", 1500)
 
@@ -127,7 +153,7 @@ def calibrate(
             refine_cfg.pop("trans_seed", None)
             refine_cfg.pop("scale_abs_bounds", None)
 
-    _apply_refine_window(scale_window_base_val, trans_window_base)
+    _apply_refine_window(scale_window_base_val, trans_window_initial)
 
     if use_orientation:
         log.info(

@@ -2,6 +2,7 @@ orientation:
   enabled: true
   raster_size: 512
   use_phase_correlation: true
+  min_accept_score: 0.05
 rot_degrees: [0, 180]
 angle_tol_deg: 6.0
 curve_tol_rel: 0.001
