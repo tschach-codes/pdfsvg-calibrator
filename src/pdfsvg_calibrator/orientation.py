@@ -1,445 +1,412 @@
-"""Orientation gating utilities for pdfsvg-calibrator."""
+"""Light-weight orientation and translation seeding utilities."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-import logging
 import math
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
 from .types import Segment
-from .metrics import Timer
-
-log = logging.getLogger(__name__)
-
-DEFAULT_RASTER_SIZE: Tuple[int, int] = (512, 512)
-DEFAULT_USE_PHASE_CORRELATION: bool = True
-DEFAULT_MIN_ACCEPT_SCORE: float = 0.05
-
-WIDE_TRANS_WINDOW_PX: float = 25.0
-
-_FLIPS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
-_ROTATIONS = (0, 180)
 
 
-@dataclass
-class OrientationPickResult:
-    """Container for the orientation hypothesis selection."""
+try:  # pragma: no cover - optional dependency
+    from skimage.draw import line as _skimage_draw_line  # type: ignore
+except Exception:  # pragma: no cover - fallback
+    _skimage_draw_line = None
 
-    flip_xy: Tuple[float, float]
-    rot_deg: int
-    tx: float
-    ty: float
-    score: float
-    overlap: float
-    response: float
-    path: str
-    primary_score: float
-    primary_overlap: float
-    fallback_score: Optional[float]
-    fallback_overlap: Optional[float]
-    widen_trans_window: bool
-    trans_window_hint_px: Optional[float]
-
-    def __iter__(self):
-        yield from (self.flip_xy, self.rot_deg, self.tx, self.ty)
+try:  # pragma: no cover - optional dependency
+    from skimage.registration import phase_cross_correlation as _skimage_pcc  # type: ignore
+except Exception:  # pragma: no cover - fallback
+    _skimage_pcc = None
 
 
-def _ensure_size_tuple(size: int | Sequence[int]) -> Tuple[int, int]:
-    if isinstance(size, int):
-        return (size, size)
-    seq = list(size)
-    if len(seq) != 2:
-        raise ValueError("size must be an int or a sequence of two ints")
-    return int(seq[0]), int(seq[1])
+SegmentInfo = Tuple[Tuple[float, float], Tuple[float, float], float, float]
 
 
-def _segments_to_array(segments: Sequence[Segment | Sequence[float]]) -> np.ndarray:
-    if isinstance(segments, np.ndarray):
-        arr = np.asarray(segments, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] != 4:
-            raise ValueError("segments must be Nx4 array-like entries")
-        return arr
+def snap_axis(theta_deg: float, tol_deg: float = 0.5) -> int:
+    """Return 0 for horizontal, 1 for vertical, or -1 when not aligned."""
+
+    a = theta_deg % 180.0
+    if min(a, 180.0 - a) <= tol_deg:
+        return 0
+    if min(abs(a - 90.0), abs(a - 90.0 - 180.0)) <= tol_deg:
+        return 1
+    return -1
+
+
+def select_topk_longest(
+    segments: Sequence[SegmentInfo], k_rel: float = 0.2
+) -> List[SegmentInfo]:
+    """Pick the longest ``k_rel`` fraction (min 16) of input segments."""
 
     if not segments:
-        return np.zeros((0, 4), dtype=np.float32)
-
-    first = segments[0]
-    if isinstance(first, Segment):
-        arr = np.array(
-            [[seg.x1, seg.y1, seg.x2, seg.y2] for seg in segments],
-            dtype=np.float32,
-        )
-    else:
-        arr = np.asarray(segments, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] != 4:
-            raise ValueError("segments must be Nx4 array-like entries")
-    return arr.astype(np.float32, copy=False)
-
-
-def _normalize_segments(
-    segments: Sequence[Segment],
-    page_size: Tuple[float, float],
-) -> Iterable[Segment]:
-    width, height = page_size
-    if width <= 0 or height <= 0:
-        raise ValueError("page dimensions must be positive")
-    inv_w = 1.0 / width
-    inv_h = 1.0 / height
-    for seg in segments:
-        yield Segment(
-            x1=seg.x1 * inv_w,
-            y1=seg.y1 * inv_h,
-            x2=seg.x2 * inv_w,
-            y2=seg.y2 * inv_h,
-        )
-
-
-def _augment_with_unit_frame(arr: np.ndarray) -> np.ndarray:
+        return []
+    arr = np.array(
+        [(s[0][0], s[0][1], s[1][0], s[1][1], s[3]) for s in segments],
+        dtype=float,
+    )
     if arr.size == 0:
-        return np.array(
-            [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]],
-            dtype=np.float32,
-        )
-    frame = np.array([[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
-    return np.vstack([arr, frame])
+        return []
+    k = max(16, int(len(arr) * k_rel))
+    idx = np.argsort(arr[:, 4])[::-1][:k]
+    return [segments[i] for i in idx]
 
 
-def _apply_flip_and_rotation(
-    coords: np.ndarray,
+def _bresenham_line(r0: int, c0: int, r1: int, c1: int) -> Tuple[np.ndarray, np.ndarray]:
+    dr = abs(r1 - r0)
+    dc = abs(c1 - c0)
+    r_step = 1 if r0 <= r1 else -1
+    c_step = 1 if c0 <= c1 else -1
+    rr: List[int] = []
+    cc: List[int] = []
+    err = dr - dc
+    r, c = r0, c0
+    while True:
+        rr.append(r)
+        cc.append(c)
+        if r == r1 and c == c1:
+            break
+        e2 = 2 * err
+        if e2 > -dc:
+            err -= dc
+            r += r_step
+        if e2 < dr:
+            err += dr
+            c += c_step
+    return np.array(rr, dtype=int), np.array(cc, dtype=int)
+
+
+def _apply_flip_rot(
+    segment: SegmentInfo,
+    page_w: float,
+    page_h: float,
     flip: Tuple[float, float],
     rot_deg: int,
-) -> np.ndarray:
-    if coords.size == 0:
-        return coords
-    cx = 0.5
-    cy = 0.5
-    arr = coords.copy()
-    arr[:, [0, 2]] = cx + flip[0] * (arr[:, [0, 2]] - cx)
-    arr[:, [1, 3]] = cy + flip[1] * (arr[:, [1, 3]] - cy)
-    angle = rot_deg % 360
-    if angle == 0:
-        return arr
-    rad = math.radians(angle)
-    cos_a = math.cos(rad)
-    sin_a = math.sin(rad)
-    for idx in range(arr.shape[0]):
-        for j in (0, 2):
-            tx = arr[idx, j] - cx
-            ty = arr[idx, j + 1] - cy
-            rx = cos_a * tx - sin_a * ty
-            ry = sin_a * tx + cos_a * ty
-            arr[idx, j] = rx + cx
-            arr[idx, j + 1] = ry + cy
-    return arr
+) -> SegmentInfo:
+    """Apply flip/rotation about the page centre and return new segment info."""
+
+    (x1, y1), (x2, y2), _, length = segment
+    cx, cy = page_w * 0.5, page_h * 0.5
+    ang = math.radians(rot_deg % 360)
+    ca, sa = math.cos(ang), math.sin(ang)
+
+    def _map(x: float, y: float) -> Tuple[float, float]:
+        xr, yr = x - cx, y - cy
+        xr *= flip[0]
+        yr *= flip[1]
+        xrr = xr * ca - yr * sa
+        yrr = xr * sa + yr * ca
+        return (xrr + cx, yrr + cy)
+
+    p1 = _map(x1, y1)
+    p2 = _map(x2, y2)
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    theta = math.degrees(math.atan2(dy, dx)) % 360.0
+    return (p1, p2, theta, length)
 
 
 def rasterize_segments(
-    segments: Sequence[Segment | Sequence[float]],
-    size: Tuple[int, int] | int = (512, 512),
-    flip: Tuple[float, float] = (1.0, 1.0),
+    segments: Sequence[SegmentInfo],
+    page_w: float,
+    page_h: float,
+    W: int = 256,
+    H: int = 256,
+    flip: Tuple[float, float] = (1, 1),
     rot_deg: int = 0,
 ) -> np.ndarray:
-    """Rasterize segments into a float32 mask using anti-aliased drawing."""
+    """Draw thin lines into a binary mask using Bresenham."""
 
-    with Timer("orientation.rasterize"):
-        width, height = _ensure_size_tuple(size)
-        img = np.zeros((height, width), dtype=np.float32)
-        seg_arr = _segments_to_array(segments)
-        if seg_arr.size == 0:
-            return img
+    mask = np.zeros((H, W), dtype=np.uint8)
+    if not segments:
+        return mask
 
-        xs = seg_arr[:, [0, 2]]
-        ys = seg_arr[:, [1, 3]]
-        min_x = float(xs.min())
-        max_x = float(xs.max())
-        min_y = float(ys.min())
-        max_y = float(ys.max())
-        span_x = max(max_x - min_x, 1e-9)
-        span_y = max(max_y - min_y, 1e-9)
+    cx, cy = page_w * 0.5, page_h * 0.5
+    a = math.radians(rot_deg)
+    ca, sa = math.cos(a), math.sin(a)
 
-        norm = seg_arr.copy()
-        norm[:, [0, 2]] = (norm[:, [0, 2]] - min_x) / span_x
-        norm[:, [1, 3]] = (norm[:, [1, 3]] - min_y) / span_y
-        norm = np.clip(norm, 0.0, 1.0)
-        norm = _apply_flip_and_rotation(norm, flip, rot_deg)
+    def xform(x: float, y: float) -> Tuple[int, int]:
+        xr, yr = x - cx, y - cy
+        xr, yr = xr * flip[0], yr * flip[1]
+        xrr = xr * ca - yr * sa
+        yrr = xr * sa + yr * ca
+        xm, ym = xrr + cx, yrr + cy
+        u = int(round(xm * (W / page_w)))
+        v = int(round((page_h - ym) * (H / page_h)))
+        return u, v
 
-        for x1, y1, x2, y2 in norm:
-            length = math.hypot((x2 - x1) * width, (y2 - y1) * height)
-            samples = max(int(length * 3), 1)
-            ts = np.linspace(0.0, 1.0, samples, dtype=np.float64)
-            xs_line = x1 + (x2 - x1) * ts
-            ys_line = y1 + (y2 - y1) * ts
-            xs_line = np.clip(xs_line, 0.0, 1.0)
-            ys_line = np.clip(ys_line, 0.0, 1.0)
-            px = xs_line * (width - 1)
-            py = ys_line * (height - 1)
-            ix0 = np.floor(px).astype(int)
-            iy0 = np.floor(py).astype(int)
-            ix1 = np.clip(ix0 + 1, 0, width - 1)
-            iy1 = np.clip(iy0 + 1, 0, height - 1)
-            dx = px - ix0
-            dy = py - iy0
-
-            w00 = (1.0 - dx) * (1.0 - dy)
-            w10 = dx * (1.0 - dy)
-            w01 = (1.0 - dx) * dy
-            w11 = dx * dy
-
-            np.add.at(img, (iy0, ix0), w00)
-            np.add.at(img, (iy0, ix1), w10)
-            np.add.at(img, (iy1, ix0), w01)
-            np.add.at(img, (iy1, ix1), w11)
-
-        np.clip(img, 0.0, 1.0, out=img)
-        return img
-
-
-def _parabolic_offset(f_m1: float, f_0: float, f_p1: float) -> float:
-    denom = f_m1 - 2.0 * f_0 + f_p1
-    if abs(denom) < 1e-12:
-        return 0.0
-    return 0.5 * (f_m1 - f_p1) / denom
-
-
-def phase_correlation(img_moving: np.ndarray, img_fixed: np.ndarray) -> Tuple[float, float, float]:
-    """Return the shift (du, dv, response) that aligns ``img_moving`` to ``img_fixed``."""
-
-    with Timer("orientation.phase"):
-        if img_moving.shape != img_fixed.shape:
-            raise ValueError("images must share the same shape")
-        if img_moving.ndim != 2:
-            raise ValueError("images must be 2-D arrays")
-
-        fa = np.fft.fft2(img_moving)
-        fb = np.fft.fft2(img_fixed)
-        product = fb * np.conj(fa)
-        magnitude = np.abs(product)
-        magnitude[magnitude == 0.0] = 1.0
-        cross_power = product / magnitude
-        corr = np.fft.ifft2(cross_power)
-        corr_mag = np.abs(corr)
-        peak_index = np.unravel_index(np.argmax(corr_mag), corr_mag.shape)
-        peak_value = float(corr_mag[peak_index])
-
-        height, width = img_moving.shape
-        py, px = peak_index
-
-        px_m1 = (px - 1) % width
-        px_p1 = (px + 1) % width
-        py_m1 = (py - 1) % height
-        py_p1 = (py + 1) % height
-
-        offset_x = _parabolic_offset(
-            float(corr_mag[py, px_m1]),
-            float(corr_mag[py, px]),
-            float(corr_mag[py, px_p1]),
-        )
-        offset_y = _parabolic_offset(
-            float(corr_mag[py_m1, px]),
-            float(corr_mag[py, px]),
-            float(corr_mag[py_p1, px]),
-        )
-
-        shift_x = float(px + offset_x)
-        shift_y = float(py + offset_y)
-
-        if shift_x > width / 2.0:
-            shift_x -= width
-        if shift_y > height / 2.0:
-            shift_y -= height
-
-        return shift_x, shift_y, peak_value
-
-
-def _fourier_shift(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    if img.size == 0:
-        return img
-    height, width = img.shape
-    ky = np.fft.fftfreq(height)
-    kx = np.fft.fftfreq(width)
-    phase = np.exp(-2j * np.pi * (ky[:, None] * dy + kx[None, :] * dx))
-    shifted = np.fft.ifft2(np.fft.fft2(img) * phase)
-    return shifted.real.astype(np.float32, copy=False)
-
-
-def _normalized_overlap(img_a: np.ndarray, img_b: np.ndarray) -> float:
-    num = float(np.sum(img_a * img_b))
-    denom = math.sqrt(float(np.sum(img_a**2) * np.sum(img_b**2))) + 1e-9
-    return num / denom
-
-
-def pick_flip_and_rot(
-    pdf_segments: Sequence[Segment],
-    svg_segments: Sequence[Segment],
-    page_size_pdf: Tuple[float, float],
-    page_size_svg: Tuple[float, float],
-) -> OrientationPickResult:
-    """Evaluate hypotheses and return the best orientation candidate."""
-
-    if not pdf_segments:
-        raise ValueError("PDF segments are required")
-    if not svg_segments:
-        raise ValueError("SVG segments are required")
-
-    with Timer("orientation.total"):
-        pdf_norm = _augment_with_unit_frame(
-            _segments_to_array(list(_normalize_segments(pdf_segments, page_size_pdf)))
-        )
-        svg_norm = _augment_with_unit_frame(
-            _segments_to_array(list(_normalize_segments(svg_segments, page_size_svg)))
-        )
-
-        raster_size = DEFAULT_RASTER_SIZE
-        pdf_image = rasterize_segments(pdf_norm, raster_size, (1.0, 1.0), 0)
-
-        best_score = -math.inf
-        best_flip = (1.0, 1.0)
-        best_rot = 0
-        best_shift = (0.0, 0.0)
-        best_response = 0.0
-        best_overlap = 0.0
-
-        for rot_deg in _ROTATIONS:
-            for flip in _FLIPS:
-                svg_image = rasterize_segments(svg_norm, raster_size, flip, rot_deg)
-                if DEFAULT_USE_PHASE_CORRELATION:
-                    du, dv, response = phase_correlation(svg_image, pdf_image)
-                    shifted_svg = _fourier_shift(svg_image, du, dv)
-                    overlap = _normalized_overlap(pdf_image, shifted_svg)
-                    score = overlap * response
-                else:
-                    du = dv = 0.0
-                    overlap = _normalized_overlap(pdf_image, svg_image)
-                    response = overlap
-                    score = overlap
-
-                if score > best_score:
-                    best_score = score
-                    best_flip = flip
-                    best_rot = rot_deg
-                    best_shift = (du, dv)
-                    best_response = response
-                    best_overlap = overlap
-
-        svg_best = rasterize_segments(svg_norm, raster_size, best_flip, best_rot)
-        if DEFAULT_USE_PHASE_CORRELATION:
-            du, dv, best_response = phase_correlation(svg_best, pdf_image)
-            shifted_best = _fourier_shift(svg_best, du, dv)
-            best_overlap = _normalized_overlap(pdf_image, shifted_best)
-            best_shift = (du, dv)
-            best_score = best_overlap * best_response
+    for (p1, p2, _, L) in segments:
+        u1, v1 = xform(p1[0], p1[1])
+        u2, v2 = xform(p2[0], p2[1])
+        if _skimage_draw_line is not None:
+            rr, cc = _skimage_draw_line(v1, u1, v2, u2)
         else:
-            best_shift = (0.0, 0.0)
-            best_overlap = _normalized_overlap(pdf_image, svg_best)
-            best_response = best_overlap
-            best_score = best_overlap
+            rr, cc = _bresenham_line(v1, u1, v2, u2)
+        rr = np.clip(rr, 0, H - 1)
+        cc = np.clip(cc, 0, W - 1)
+        mask[rr, cc] = 255
+    return mask
 
-        primary_score = best_score
-        primary_overlap = best_overlap
-        fallback_score: Optional[float] = None
-        fallback_overlap: Optional[float] = None
-        chosen_flip = best_flip
-        chosen_rot = best_rot
-        chosen_shift = best_shift
-        chosen_response = best_response
-        chosen_overlap = best_overlap
-        chosen_score = best_score
-        widen_trans_window = False
-        trans_window_hint: Optional[float] = None
-        path = "primary"
 
-        if best_score < DEFAULT_MIN_ACCEPT_SCORE:
-            fallback_flip = (-1.0, -1.0)
-            fallback_rot = 0
-            svg_fallback = rasterize_segments(svg_norm, raster_size, fallback_flip, fallback_rot)
-            if DEFAULT_USE_PHASE_CORRELATION:
-                du_fb, dv_fb, response_fb = phase_correlation(svg_fallback, pdf_image)
-                shifted_fb = _fourier_shift(svg_fallback, du_fb, dv_fb)
-                fallback_overlap = _normalized_overlap(pdf_image, shifted_fb)
-                fallback_score = fallback_overlap * response_fb
-            else:
-                du_fb = dv_fb = 0.0
-                fallback_overlap = _normalized_overlap(pdf_image, svg_fallback)
-                response_fb = fallback_overlap
-                fallback_score = fallback_overlap
+def _histogram(
+    values: Sequence[float],
+    page_extent: float,
+    bin_px: float,
+) -> np.ndarray:
+    if page_extent <= 0 or not values:
+        return np.zeros(1, dtype=float)
+    bins = max(16, int(math.ceil(page_extent / max(bin_px, 1e-6))))
+    hist, _ = np.histogram(values, bins=bins, range=(0.0, page_extent))
+    return hist.astype(float, copy=False)
 
-            if fallback_score > chosen_score:
-                chosen_flip = fallback_flip
-                chosen_rot = fallback_rot
-                chosen_shift = (du_fb, dv_fb)
-                chosen_response = response_fb
-                chosen_overlap = fallback_overlap
-                chosen_score = fallback_score
-                path = "fallback_orientation"
-            else:
-                path = "fallback_wide_window"
-                widen_trans_window = True
-                trans_window_hint = WIDE_TRANS_WINDOW_PX
 
-        width, height = _ensure_size_tuple(raster_size)
+def x_histogram_of_verticals(
+    segments: Sequence[SegmentInfo], bin_w_px: float, page_w: float, tol_deg: float = 2.0
+) -> np.ndarray:
+    """Histogram X positions of vertical-aligned segments."""
 
-        width, height = _ensure_size_tuple(raster_size)
-        page_w, page_h = page_size_svg
-        scale_x = page_w / float(width) if width > 0 else 0.0
-        scale_y = page_h / float(height) if height > 0 else 0.0
-        dx_doc = chosen_shift[0] * scale_x
-        dy_doc = -chosen_shift[1] * scale_y
-        doc_shift = np.array([dx_doc, dy_doc], dtype=np.float64)
+    xs: List[float] = []
+    for p1, p2, theta_deg, _ in segments:
+        if snap_axis(theta_deg, tol_deg) != 1:
+            continue
+        xs.append(0.5 * (p1[0] + p2[0]))
+    return _histogram(xs, page_w, bin_w_px)
 
-        angle_rad = math.radians(chosen_rot % 360)
-        cos_a = math.cos(angle_rad)
-        sin_a = math.sin(angle_rad)
-        rot_matrix = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
-        flip_matrix = np.array(
-            [[chosen_flip[0], 0.0], [0.0, chosen_flip[1]]], dtype=np.float64
-        )
-        M = flip_matrix @ rot_matrix
-        t_seed = M.T @ doc_shift
-        tx0 = float(t_seed[0])
-        ty0 = float(t_seed[1])
 
-        log.debug(
-            "[orient] best rot=%d flip=%s score=%.4f overlap=%.4f response=%.4f shift=(%.2f, %.2f)px",
-            chosen_rot,
-            chosen_flip,
-            chosen_score,
-            chosen_overlap,
-            chosen_response,
-            chosen_shift[0],
-            chosen_shift[1],
-        )
-        log.info(
-            "[orient] score primary=%.4f overlap=%.4f fallback=%s path=%s",
-            primary_score,
-            primary_overlap,
-            f"{fallback_score:.4f}" if fallback_score is not None else "n/a",
-            path,
-        )
-        log.info(
-            "[orient] phase du=%.2fpx dv=%.2fpx -> doc=(%.2f, %.2f) units -> t_seed=(%.2f, %.2f)",
-            chosen_shift[0],
-            chosen_shift[1],
-            dx_doc,
-            dy_doc,
-            tx0,
-            ty0,
-        )
+def y_histogram_of_horizontals(
+    segments: Sequence[SegmentInfo], bin_h_px: float, page_h: float, tol_deg: float = 2.0
+) -> np.ndarray:
+    """Histogram Y positions of horizontal-aligned segments."""
 
-        return OrientationPickResult(
-            flip_xy=chosen_flip,
-            rot_deg=chosen_rot,
-            tx=tx0,
-            ty=ty0,
-            score=chosen_score,
-            overlap=chosen_overlap,
-            response=chosen_response,
-            path=path,
-            primary_score=primary_score,
-            primary_overlap=primary_overlap,
-            fallback_score=fallback_score,
-            fallback_overlap=fallback_overlap,
-            widen_trans_window=widen_trans_window,
-            trans_window_hint_px=trans_window_hint,
-        )
+    ys: List[float] = []
+    for p1, p2, theta_deg, _ in segments:
+        if snap_axis(theta_deg, tol_deg) != 0:
+            continue
+        ys.append(0.5 * (p1[1] + p2[1]))
+    return _histogram(ys, page_h, bin_h_px)
+
+
+def argmax_xcorr(a: np.ndarray, b: np.ndarray) -> Tuple[int, float]:
+    """Return shift and normalized response to align ``b`` onto ``a``."""
+
+    if len(a) == 0 or len(b) == 0:
+        return 0, 0.0
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size == 0 or b.size == 0:
+        return 0, 0.0
+    c = np.correlate(a - a.mean(), b - b.mean(), mode="full")
+    shift = int(np.argmax(c) - (len(b) - 1))
+    denom = (np.linalg.norm(a - a.mean()) * np.linalg.norm(b - b.mean()) + 1e-9)
+    return shift, float(c.max() / denom)
+
+
+def phase_correlation(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float]:
+    """Wrapper around :func:`skimage.registration.phase_cross_correlation`."""
+    if _skimage_pcc is not None:
+        shift, response, _ = _skimage_pcc(a, b, upsample_factor=1)
+        dv, du = float(shift[0]), float(shift[1])
+        return du, dv, float(response)
+
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    axes = tuple(range(a.ndim))
+    Fa = np.fft.rfftn(a, axes=axes)
+    Fb = np.fft.rfftn(b, axes=axes)
+    R = Fa * np.conj(Fb)
+    denom = np.abs(R)
+    denom[denom == 0] = 1.0
+    R /= denom
+    corr = np.fft.irfftn(R, s=a.shape, axes=axes)
+    max_pos = np.unravel_index(np.argmax(corr), corr.shape)
+    shifts = np.array(max_pos, dtype=float)
+    for dim, size in enumerate(a.shape):
+        if shifts[dim] > size // 2:
+            shifts[dim] -= size
+    response = float(corr.max() / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+    dv, du = shifts[0], shifts[1]
+    return float(-du), float(-dv), response
+
+
+def _segments_to_info(
+    segments: Iterable[Segment | Sequence[float] | SegmentInfo],
+) -> List[SegmentInfo]:
+    result: List[SegmentInfo] = []
+    for seg in segments:
+        if isinstance(seg, Segment):
+            x1, y1, x2, y2 = seg.x1, seg.y1, seg.x2, seg.y2
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            theta_deg = math.degrees(math.atan2(dy, dx)) % 360.0
+        elif len(seg) == 4 and isinstance(seg[0], tuple):
+            (x1, y1), (x2, y2), theta_deg, length = seg  # type: ignore[misc]
+        else:
+            x1, y1, x2, y2 = seg  # type: ignore[misc]
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            theta_deg = math.degrees(math.atan2(dy, dx)) % 360.0
+        result.append(((float(x1), float(y1)), (float(x2), float(y2)), float(theta_deg), float(length)))
+    return result
+
+
+def _scale_segments(
+    segments: Sequence[SegmentInfo],
+    scale_x: float,
+    scale_y: float,
+) -> List[SegmentInfo]:
+    scaled: List[SegmentInfo] = []
+    for (p1, p2, _, _) in segments:
+        x1, y1 = p1[0] * scale_x, p1[1] * scale_y
+        x2, y2 = p2[0] * scale_x, p2[1] * scale_y
+        dx = x2 - x1
+        dy = y2 - y1
+        theta = math.degrees(math.atan2(dy, dx)) % 360.0
+        length = math.hypot(dx, dy)
+        scaled.append(((x1, y1), (x2, y2), theta, length))
+    return scaled
+
+
+def _transform_segments(
+    segments: Sequence[SegmentInfo],
+    page_w: float,
+    page_h: float,
+    flip: Tuple[float, float],
+    rot_deg: int,
+) -> List[SegmentInfo]:
+    return [_apply_flip_rot(seg, page_w, page_h, flip, rot_deg) for seg in segments]
+
+
+def pick_flip_rot_and_shift(
+    pdf_segs: Iterable[Sequence[float] | SegmentInfo],
+    svg_segs: Iterable[Sequence[float] | SegmentInfo],
+    page_pdf,
+    page_svg,
+    cfg,
+):
+    """Pick best orientation and translation seed between PDF and SVG segments."""
+
+    orientation_cfg: Mapping[str, float | int | bool] | dict
+    orientation_cfg = getattr(cfg, "orientation", None)
+    if orientation_cfg is None:
+        orientation_cfg = cfg.get("orientation", {}) if isinstance(cfg, dict) else {}
+
+    sample_topk_rel = orientation_cfg.get("sample_topk_rel", 0.2)
+    raster_size = int(orientation_cfg.get("raster_size", 256))
+    min_accept = float(orientation_cfg.get("min_accept_score", 0.05))
+    hist_bin_px = float(orientation_cfg.get("hist_bin_px", 4.0))
+    axis_tol = float(orientation_cfg.get("axis_snap_tol_deg", 2.0))
+
+    pdf_infos = _segments_to_info(pdf_segs)
+    svg_infos_raw = _segments_to_info(svg_segs)
+
+    scale_x = page_pdf.w / page_svg.w if getattr(page_svg, "w", 0.0) else 1.0
+    scale_y = page_pdf.h / page_svg.h if getattr(page_svg, "h", 0.0) else 1.0
+    svg_infos = _scale_segments(svg_infos_raw, scale_x, scale_y)
+
+    pdf_top = select_topk_longest(pdf_infos, sample_topk_rel)
+    svg_top = select_topk_longest(svg_infos, sample_topk_rel)
+
+    pdf_hist_x = x_histogram_of_verticals(pdf_top, hist_bin_px, page_pdf.w, axis_tol)
+    pdf_hist_y = y_histogram_of_horizontals(pdf_top, hist_bin_px, page_pdf.h, axis_tol)
+
+    candidates = []
+    for rot in (0, 180):
+        for flip in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+            svg_trans = _transform_segments(svg_top, page_pdf.w, page_pdf.h, flip, rot)
+            svg_hist_x = x_histogram_of_verticals(svg_trans, hist_bin_px, page_pdf.w, axis_tol)
+            svg_hist_y = y_histogram_of_horizontals(svg_trans, hist_bin_px, page_pdf.h, axis_tol)
+
+            dx_doc = 0.0
+            dy_doc = 0.0
+            used_hist_x = False
+            used_hist_y = False
+            responses: List[float] = []
+
+            if pdf_hist_x.size > 1 and svg_hist_x.size > 1:
+                shift_x, resp_x = argmax_xcorr(pdf_hist_x, svg_hist_x)
+                bin_w = page_pdf.w / max(len(pdf_hist_x), 1)
+                dx_doc = shift_x * bin_w
+                responses.append(resp_x)
+                used_hist_x = True
+
+            if pdf_hist_y.size > 1 and svg_hist_y.size > 1:
+                shift_y, resp_y = argmax_xcorr(pdf_hist_y, svg_hist_y)
+                bin_h = page_pdf.h / max(len(pdf_hist_y), 1)
+                dy_doc = shift_y * bin_h
+                responses.append(resp_y)
+                used_hist_y = True
+
+            A = rasterize_segments(pdf_top, page_pdf.w, page_pdf.h, raster_size, raster_size, (1, 1), 0)
+            B = rasterize_segments(svg_top, page_pdf.w, page_pdf.h, raster_size, raster_size, flip, rot)
+
+            sx_canvas = raster_size / page_pdf.w if page_pdf.w else 1.0
+            sy_canvas = raster_size / page_pdf.h if page_pdf.h else 1.0
+
+            du = dx_doc * sx_canvas
+            dv = -dy_doc * sy_canvas
+
+            phase_resp = 0.0
+            if not (used_hist_x and used_hist_y):
+                du_pc, dv_pc, phase_resp = phase_correlation(B, A)
+                if not used_hist_x:
+                    dx_doc = du_pc / sx_canvas
+                    du = du_pc
+                if not used_hist_y:
+                    dy_doc = -dv_pc / sy_canvas
+                    dv = dv_pc
+                responses.append(phase_resp)
+
+            overlap = 0.0
+            if raster_size > 0:
+                shifted = np.roll(np.roll(B, int(round(du)), axis=1), int(round(dv)), axis=0)
+                overlap = float((A & shifted).mean() / 255.0)
+
+            response_score = float(np.mean(responses)) if responses else 0.0
+
+            F = np.array([[flip[0], 0.0], [0.0, flip[1]]], dtype=float)
+            a = math.radians(rot)
+            ca, sa = math.cos(a), math.sin(a)
+            R = np.array([[ca, -sa], [sa, ca]], dtype=float)
+            M = F @ R
+            t_seed = M.T @ np.array([dx_doc, dy_doc], dtype=float)
+
+            norm_shift = (abs(dx_doc) / (page_pdf.w or 1.0)) + (abs(dy_doc) / (page_pdf.h or 1.0))
+
+            candidates.append(
+                {
+                    "overlap": overlap,
+                    "response": response_score,
+                    "rot_deg": rot,
+                    "flip": flip,
+                    "dx_doc": float(dx_doc),
+                    "dy_doc": float(dy_doc),
+                    "du_dv": (float(du), float(dv)),
+                    "t_seed": (float(t_seed[0]), float(t_seed[1])),
+                    "phase_response": phase_resp,
+                    "norm_shift": float(norm_shift),
+                }
+            )
+
+    candidates.sort(
+        key=lambda item: (item["overlap"] - 0.25 * item.get("norm_shift", 0.0), item["response"]),
+        reverse=True,
+    )
+    best = candidates[0] if candidates else {
+        "flip": (1, 1),
+        "rot_deg": 0,
+        "dx_doc": 0.0,
+        "dy_doc": 0.0,
+        "du_dv": (0.0, 0.0),
+        "t_seed": (0.0, 0.0),
+        "overlap": 0.0,
+        "response": 0.0,
+    }
+
+    best["min_accept_score"] = min_accept
+    best["widen_window"] = best.get("overlap", 0.0) < min_accept
+    best.setdefault("phase_response", 0.0)
+    return best
+

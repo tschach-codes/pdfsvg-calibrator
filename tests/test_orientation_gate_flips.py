@@ -1,21 +1,18 @@
 import math
 import os
 import sys
+from types import SimpleNamespace
 from itertools import product
-from typing import Iterable, List, Tuple
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import pdfsvg_calibrator.orientation as orientation_module
-from pdfsvg_calibrator.orientation import pick_flip_and_rot
+from pdfsvg_calibrator.orientation import pick_flip_rot_and_shift
 from pdfsvg_calibrator.types import Segment
 
 
-def _base_segments() -> List[Segment]:
-    """Return a non-symmetric set of segments within the page."""
-
+def _base_segments() -> list[Segment]:
     return [
         Segment(25.0, 30.0, 180.0, 45.0),
         Segment(60.0, 40.0, 95.0, 150.0),
@@ -29,38 +26,40 @@ def _base_segments() -> List[Segment]:
 
 
 def _transform_segments(
-    segments: Iterable[Segment],
-    flip: Tuple[float, float],
+    segments: list[Segment],
+    flip: tuple[float, float],
     rot_deg: int,
-    page_size: Tuple[float, float],
-) -> List[Segment]:
+    page_size: tuple[float, float],
+    tx: float = 0.0,
+    ty: float = 0.0,
+) -> list[Segment]:
     cx, cy = page_size[0] / 2.0, page_size[1] / 2.0
     ang = math.radians(rot_deg % 360)
     cos_a = math.cos(ang)
     sin_a = math.sin(ang)
-    transformed: List[Segment] = []
+    transformed: list[Segment] = []
     for seg in segments:
         coords = [(seg.x1, seg.y1), (seg.x2, seg.y2)]
         new_coords = []
         for x, y in coords:
             fx = cx + flip[0] * (x - cx)
             fy = cy + flip[1] * (y - cy)
-            tx = fx - cx
-            ty = fy - cy
-            rx = cos_a * tx - sin_a * ty
-            ry = sin_a * tx + cos_a * ty
-            new_coords.append((rx + cx, ry + cy))
+            tx_rel = fx - cx
+            ty_rel = fy - cy
+            rx = cos_a * tx_rel - sin_a * ty_rel
+            ry = sin_a * tx_rel + cos_a * ty_rel
+            new_coords.append((rx + cx + tx, ry + cy + ty))
         (x1, y1), (x2, y2) = new_coords
         transformed.append(Segment(x1=x1, y1=y1, x2=x2, y2=y2))
     return transformed
 
 
-def _matrix_for(flip: Tuple[float, float], rot_deg: int) -> Tuple[float, float]:
+def _matrix_for(flip: tuple[float, float], rot_deg: int) -> tuple[int, int]:
     rot_norm = rot_deg % 360
     if rot_norm == 0:
-        return flip
+        return (int(math.copysign(1, flip[0])), int(math.copysign(1, flip[1])))
     if rot_norm == 180:
-        return (-flip[0], -flip[1])
+        return (-int(math.copysign(1, flip[0])), -int(math.copysign(1, flip[1])))
     raise ValueError("rotation must be 0 or 180 degrees")
 
 
@@ -68,83 +67,42 @@ def _matrix_for(flip: Tuple[float, float], rot_deg: int) -> Tuple[float, float]:
     "flip, rot_deg",
     list(product(((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)), (0, 180))),
 )
-def test_orientation_gate_matches_expected_transform(
-    flip: Tuple[float, float], rot_deg: int
+def test_pick_flip_rot_and_shift_detects_orientation(
+    flip: tuple[float, float], rot_deg: int
 ) -> None:
     pdf_size = (220.0, 170.0)
     pdf_segments = _base_segments()
     svg_segments = _transform_segments(pdf_segments, flip, rot_deg, pdf_size)
 
-    result_flip, result_rot, tx, ty = pick_flip_and_rot(
-        pdf_segments,
-        svg_segments,
-        pdf_size,
-        pdf_size,
-    )
+    cfg = {"orientation": {"sample_topk_rel": 1.0, "raster_size": 128, "min_accept_score": 0.01}}
+    page = SimpleNamespace(w=pdf_size[0], h=pdf_size[1])
 
-    expected_matrix = _matrix_for(flip, rot_deg)
-    result_matrix = _matrix_for(result_flip, result_rot)
+    result = pick_flip_rot_and_shift(pdf_segments, svg_segments, page, page, cfg)
 
-    assert result_matrix == expected_matrix
-    assert abs(tx) < 1e-2
-    assert abs(ty) < 1e-2
+    result_flip = tuple(result["flip"])
+    result_rot = int(result["rot_deg"])
+
+    expected = _matrix_for(flip, rot_deg)
+    actual = _matrix_for(result_flip, result_rot)
+    assert actual == expected
+    assert abs(result.get("dx_doc", 0.0)) < 1e-3
+    assert abs(result.get("dy_doc", 0.0)) < 1e-3
 
 
-def test_orientation_fallback_prefers_default_when_better(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pick_flip_rot_and_shift_recovers_translation() -> None:
     pdf_size = (220.0, 170.0)
     pdf_segments = _base_segments()
-    svg_segments = list(pdf_segments)
+    tx_true = 6.5
+    ty_true = -4.0
+    svg_segments = _transform_segments(pdf_segments, (1.0, 1.0), 0, pdf_size, tx=tx_true, ty=ty_true)
 
-    monkeypatch.setattr(orientation_module, "DEFAULT_USE_PHASE_CORRELATION", False)
-    monkeypatch.setattr(orientation_module, "DEFAULT_MIN_ACCEPT_SCORE", 0.05)
+    cfg = {"orientation": {"sample_topk_rel": 1.0, "raster_size": 128, "min_accept_score": 0.01}}
+    page = SimpleNamespace(w=pdf_size[0], h=pdf_size[1])
 
-    overlap_values = iter([0.01, 0.009, 0.008, 0.007, 0.006, 0.005, 0.004, 0.003, 0.01, 0.2])
+    result = pick_flip_rot_and_shift(pdf_segments, svg_segments, page, page, cfg)
 
-    def fake_overlap(_img_a, _img_b):
-        return next(overlap_values)
-
-    monkeypatch.setattr(orientation_module, "_normalized_overlap", fake_overlap)
-
-    result = orientation_module.pick_flip_and_rot(
-        pdf_segments,
-        svg_segments,
-        pdf_size,
-        pdf_size,
-    )
-
-    assert result.path == "fallback_orientation"
-    assert result.widen_trans_window is False
-    assert result.trans_window_hint_px is None
-    assert result.primary_score == pytest.approx(0.01)
-    assert result.fallback_score == pytest.approx(0.2)
-    assert result.score == pytest.approx(0.2)
-
-
-def test_orientation_fallback_requests_wide_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    pdf_size = (220.0, 170.0)
-    pdf_segments = _base_segments()
-    svg_segments = list(pdf_segments)
-
-    monkeypatch.setattr(orientation_module, "DEFAULT_USE_PHASE_CORRELATION", False)
-    monkeypatch.setattr(orientation_module, "DEFAULT_MIN_ACCEPT_SCORE", 0.05)
-
-    overlap_values = iter([0.01, 0.009, 0.008, 0.007, 0.006, 0.005, 0.004, 0.003, 0.01, 0.005])
-
-    def fake_overlap(_img_a, _img_b):
-        return next(overlap_values)
-
-    monkeypatch.setattr(orientation_module, "_normalized_overlap", fake_overlap)
-
-    result = orientation_module.pick_flip_and_rot(
-        pdf_segments,
-        svg_segments,
-        pdf_size,
-        pdf_size,
-    )
-
-    assert result.path == "fallback_wide_window"
-    assert result.widen_trans_window is True
-    assert result.trans_window_hint_px == pytest.approx(orientation_module.WIDE_TRANS_WINDOW_PX)
-    assert result.primary_score == pytest.approx(0.01)
-    assert result.fallback_score == pytest.approx(0.005)
-    assert result.score == pytest.approx(0.01)
+    assert result["flip"] == (1, 1)
+    assert result["rot_deg"] == 0
+    tx_seed, ty_seed = result["t_seed"]
+    assert pytest.approx(tx_seed, abs=1.0) == -tx_true
+    assert pytest.approx(ty_seed, abs=1.0) == -ty_true

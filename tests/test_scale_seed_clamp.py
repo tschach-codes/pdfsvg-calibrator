@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pdfsvg_calibrator.calibrate as calibrate_module
 import pdfsvg_calibrator.fit_model as fit_model_module
 from pdfsvg_calibrator.calibrate import calibrate
-from pdfsvg_calibrator.orientation import OrientationPickResult
 from pdfsvg_calibrator.types import Model, Segment
 
 
@@ -74,24 +73,19 @@ def test_scale_seed_and_bounds_clamp(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Tuple[Tuple[float, float], Tuple[float, float]] | Tuple[float, float]] = {}
 
     def fake_pick(*_args, **_kwargs):
-        return OrientationPickResult(
-            flip_xy=(1.0, 1.0),
-            rot_deg=0,
-            tx=0.0,
-            ty=0.0,
-            score=1.0,
-            overlap=1.0,
-            response=1.0,
-            path="primary",
-            primary_score=1.0,
-            primary_overlap=1.0,
-            fallback_score=None,
-            fallback_overlap=None,
-            widen_trans_window=False,
-            trans_window_hint_px=None,
-        )
+        return {
+            "flip": (1.0, 1.0),
+            "rot_deg": 0,
+            "t_seed": (0.0, 0.0),
+            "dx_doc": 0.0,
+            "dy_doc": 0.0,
+            "du_dv": (0.0, 0.0),
+            "overlap": 1.0,
+            "response": 1.0,
+            "phase_response": 1.0,
+        }
 
-    monkeypatch.setattr(calibrate_module, "pick_flip_and_rot", fake_pick)
+    monkeypatch.setattr(calibrate_module, "pick_flip_rot_and_shift", fake_pick)
 
     def stub_ransac(*args, **kwargs):
         cfg_local = kwargs.get("cfg") if "cfg" in kwargs else args[4]
