@@ -77,13 +77,13 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
     "grid": {"initial_cell_rel": 0.05, "final_cell_rel": 0.02},
     "chamfer": {"sigma_rel": 0.004, "hard_mul": 3.0},
     "refine": {
-        "max_iters": 120,
+        "max_iters": 60,
         "max_samples": 1500,
         "scale_max_dev_rel": 0.02,
-        "trans_max_dev_px": 10.0,
+        "trans_max_dev_px": 8.0,
     },
     "ransac": {
-        "iters": 120,
+        "iters": 60,
         "refine_scale_step": 0.004,
         "refine_trans_px": 3.0,
         "patience": 60,

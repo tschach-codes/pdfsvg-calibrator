@@ -142,15 +142,18 @@ def calibrate(
     if not isinstance(refine_cfg, dict):
         raise ValueError("refine config must be a mapping")
     scale_window_base_val = abs(float(refine_cfg.get("scale_max_dev_rel", 0.02)))
-    trans_window_base = abs(float(refine_cfg.get("trans_max_dev_px", 10.0)))
+    trans_window_base = abs(float(refine_cfg.get("trans_max_dev_px", 8.0)))
     trans_window_initial = trans_window_base
     if use_orientation and orientation_result is not None:
         overlap = float(orientation_result.get("overlap", 0.0))
         if overlap < min_accept_score:
-            trans_window_initial = max(trans_window_initial, 25.0)
-        else:
-            trans_window_initial = max(trans_window_initial, 10.0)
-    max_iters_base = int(refine_cfg.get("max_iters", 120))
+            log.info(
+                "[orient] overlap %.3f below %.3f – keeping minimal refine window ±%.1fpx",
+                overlap,
+                min_accept_score,
+                trans_window_initial,
+            )
+    max_iters_base = int(refine_cfg.get("max_iters", 60))
     refine_cfg.setdefault("max_samples", 1500)
 
     def _apply_refine_window(
@@ -196,12 +199,12 @@ def calibrate(
     ransac_cfg = cfg_local.setdefault("ransac", {})  # type: ignore[assignment]
     if not isinstance(ransac_cfg, dict):
         raise ValueError("ransac config must be a mapping")
-    ransac_cfg.setdefault("iters", refine_cfg.get("max_iters", 120))
+    ransac_cfg.setdefault("iters", refine_cfg.get("max_iters", 60))
     if "refine_scale_step" not in ransac_cfg:
         scale_window = float(refine_cfg.get("scale_max_dev_rel", 0.02))
         ransac_cfg["refine_scale_step"] = max(scale_window / 10.0, 1e-4)
     if "refine_trans_px" not in ransac_cfg:
-        trans_window = float(refine_cfg.get("trans_max_dev_px", 10.0))
+        trans_window = float(refine_cfg.get("trans_max_dev_px", 8.0))
         ransac_cfg["refine_trans_px"] = max(trans_window / 3.0, 0.5)
 
     sampling_cfg = cfg_local.setdefault("sampling", {})  # type: ignore[assignment]
@@ -330,12 +333,12 @@ def calibrate(
     if gate_enabled:
         failures = _quality_failures(model)
         if failures:
-            fallback_trans_window = max(trans_window_base, fallback_trans)
-            fallback_scale_window = max(scale_window_base_val, fallback_scale)
+            fallback_trans_window = min(trans_window_base, fallback_trans)
+            fallback_scale_window = min(scale_window_base_val, fallback_scale)
             fallback_iters = max(1, min(max_iters_base, fallback_iters_cfg))
             log.warning(
                 "[calib] quality gate triggered (RMSE=%.2fpx, P95=%.2fpx, Score=%.4f; %s); "
-                "expanding to trans=±%.1fpx, scale=±%.2f%% and running fallback (max %d iters)",
+                "retrying with trans=±%.1fpx, scale=±%.2f%% (max %d iters)",
                 model.rmse,
                 model.p95,
                 model.score,
