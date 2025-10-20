@@ -5,6 +5,7 @@ import re
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -592,6 +593,19 @@ def _segment_angle(seg: Segment) -> Optional[float]:
     return float(angle)
 
 
+def _classify_segment_axes(segments: Sequence[Segment]) -> List[str]:
+    if not segments:
+        return []
+    arr = np.array(
+        [[seg.x1, seg.y1, seg.x2, seg.y2] for seg in segments],
+        dtype=np.float64,
+    )
+    dx = np.abs(arr[:, 2] - arr[:, 0])
+    dy = np.abs(arr[:, 3] - arr[:, 1])
+    axes = np.where(dx >= dy, "H", "V")
+    return [str(axis) for axis in axes]
+
+
 def _angle_diff_deg(a: float, b: float) -> float:
     diff = abs(a - b) % 180.0
     if diff > 90.0:
@@ -611,17 +625,151 @@ def _point_line_distance(pt: Tuple[float, float], start: Tuple[float, float], en
     return abs((x0 - x1) * dy - (y0 - y1) * dx) / denom
 
 
-def _max_perpendicular_offset(a: Segment, b: Segment) -> float:
-    start = (a.x1, a.y1)
-    end = (a.x2, a.y2)
-    offsets = [
-        _point_line_distance((b.x1, b.y1), start, end),
-        _point_line_distance((b.x2, b.y2), start, end),
-    ]
-    return float(max(offsets))
+def _merge_collinear_axis(
+    segments: Sequence[Segment],
+    axis: str,
+    diag: float,
+    angle_tol: float,
+    gap_tol: float,
+    offset_tol: float,
+) -> List[Segment]:
+    if not segments:
+        return []
+
+    bin_size = max(offset_tol, max(diag * 1e-6, 1e-9))
+
+    def _prepare(seg: Segment) -> Optional[Dict[str, object]]:
+        length = _segment_length(seg)
+        if length <= 1e-9:
+            return None
+        angle = _segment_angle(seg)
+        if axis == "H":
+            run_start = min(seg.x1, seg.x2)
+            run_end = max(seg.x1, seg.x2)
+            offset = 0.5 * (seg.y1 + seg.y2)
+            if seg.x1 <= seg.x2:
+                start_point = (seg.x1, seg.y1)
+                end_point = (seg.x2, seg.y2)
+            else:
+                start_point = (seg.x2, seg.y2)
+                end_point = (seg.x1, seg.y1)
+        else:
+            run_start = min(seg.y1, seg.y2)
+            run_end = max(seg.y1, seg.y2)
+            offset = 0.5 * (seg.x1 + seg.x2)
+            if seg.y1 <= seg.y2:
+                start_point = (seg.x1, seg.y1)
+                end_point = (seg.x2, seg.y2)
+            else:
+                start_point = (seg.x2, seg.y2)
+                end_point = (seg.x1, seg.y1)
+
+        bucket = int(round(offset / bin_size))
+        return {
+            "segment": seg,
+            "run_start": run_start,
+            "run_end": run_end,
+            "offset": offset,
+            "angle": angle,
+            "length": length,
+            "start_point": start_point,
+            "end_point": end_point,
+            "bucket": bucket,
+        }
+
+    bins: Dict[int, List[Dict[str, object]]] = defaultdict(list)
+    passthrough: List[Segment] = []
+
+    for seg in segments:
+        prepared = _prepare(seg)
+        if prepared is None:
+            passthrough.append(seg)
+            continue
+        bins[int(prepared["bucket"])].append(prepared)
+
+    merged: List[Segment] = []
+
+    def _finalize(group: Optional[Dict[str, object]]) -> None:
+        if not group:
+            return
+        sx, sy = group["start_point"]  # type: ignore[index]
+        ex, ey = group["end_point"]  # type: ignore[index]
+        merged.append(Segment(float(sx), float(sy), float(ex), float(ey)))
+
+    for bucket in sorted(bins.keys()):
+        items = bins[bucket]
+        items.sort(key=lambda data: float(data["run_start"]))
+        current: Optional[Dict[str, object]] = None
+        for data in items:
+            if current is None:
+                current = dict(data)
+                continue
+
+            run_gap = max(0.0, float(data["run_start"]) - float(current["run_end"]))
+            if run_gap > gap_tol:
+                _finalize(current)
+                current = dict(data)
+                continue
+
+            offset_diff = abs(float(data["offset"]) - float(current["offset"]))
+            if offset_diff > offset_tol:
+                _finalize(current)
+                current = dict(data)
+                continue
+
+            angle_a = current.get("angle")
+            angle_b = data.get("angle")
+            angle_diff = 0.0
+            if angle_a is not None and angle_b is not None:
+                angle_diff = _angle_diff_deg(float(angle_a), float(angle_b))
+            if angle_diff > angle_tol:
+                _finalize(current)
+                current = dict(data)
+                continue
+
+            length_a = float(current["length"])
+            length_b = float(data["length"])
+            if length_a < 0:
+                length_a = 0.0
+            if length_b < 0:
+                length_b = 0.0
+            total_length = length_a + length_b
+            if total_length <= 0:
+                total_length = 1.0
+
+            current["offset"] = (
+                float(current["offset"]) * length_a + float(data["offset"]) * length_b
+            ) / total_length
+
+            if angle_a is None:
+                current["angle"] = angle_b
+            elif angle_b is not None:
+                current["angle"] = (
+                    float(angle_a) * length_a + float(angle_b) * length_b
+                ) / total_length
+
+            if float(data["run_start"]) < float(current["run_start"]):
+                current["run_start"] = data["run_start"]
+                current["start_point"] = data["start_point"]
+
+            if float(data["run_end"]) >= float(current["run_end"]):
+                current["run_end"] = data["run_end"]
+                current["end_point"] = data["end_point"]
+
+            current["length"] = total_length
+
+        _finalize(current)
+
+    merged.extend(passthrough)
+    return merged
 
 
-def _merge_collinear_segments(segments: List[Segment], diag: float, cfg: dict) -> List[Segment]:
+def _merge_collinear_segments(
+    segments: List[Segment],
+    diag: float,
+    cfg: dict,
+    axes: Optional[Sequence[str]] = None,
+) -> List[Segment]:
     merge_cfg = cfg.get("merge") or {}
     if not merge_cfg.get("enable", False):
         return segments
@@ -641,90 +789,14 @@ def _merge_collinear_segments(segments: List[Segment], diag: float, cfg: dict) -
         gap_tol = float(merge_cfg.get("gap_max_rel", 0.003)) * diag
         offset_tol = float(merge_cfg.get("offset_tol_rel", 0.002)) * diag
 
-    angles: List[Optional[float]] = []
-    for seg in segments:
-        angles.append(_segment_angle(seg))
-
-    bucket_size = max(gap_tol, 1e-6)
-
-    parent = list(range(len(segments)))
-    rank = [0] * len(segments)
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i: int, j: int) -> None:
-        ri = find(i)
-        rj = find(j)
-        if ri == rj:
-            return
-        if rank[ri] < rank[rj]:
-            parent[ri] = rj
-        elif rank[ri] > rank[rj]:
-            parent[rj] = ri
-        else:
-            parent[rj] = ri
-            rank[ri] += 1
-
-    buckets: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = defaultdict(list)
-
-    for idx, seg in enumerate(segments):
-        endpoints = ((seg.x1, seg.y1), (seg.x2, seg.y2))
-        for x, y in endpoints:
-            cell = (int(round(x / bucket_size)), int(round(y / bucket_size)))
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    candidates = buckets.get((cell[0] + dx, cell[1] + dy))
-                    if not candidates:
-                        continue
-                    for other_idx, ox, oy in candidates:
-                        if other_idx == idx:
-                            continue
-                        ang_a = angles[idx]
-                        ang_b = angles[other_idx]
-                        if ang_a is None or ang_b is None:
-                            continue
-                        if _angle_diff_deg(ang_a, ang_b) > angle_tol:
-                            continue
-                        if math.hypot(x - ox, y - oy) > gap_tol:
-                            continue
-                        offset = max(
-                            _max_perpendicular_offset(seg, segments[other_idx]),
-                            _max_perpendicular_offset(segments[other_idx], seg),
-                        )
-                        if offset > offset_tol:
-                            continue
-                        union(idx, other_idx)
-            buckets[cell].append((idx, x, y))
-
-    components: Dict[int, List[int]] = defaultdict(list)
-    for idx in range(len(segments)):
-        components[find(idx)].append(idx)
+    axes_list = list(axes) if axes is not None else _classify_segment_axes(segments)
+    if len(axes_list) != len(segments):
+        axes_list = _classify_segment_axes(segments)
 
     merged: List[Segment] = []
-    for _, comp in sorted(components.items(), key=lambda item: min(item[1])):
-        if len(comp) == 1:
-            merged.append(segments[comp[0]])
-            continue
-
-        points: List[Tuple[float, float]] = []
-        for idx in comp:
-            seg = segments[idx]
-            points.append((seg.x1, seg.y1))
-            points.append((seg.x2, seg.y2))
-
-        fit = _fit_polyline(points)
-        if fit and fit.segment and fit.delta_max <= offset_tol:
-            seg_fit = fit.segment
-            if _segment_length(seg_fit) > 1e-9:
-                merged.append(seg_fit)
-                continue
-
-        for idx in comp:
-            merged.append(segments[idx])
+    for axis in ("H", "V"):
+        axis_segments = [seg for seg, seg_axis in zip(segments, axes_list) if seg_axis == axis]
+        merged.extend(_merge_collinear_axis(axis_segments, axis, diag, angle_tol, gap_tol, offset_tol))
 
     return merged
 
@@ -882,8 +954,15 @@ def parse_svg_segments(svg_path: str, cfg: dict) -> List[Segment]:
     for child in root:
         process_node(child, root_matrix)
 
-    merged = _merge_collinear_segments(segments, diag, cfg)
     merge_cfg = cfg.get("merge") or {}
+    axes: Optional[Sequence[str]] = None
+    if merge_cfg.get("enable", False):
+        axes = _classify_segment_axes(segments)
+
+    merge_start = perf_counter()
+    merged = _merge_collinear_segments(segments, diag, cfg, axes=axes)
+    merge_elapsed = perf_counter() - merge_start
+
     if merge_cfg.get("enable", False):
         before = len(segments)
         after = len(merged)
@@ -897,10 +976,11 @@ def parse_svg_segments(svg_path: str, cfg: dict) -> List[Segment]:
                 sign = "-" if percent < 0 else "+"
                 percent_str = f"{sign}{abs(percent):.0f}%"
         log.info(
-            "SVG segments: %s → %s after merge (%s)",
+            "SVG segments: %s → %s after merge (%s) in %.3fs",
             f"{before:,}",
             f"{after:,}",
             percent_str,
+            merge_elapsed,
         )
 
     return merged
