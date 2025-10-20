@@ -341,11 +341,20 @@ def candidate_cost(
     endpoint_term = _endpoint_term(pdf_seg_T, svg_seg, radius)
     midpoint_term = _midpoint_term(pdf_seg_T, svg_seg, radius)
     neighbors_cfg = cfg.get("neighbors", {})
-    neighbor_term = _neighbor_cost(sig_pdf, sig_svg, neighbors_cfg)
+    neighbors_enabled = True
+    if isinstance(neighbors_cfg, dict):
+        neighbors_enabled = bool(neighbors_cfg.get("use", True))
+    else:
+        neighbors_cfg = {}
+    neighbor_term = 0.0
     w_endpoint = float(weights.get("endpoint", 1.0))
     w_midpoint = float(weights.get("midpoint", 1.0))
     w_direction = float(weights.get("direction", 1.0))
     w_neighbors = float(weights.get("neighbors", 1.0))
+    if neighbors_enabled:
+        neighbor_term = _neighbor_cost(sig_pdf, sig_svg, neighbors_cfg)
+    else:
+        w_neighbors = 0.0
     cost = (
         w_endpoint * endpoint_term
         + w_midpoint * midpoint_term
@@ -361,12 +370,13 @@ def _prepare_segment_infos(
     angle_tol_deg: float,
     *,
     use_grid: bool = True,
+    compute_signature: bool = True,
 ) -> List[_SegmentInfo]:
     infos: List[_SegmentInfo] = []
     if not segments:
         return infos
     grid: Optional[SegmentGrid] = None
-    if use_grid and radius > 0 and len(segments) > 1:
+    if compute_signature and use_grid and radius > 0 and len(segments) > 1:
         min_x, min_y, max_x, max_y, _ = _bbox_and_diag(segments)
         cell_size = max(radius * 0.5, 1.0)
         grid = SegmentGrid(segments, cell_size, (min_x, min_y, max_x, max_y))
@@ -374,17 +384,20 @@ def _prepare_segment_infos(
         length = _segment_length(seg)
         axis = _is_axis_aligned(seg, angle_tol_deg)
         center = _segment_center(seg)
-        if grid is not None:
-            neighbor_ids = grid.query_indices(center[0], center[1], radius)
-            signature = neighbor_signature(
-                seg,
-                grid,
-                radius,
-                angle_tol_deg,
-                neighbor_indices=neighbor_ids,
-            )
+        if compute_signature:
+            if grid is not None:
+                neighbor_ids = grid.query_indices(center[0], center[1], radius)
+                signature = neighbor_signature(
+                    seg,
+                    grid,
+                    radius,
+                    angle_tol_deg,
+                    neighbor_indices=neighbor_ids,
+                )
+            else:
+                signature = neighbor_signature(seg, segments, radius, angle_tol_deg)
         else:
-            signature = neighbor_signature(seg, segments, radius, angle_tol_deg)
+            signature = []
         infos.append(_SegmentInfo(seg, axis, length, center, signature))
     return infos
 
@@ -674,16 +687,25 @@ def match_lines(
 ) -> List[Match]:
     verify_cfg = cfg.get("verify", {})
     neighbors_cfg = cfg.get("neighbors", {})
+    if neighbors_cfg and not isinstance(neighbors_cfg, dict):
+        raise ValueError("neighbors config must be a mapping")
+    neighbors_cfg = dict(neighbors_cfg)
+    neighbors_enabled = bool(neighbors_cfg.get("use", True))
+    cfg_local = dict(cfg)
+    cfg_local["neighbors"] = neighbors_cfg
     cost_weights = cfg.get("cost_weights", {})
     dir_tol_deg = float(verify_cfg.get("dir_tol_deg", cfg.get("angle_tol_deg", 6.0)))
     tol_rel = float(verify_cfg.get("tol_rel", 0.01))
     radius_px = float(verify_cfg.get("radius_px", 80.0))
     angle_tol_deg = float(verify_cfg.get("angle_tol_deg", 4.0))
     _, _, _, _, diag_svg = _bbox_and_diag(svg_segs)
-    neighbor_radius = float(neighbors_cfg.get("radius_rel", 0.06)) * diag_svg
-    if neighbor_radius <= 0:
-        neighbor_radius = radius_px
-    fast_signature = bool(neighbors_cfg.get("fast_signature", True))
+    neighbor_radius = 0.0
+    fast_signature = False
+    if neighbors_enabled:
+        neighbor_radius = float(neighbors_cfg.get("radius_rel", 0.06)) * diag_svg
+        if neighbor_radius <= 0:
+            neighbor_radius = radius_px
+        fast_signature = bool(neighbors_cfg.get("fast_signature", True))
 
     transformed_pdf: List[Segment] = []
     for seg in pdf_lines:
@@ -696,12 +718,14 @@ def match_lines(
         neighbor_radius,
         angle_tol_deg,
         use_grid=fast_signature,
+        compute_signature=neighbors_enabled,
     )
     svg_infos = _prepare_segment_infos(
         svg_segs,
         neighbor_radius,
         angle_tol_deg,
         use_grid=fast_signature,
+        compute_signature=neighbors_enabled,
     )
 
     pdf_axis_counts = {
@@ -743,7 +767,7 @@ def match_lines(
                     cost_weights,
                     pdf_info.signature,
                     svg_info.signature,
-                    cfg,
+                    cfg_local,
                 )
                 if math.isinf(cost):
                     continue
