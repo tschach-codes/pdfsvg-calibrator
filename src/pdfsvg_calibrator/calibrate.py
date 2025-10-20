@@ -3,29 +3,16 @@ from __future__ import annotations
 
 import copy
 import logging
+from types import SimpleNamespace
 from typing import Dict, Mapping, Sequence, Tuple
 
 from .fit_model import calibrate as _calibrate_ransac
-from .orientation import (
-    DEFAULT_MIN_ACCEPT_SCORE,
-    DEFAULT_RASTER_SIZE,
-    DEFAULT_USE_PHASE_CORRELATION,
-    pick_flip_and_rot,
-)
+from .orientation import pick_flip_rot_and_shift
 from .types import Model, Segment
 from .metrics import Timer
 from .transform import Transform2D
 
 log = logging.getLogger(__name__)
-
-
-def _ensure_size_tuple(value: int | Tuple[int, int] | Sequence[int]) -> Tuple[int, int]:
-    if isinstance(value, int):
-        return (value, value)
-    seq = list(value)
-    if len(seq) != 2:
-        raise ValueError("raster size must have two entries")
-    return int(seq[0]), int(seq[1])
 
 
 def calibrate(
@@ -48,65 +35,17 @@ def calibrate(
     if not isinstance(orientation_cfg, dict):
         raise ValueError("orientation config must be a mapping")
 
-    raster_size = orientation_cfg.get("raster_size", DEFAULT_RASTER_SIZE)
-    try:
-        raster_tuple = _ensure_size_tuple(raster_size)
-    except Exception as exc:  # pragma: no cover - defensive
-        raise ValueError("orientation.raster_size must be an int or length-2 sequence") from exc
-
-    use_phase = bool(orientation_cfg.get("use_phase_correlation", DEFAULT_USE_PHASE_CORRELATION))
-    min_accept_score = float(orientation_cfg.get("min_accept_score", DEFAULT_MIN_ACCEPT_SCORE))
+    orientation_cfg.setdefault("sample_topk_rel", 0.2)
+    orientation_cfg.setdefault("raster_size", 256)
+    min_accept_score = float(orientation_cfg.get("min_accept_score", 0.05))
     orientation_cfg["min_accept_score"] = min_accept_score
 
     flip_xy = (1.0, 1.0)
-    rot_deg = cfg_local.get("rot_degrees", [0])  # type: ignore[assignment]
-    if isinstance(rot_deg, Sequence):
-        rot_deg = rot_deg[0] if rot_deg else 0
-    rot_deg = int(rot_deg)  # type: ignore[assignment]
+    rot_deg = 0
     tx0 = 0.0
     ty0 = 0.0
 
     use_orientation = bool(orientation_cfg.get("enabled", True))
-
-    if use_orientation:
-        from . import orientation as orientation_module
-
-        orientation_module.DEFAULT_RASTER_SIZE = raster_tuple
-        orientation_module.DEFAULT_USE_PHASE_CORRELATION = use_phase
-        orientation_module.DEFAULT_MIN_ACCEPT_SCORE = min_accept_score
-        orientation_result = pick_flip_and_rot(
-            pdf_segments,
-            svg_segments,
-            pdf_size,
-            svg_size,
-        )
-        flip_xy, rot_deg, tx0, ty0 = orientation_result
-        orientation_cfg["flip_xy"] = flip_xy
-        orientation_cfg["rot_deg"] = rot_deg
-        orientation_cfg["translation"] = (tx0, ty0)
-        orientation_cfg["score"] = orientation_result.score
-        orientation_cfg["overlap"] = orientation_result.overlap
-        orientation_cfg["path"] = orientation_result.path
-        orientation_cfg["primary_score"] = orientation_result.primary_score
-        orientation_cfg["primary_overlap"] = orientation_result.primary_overlap
-        if orientation_result.fallback_score is not None:
-            orientation_cfg["fallback_score"] = orientation_result.fallback_score
-        if orientation_result.fallback_overlap is not None:
-            orientation_cfg["fallback_overlap"] = orientation_result.fallback_overlap
-        orientation_cfg["widen_trans_window"] = orientation_result.widen_trans_window
-        if orientation_result.trans_window_hint_px is not None:
-            orientation_cfg["trans_window_hint_px"] = orientation_result.trans_window_hint_px
-        log.info(
-            "Orientation: rot=%d, flip=%s, seed_t=(%.2f, %.2f))",
-            rot_deg,
-            flip_xy,
-            tx0,
-            ty0,
-        )
-    else:
-        orientation_cfg["flip_xy"] = flip_xy
-        orientation_cfg["rot_deg"] = rot_deg
-        orientation_cfg["translation"] = (tx0, ty0)
 
     pdf_w, pdf_h = pdf_size
     svg_w, svg_h = svg_size
@@ -114,6 +53,60 @@ def calibrate(
         raise ValueError("pdf_size must contain positive values")
     if svg_w == 0 or svg_h == 0:
         raise ValueError("svg_size must contain positive values")
+
+    page_pdf = SimpleNamespace(w=float(pdf_w), h=float(pdf_h))
+    page_svg = SimpleNamespace(w=float(svg_w), h=float(svg_h))
+
+    orientation_result = None
+
+    if use_orientation:
+        with Timer("seed.orientation"):
+            orientation_result = pick_flip_rot_and_shift(
+                pdf_segments,
+                svg_segments,
+                page_pdf,
+                page_svg,
+                cfg_local,
+            )
+        flip_xy = tuple(float(v) for v in orientation_result.get("flip", (1, 1)))  # type: ignore[assignment]
+        rot_deg = int(orientation_result.get("rot_deg", 0))
+        tx0 = float(orientation_result.get("t_seed", (0.0, 0.0))[0])
+        ty0 = float(orientation_result.get("t_seed", (0.0, 0.0))[1])
+
+        orientation_cfg["flip_xy"] = flip_xy
+        orientation_cfg["rot_deg"] = rot_deg
+        orientation_cfg["translation"] = (tx0, ty0)
+        orientation_cfg["overlap"] = float(orientation_result.get("overlap", 0.0))
+        orientation_cfg["response"] = float(orientation_result.get("response", 0.0))
+        orientation_cfg["phase_response"] = float(orientation_result.get("phase_response", 0.0))
+        orientation_cfg["du_dv"] = orientation_result.get("du_dv", (0.0, 0.0))
+        orientation_cfg["dx_dy_doc"] = (
+            float(orientation_result.get("dx_doc", 0.0)),
+            float(orientation_result.get("dy_doc", 0.0)),
+        )
+        orientation_cfg["t_seed"] = (tx0, ty0)
+
+        log.info(
+            "[orient] best rot=%d flip=%s overlap=%.3f resp=%.3f",
+            rot_deg,
+            flip_xy,
+            orientation_cfg["overlap"],
+            orientation_cfg["response"],
+        )
+        du, dv = orientation_result.get("du_dv", (0.0, 0.0))
+        log.info(
+            "[orient] shift_pixels=(%.2f, %.2f) dx_dy_doc=(%.2f, %.2f) -> t_seed=(%.2f, %.2f)",
+            float(du),
+            float(dv),
+            orientation_cfg["dx_dy_doc"][0],
+            orientation_cfg["dx_dy_doc"][1],
+            tx0,
+            ty0,
+        )
+    else:
+        orientation_cfg["flip_xy"] = flip_xy
+        orientation_cfg["rot_deg"] = rot_deg
+        orientation_cfg["translation"] = (tx0, ty0)
 
     sx0 = svg_w / pdf_w
     sy0 = svg_h / pdf_h
@@ -136,10 +129,12 @@ def calibrate(
     scale_window_base_val = abs(float(refine_cfg.get("scale_max_dev_rel", 0.02)))
     trans_window_base = abs(float(refine_cfg.get("trans_max_dev_px", 10.0)))
     trans_window_initial = trans_window_base
-    if use_orientation:
-        hint = orientation_cfg.get("trans_window_hint_px")
-        if isinstance(hint, (int, float)):
-            trans_window_initial = max(trans_window_initial, float(hint))
+    if use_orientation and orientation_result is not None:
+        overlap = float(orientation_result.get("overlap", 0.0))
+        if overlap < min_accept_score:
+            trans_window_initial = max(trans_window_initial, 25.0)
+        else:
+            trans_window_initial = max(trans_window_initial, 10.0)
     max_iters_base = int(refine_cfg.get("max_iters", 120))
     refine_cfg.setdefault("max_samples", 1500)
 

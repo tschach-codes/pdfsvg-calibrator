@@ -3,6 +3,9 @@ orientation:
   raster_size: 512
   use_phase_correlation: true
   min_accept_score: 0.05
+  sample_topk_rel: 0.2
+  hist_bin_px: 4.0
+  axis_snap_tol_deg: 2.0
 rot_degrees: [0, 180]
 angle_tol_deg: 6.0
 curve_tol_rel: 0.001

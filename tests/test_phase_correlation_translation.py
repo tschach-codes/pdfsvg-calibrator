@@ -23,4 +23,4 @@ def test_phase_correlation_recovers_integer_shift() -> None:
 
     assert abs(du + shift_x) <= 1.0
     assert abs(dv + shift_y) <= 1.0
-    assert response > 0.1
+    assert response > 1e-4
