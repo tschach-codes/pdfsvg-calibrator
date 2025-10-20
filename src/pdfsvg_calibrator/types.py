@@ -1,5 +1,10 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .transform import Transform2D
 
 @dataclass
 class Segment:
@@ -12,6 +17,9 @@ class Model:
     rot_deg: int
     sx: float; sy: float; tx: float; ty: float
     score: float; rmse: float; p95: float; median: float
+    flip_x: float = 1.0
+    flip_y: float = 1.0
+    transform: "Transform2D | None" = None
     quality_notes: Tuple[str, ...] = ()
 
 @dataclass

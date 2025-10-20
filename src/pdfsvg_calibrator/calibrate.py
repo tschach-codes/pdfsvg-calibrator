@@ -14,6 +14,7 @@ from .orientation import (
 )
 from .types import Model, Segment
 from .metrics import Timer
+from .transform import Transform2D
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +119,16 @@ def calibrate(
     sy0 = svg_h / pdf_h
     seed_sx = sx0
     seed_sy = sy0
+
+    seed_transform = Transform2D(
+        flip=flip_xy,
+        rot_deg=rot_deg,
+        sx=sx0,
+        sy=sy0,
+        tx=tx0,
+        ty=ty0,
+    )
+    orientation_cfg["transform_seed"] = seed_transform.summary()
 
     refine_cfg = cfg_local.setdefault("refine", {})  # type: ignore[assignment]
     if not isinstance(refine_cfg, dict):
@@ -265,4 +276,12 @@ def calibrate(
                 quality_notes.append(note)
 
     model.quality_notes = tuple(quality_notes)
+    model.transform = Transform2D(
+        flip=(model.flip_x, model.flip_y),
+        rot_deg=model.rot_deg,
+        sx=model.sx,
+        sy=model.sy,
+        tx=model.tx,
+        ty=model.ty,
+    )
     return model

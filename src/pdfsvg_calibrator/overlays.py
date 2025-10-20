@@ -3,12 +3,24 @@ from __future__ import annotations
 import csv
 import math
 import os
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import fitz
 from lxml import etree
 
 from .types import Match, Model
+
+
+def _flip_label_from_model(model: Model) -> str:
+    fx = int(model.flip_x)
+    fy = int(model.flip_y)
+    if fx < 0 and fy < 0:
+        return "XY"
+    if fx < 0:
+        return "X"
+    if fy < 0:
+        return "Y"
+    return "none"
 
 SVG_RED = "#F44336"
 SVG_BLUE = "#2979FF"
@@ -28,7 +40,9 @@ def _apply_model(model: Model, x: float, y: float) -> Tuple[float, float]:
         rx, ry = y, -x
     else:
         raise ValueError(f"Unsupported rotation: {model.rot_deg}")
-    return model.sx * rx + model.tx, model.sy * ry + model.ty
+    scale_x = model.flip_x * model.sx
+    scale_y = model.flip_y * model.sy
+    return scale_x * rx + model.tx, scale_y * ry + model.ty
 
 
 def _format_float(value: Optional[float], precision: int = 4) -> str:
@@ -60,7 +74,7 @@ def _metadata_lines(model: Model, alignment: Mapping[str, Any] | None) -> Tuple[
         shift = math.hypot(model.tx, model.ty)
         lines = [
             (
-                f"rot={model.rot_deg % 360}° | flips={'XY' if model.sx < 0 and model.sy < 0 else 'X' if model.sx < 0 else 'Y' if model.sy < 0 else 'none'} "
+                f"rot={model.rot_deg % 360}° | flips={_flip_label_from_model(model)} "
                 f"| sx={model.sx:.6f} | sy={model.sy:.6f}"
             ),
             (
@@ -76,9 +90,7 @@ def _metadata_lines(model: Model, alignment: Mapping[str, Any] | None) -> Tuple[
     rot_norm = alignment.get("rot_norm", model.rot_deg % 360)
     flip_label = alignment.get("flip_label")
     if not flip_label:
-        flip_label = (
-            "XY" if model.sx < 0 and model.sy < 0 else "X" if model.sx < 0 else "Y" if model.sy < 0 else "none"
-        )
+        flip_label = _flip_label_from_model(model)
     shift = alignment.get("shift", math.hypot(model.tx, model.ty))
     tol = alignment.get("tol")
     tol_source = alignment.get("tol_source", "config")
@@ -498,7 +510,7 @@ def write_report_csv(
                     "p95": _format_float(model.p95, 4),
                     "median": _format_float(model.median, 4),
                     "calibration_notes": "; ".join(model.quality_notes),
-                    "flip_xy": alignment.get("flip_label") if alignment else ("XY" if model.sx < 0 and model.sy < 0 else "X" if model.sx < 0 else "Y" if model.sy < 0 else "none"),
+                    "flip_xy": alignment.get("flip_label") if alignment else _flip_label_from_model(model),
                     "shift_abs": _format_float(alignment.get("shift") if alignment else math.hypot(model.tx, model.ty), 3),
                     "shift_tol_px": _format_float(alignment.get("tol") if alignment else None, 3),
                     "shift_tol_source": alignment.get("tol_source", "") if alignment else "",

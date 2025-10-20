@@ -11,6 +11,7 @@ import numpy as np
 
 from .geom import classify_hv
 from .metrics import Timer, get_tracker
+from .transform import Transform2D
 from .types import Model, Segment
 
 
@@ -198,6 +199,8 @@ def chamfer_score(
     sy: float,
     tx: float,
     ty: float,
+    flip_x: float,
+    flip_y: float,
     svg_grid: SegGrid,
     sigma: float,
     hard: float,
@@ -208,9 +211,11 @@ def chamfer_score(
         raise ValueError("sigma muss > 0 sein")
     inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma)
     total = 0.0
+    scale_x = flip_x * sx
+    scale_y = flip_y * sy
     for px, py in pts_pdf:
-        x = sx * px + tx
-        y = sy * py + ty
+        x = scale_x * px + tx
+        y = scale_y * py + ty
         d = _min_distance_to_grid(x, y, svg_grid, hard)
         if d >= hard:
             continue
@@ -227,9 +232,11 @@ def residual_stats(
     if not pts_pdf:
         raise ValueError("Es wurden keine Stichprobenpunkte übergeben")
     dists = []
+    scale_x = model.flip_x * model.sx
+    scale_y = model.flip_y * model.sy
     for px, py in pts_pdf:
-        x = model.sx * px + model.tx
-        y = model.sy * py + model.ty
+        x = scale_x * px + model.tx
+        y = scale_y * py + model.ty
         d = _min_distance_to_grid(x, y, svg_grid, hard)
         dists.append(d)
     arr = np.asarray(dists, dtype=float)
@@ -410,7 +417,7 @@ def calibrate(
     orientation_cfg = cfg.get("orientation", {})
     if orientation_cfg and not isinstance(orientation_cfg, dict):
         raise ValueError("orientation config muss ein Mapping sein")
-    flip_xy = None
+    flip_xy: Tuple[float, float] | None = None
     if isinstance(orientation_cfg, dict):
         flip_val = orientation_cfg.get("flip_xy")
         if flip_val is not None:
@@ -420,6 +427,8 @@ def calibrate(
             except Exception as exc:  # pragma: no cover - defensive
                 raise ValueError("orientation.flip_xy muss ein Paar aus Zahlen sein") from exc
 
+    flip_seed = flip_xy if flip_xy is not None else (1.0, 1.0)
+
     scale_seed = None
     trans_seed = None
     scale_max_dev_rel = 0.0
@@ -428,7 +437,7 @@ def calibrate(
     if isinstance(refine_cfg, dict):
         seed_val = refine_cfg.get("scale_seed")
         if seed_val is not None:
-            scale_seed = (float(seed_val[0]), float(seed_val[1]))
+            scale_seed = (abs(float(seed_val[0])), abs(float(seed_val[1])))
         trans_val = refine_cfg.get("trans_seed")
         if trans_val is not None:
             trans_seed = (float(trans_val[0]), float(trans_val[1]))
@@ -461,13 +470,26 @@ def calibrate(
         sy: float,
         tx: float,
         ty: float,
+        flip_x: float,
+        flip_y: float,
         svg_grid: SegGrid,
         sigma: float,
         hard: float,
     ) -> float:
         nonlocal current_iter_evaluated, num_evals
         with Timer("chamfer.total") as timer:
-            score = chamfer_score(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+            score = chamfer_score(
+                pts_pdf,
+                sx,
+                sy,
+                tx,
+                ty,
+                flip_x,
+                flip_y,
+                svg_grid,
+                sigma,
+                hard,
+            )
         chamfer_stats["calls"] += 1
         chamfer_stats["time"] += timer.duration
         num_evals += 1
@@ -480,7 +502,7 @@ def calibrate(
     best_score_coarse = -math.inf
     best_score_fine = -math.inf
     svg_grid_fine: SegGrid | None = None
-    best_params: Tuple[int, float, float, float, float] | None = None
+    best_params: Tuple[int, float, float, float, float, float, float] | None = None
     total_iters = 0
     center_pdf = (pdf_size[0] * 0.5, pdf_size[1] * 0.5)
     rot_degrees = cfg.get("rot_degrees", [0, 180])
@@ -574,6 +596,8 @@ def calibrate(
                     sy_seed,
                     tx_seed,
                     ty_seed,
+                    flip_seed[0],
+                    flip_seed[1],
                     svg_grid,
                     sigma,
                     hard,
@@ -602,6 +626,8 @@ def calibrate(
                             sy_seed,
                             tx_seed,
                             ty_seed,
+                            flip_seed[0],
+                            flip_seed[1],
                             svg_grid_fine,
                             sigma,
                             hard,
@@ -618,6 +644,8 @@ def calibrate(
                         rmse=0.0,
                         p95=0.0,
                         median=0.0,
+                        flip_x=flip_seed[0],
+                        flip_y=flip_seed[1],
                     )
                     best_params = (
                         rot_deg,
@@ -625,6 +653,8 @@ def calibrate(
                         sy_seed,
                         tx_seed,
                         ty_seed,
+                        flip_seed[0],
+                        flip_seed[1],
                     )
                     log.debug(
                         "[calib] rot=%s Seed-Hypothese score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f",
@@ -662,7 +692,8 @@ def calibrate(
             msv = _segment_midpoint(sv)
 
             for sign_x in sign_x_options:
-                sx = sign_x * base_sx
+                flip_x = 1.0 if sign_x >= 0 else -1.0
+                sx = base_sx
                 if scale_abs_bounds is not None:
                     sx_abs = abs(sx)
                     if sx_abs < scale_abs_bounds[0][0] or sx_abs > scale_abs_bounds[0][1]:
@@ -671,7 +702,8 @@ def calibrate(
                     if abs(abs(sx) - scale_seed[0]) > scale_tol_x:
                         continue
                 for sign_y in sign_y_options:
-                    sy = sign_y * base_sy
+                    flip_y = 1.0 if sign_y >= 0 else -1.0
+                    sy = base_sy
                     if scale_abs_bounds is not None:
                         sy_abs = abs(sy)
                         if sy_abs < scale_abs_bounds[1][0] or sy_abs > scale_abs_bounds[1][1]:
@@ -679,8 +711,10 @@ def calibrate(
                     if scale_seed is not None and scale_tol_y is not None:
                         if abs(abs(sy) - scale_seed[1]) > scale_tol_y:
                             continue
-                    tx_candidates = [msh[0] - sx * mph[0], msv[0] - sx * mpv[0]]
-                    ty_candidates = [msh[1] - sy * mph[1], msv[1] - sy * mpv[1]]
+                    scale_x = flip_x * sx
+                    scale_y = flip_y * sy
+                    tx_candidates = [msh[0] - scale_x * mph[0], msv[0] - scale_x * mpv[0]]
+                    ty_candidates = [msh[1] - scale_y * mph[1], msv[1] - scale_y * mpv[1]]
                     tx = sum(tx_candidates) / len(tx_candidates)
                     ty = sum(ty_candidates) / len(ty_candidates)
 
@@ -691,13 +725,24 @@ def calibrate(
                         ):
                             continue
 
-                    score = eval_chamfer(pts_pdf, sx, sy, tx, ty, svg_grid, sigma, hard)
+                    score = eval_chamfer(
+                        pts_pdf,
+                        sx,
+                        sy,
+                        tx,
+                        ty,
+                        flip_x,
+                        flip_y,
+                        svg_grid,
+                        sigma,
+                        hard,
+                    )
                     if score > rot_best_score:
                         rot_best_score = score
                     if score <= best_score_coarse:
                         continue
 
-                    best_local = (sx, sy, tx, ty, score)
+                    best_local = (sx, sy, tx, ty, score, flip_x, flip_y)
 
                     for dk in (-2, -1, 0, 1, 2):
                         sx_ref = sx * (1.0 + dk * refine_scale_step)
@@ -737,12 +782,22 @@ def calibrate(
                                         sy_ref,
                                         tx_ref,
                                         ty_ref,
+                                        flip_x,
+                                        flip_y,
                                         svg_grid,
                                         sigma,
                                         hard,
                                     )
                                     if score_ref > best_local[4]:
-                                        best_local = (sx_ref, sy_ref, tx_ref, ty_ref, score_ref)
+                                        best_local = (
+                                            sx_ref,
+                                            sy_ref,
+                                            tx_ref,
+                                            ty_ref,
+                                            score_ref,
+                                            flip_x,
+                                            flip_y,
+                                        )
                                     if score_ref > rot_best_score:
                                         rot_best_score = score_ref
 
@@ -761,16 +816,18 @@ def calibrate(
                                     svg_grid_fine.avg_segments_per_cell,
                                     fine_grid_duration,
                                 )
-                            fine_score = eval_chamfer(
-                                pts_pdf,
-                                best_local[0],
-                                best_local[1],
-                                best_local[2],
-                                best_local[3],
-                                svg_grid_fine,
-                                sigma,
-                                hard,
-                            )
+                                fine_score = eval_chamfer(
+                                    pts_pdf,
+                                    best_local[0],
+                                    best_local[1],
+                                    best_local[2],
+                                    best_local[3],
+                                    best_local[5],
+                                    best_local[6],
+                                    svg_grid_fine,
+                                    sigma,
+                                    hard,
+                                )
                         best_score_coarse = best_local[4]
                         best_score_fine = fine_score
                         best_model = Model(
@@ -783,6 +840,8 @@ def calibrate(
                             rmse=0.0,
                             p95=0.0,
                             median=0.0,
+                            flip_x=best_local[5],
+                            flip_y=best_local[6],
                         )
                         best_params = (
                             rot_deg,
@@ -790,6 +849,8 @@ def calibrate(
                             best_local[1],
                             best_local[2],
                             best_local[3],
+                            best_local[5],
+                            best_local[6],
                         )
                         improved_iter = True
                         log.debug(
@@ -855,7 +916,7 @@ def calibrate(
         )
         raise RuntimeError("Keine gültige Kalibrierung gefunden – zu wenig Struktur oder rot_degrees prüfen")
 
-    best_rot, best_sx, best_sy, best_tx, best_ty = best_params
+    best_rot, best_sx, best_sy, best_tx, best_ty, best_fx, best_fy = best_params
 
     full_grid_start = perf_counter()
     svg_grid_full = build_seg_grid(svg_segs_all, final_cell_rel * diag_svg)
@@ -881,6 +942,8 @@ def calibrate(
         best_sy,
         best_tx,
         best_ty,
+        best_fx,
+        best_fy,
         svg_grid_full,
         sigma,
         hard,
@@ -898,6 +961,8 @@ def calibrate(
             rmse=0.0,
             p95=0.0,
             median=0.0,
+            flip_x=best_fx,
+            flip_y=best_fy,
         ),
         svg_grid_full,
         hard,
@@ -913,6 +978,16 @@ def calibrate(
         rmse=rmse,
         p95=p95,
         median=median,
+        flip_x=best_fx,
+        flip_y=best_fy,
+    )
+    best_model.transform = Transform2D(
+        flip=(best_fx, best_fy),
+        rot_deg=best_rot,
+        sx=best_sx,
+        sy=best_sy,
+        tx=best_tx,
+        ty=best_ty,
     )
 
     total_duration = perf_counter() - start_total
@@ -922,8 +997,10 @@ def calibrate(
     if tracker is not None:
         samples_total = int(tracker.get_count("sampling.points"))
     log.info(
-        "[calib] abgeschlossen rot=%s score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Evals=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer, Samples=%d)",
+        "[calib] abgeschlossen rot=%s flip=(%d,%d) score=%.6f sx=%.6f sy=%.6f tx=%.3f ty=%.3f – Iterationen=%d Evals=%d Chamfer=%d (%.1f ms gesamt, %.1f ms Chamfer, Samples=%d)",
         best_model.rot_deg,
+        int(best_fx),
+        int(best_fy),
         best_model.score,
         best_model.sx,
         best_model.sy,
