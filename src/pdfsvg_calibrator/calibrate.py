@@ -4,15 +4,17 @@ from __future__ import annotations
 import copy
 import logging
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Mapping, MutableMapping, Sequence, Tuple
 
+import numpy as np
+
 try:
-    from src.coarse.geom import transform_segments
+    from src.coarse.geom import apply_orientation_pts, apply_scale_shift_pts, transform_segments
     from src.coarse.pipeline import coarse_align
 except ModuleNotFoundError:  # pragma: no cover - fallback for src-layout installs
     import sys
-    from pathlib import Path
 
     project_root = Path(__file__).resolve().parents[2]
     project_root_str = str(project_root)
@@ -21,7 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for src-layout instal
         sys.path.insert(0, src_root_str)
     if project_root_str not in sys.path:
         sys.path.insert(0, project_root_str)
-    from src.coarse.geom import transform_segments
+    from src.coarse.geom import apply_orientation_pts, apply_scale_shift_pts, transform_segments
     from src.coarse.pipeline import coarse_align
 
 from .fit_model import calibrate as _calibrate_ransac
@@ -34,6 +36,28 @@ from .verify_distmap import evaluate_rmse
 log = logging.getLogger(__name__)
 
 
+def _coarse_affine_matrix(
+    orientation,
+    scale: tuple[float, float],
+    shift: tuple[float, float],
+    bbox_svg: tuple[float, float, float, float],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Compute 2×2 matrix (columns) and translation for coarse alignment."""
+
+    pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=float)
+    oriented = apply_orientation_pts(pts, orientation, bbox_svg)
+    mapped = apply_scale_shift_pts(oriented, scale[0], scale[1], shift[0], shift[1])
+    origin = mapped[0]
+    e1 = mapped[1] - origin
+    e2 = mapped[2] - origin
+    matrix = (
+        (float(e1[0]), float(e2[0])),
+        (float(e1[1]), float(e2[1])),
+    )
+    translation = (float(origin[0]), float(origin[1]))
+    return matrix, translation
+
+
 def calibrate(
     pdf_segments: Sequence[Segment],
     svg_segments: Sequence[Segment],
@@ -42,6 +66,9 @@ def calibrate(
     cfg: Mapping[str, object],
     *,
     stats: MutableMapping[str, float] | None = None,
+    coarse_only: bool = False,
+    coarse_outputs: MutableMapping[str, object] | None = None,
+    coarse_debug_dir: str | Path | None = None,
 ) -> Model:
     """Run full calibration with orientation seeding."""
 
@@ -79,6 +106,9 @@ def calibrate(
     page_svg = SimpleNamespace(w=float(svg_w), h=float(svg_h))
 
     orientation_result = None
+    if coarse_outputs is not None:
+        coarse_outputs.clear()
+        coarse_outputs["orientation"] = None
 
     def _timed(key: str):
         return timer(stats, key) if stats is not None else nullcontext()
@@ -139,6 +169,9 @@ def calibrate(
         orientation_cfg["flip_xy"] = flip_xy
         orientation_cfg["rot_deg"] = rot_deg
         orientation_cfg["translation"] = (tx0, ty0)
+
+    if coarse_outputs is not None:
+        coarse_outputs["orientation"] = orientation_result
 
     sx0 = svg_w / pdf_w
     sy0 = svg_h / pdf_h
@@ -237,15 +270,25 @@ def calibrate(
             for seg in svg_segments
         ]
         coarse = None
+        debug_path = Path(coarse_debug_dir) if coarse_debug_dir is not None else None
         try:
             coarse = coarse_align(
-                coarse_pdf_segments, coarse_svg_segments, bbox_pdf, bbox_svg, cfg_local
+                coarse_pdf_segments,
+                coarse_svg_segments,
+                bbox_pdf,
+                bbox_svg,
+                cfg_local,
+                debug_dir=debug_path,
             )
         except Exception as exc:  # pragma: no cover - robustness against optional feature
             log.warning(
                 "[coarse] Fehler bei Grobausrichtung (%s) – fahre mit bestehenden Defaults fort",
                 exc,
             )
+        if coarse_outputs is not None:
+            coarse_outputs["bbox_pdf"] = bbox_pdf
+            coarse_outputs["bbox_svg"] = bbox_svg
+            coarse_outputs["coarse"] = coarse
         if coarse and coarse.ok and coarse.orientation and coarse.scale and coarse.shift:
             log.info(
                 "[coarse] rot=%d flip=%s sx=%.6f sy=%.6f shift=(%.2f,%.2f) score=%.3f",
@@ -259,8 +302,6 @@ def calibrate(
             )
 
             def _pipe_pts(P):
-                from src.coarse.geom import apply_orientation_pts, apply_scale_shift_pts
-
                 Q = apply_orientation_pts(P, coarse.orientation, bbox_svg)
                 Q = apply_scale_shift_pts(
                     Q, coarse.scale[0], coarse.scale[1], coarse.shift[0], coarse.shift[1]
@@ -277,6 +318,17 @@ def calibrate(
                 )
                 for values in svg_segments_np
             ]
+
+            if coarse_outputs is not None:
+                matrix, translation = _coarse_affine_matrix(
+                    coarse.orientation,
+                    (float(coarse.scale[0]), float(coarse.scale[1])),
+                    (float(coarse.shift[0]), float(coarse.shift[1])),
+                    bbox_svg,
+                )
+                coarse_outputs["transform_matrix"] = matrix
+                coarse_outputs["translation"] = translation
+                coarse_outputs["svg_segments_coarse"] = svg_segments
 
             refine_windows = coarse_cfg_raw.get("refine_windows")
             if isinstance(refine_windows, Mapping):
@@ -308,6 +360,36 @@ def calibrate(
                 cfg_local["angle_tol_deg"] = min(current_angle_tol, target_angle)
         else:
             log.warning("[coarse] keine robuste Grobausrichtung – fahre mit bestehenden Defaults fort")
+
+        if coarse_only:
+            if not coarse or not coarse.ok or not coarse.orientation or not coarse.scale or not coarse.shift:
+                raise RuntimeError("Grobausrichtung fehlgeschlagen – kein Ergebnis verfügbar")
+            flip_x = -1.0 if coarse.orientation.flip == "x" else 1.0
+            flip_y = -1.0 if coarse.orientation.flip == "y" else 1.0
+            transform = Transform2D(
+                flip=(flip_x, flip_y),
+                rot_deg=int(coarse.orientation.rot_deg),
+                sx=float(coarse.scale[0]),
+                sy=float(coarse.scale[1]),
+                tx=float(coarse.shift[0]),
+                ty=float(coarse.shift[1]),
+            )
+            model = Model(
+                rot_deg=int(coarse.orientation.rot_deg),
+                sx=float(coarse.scale[0]),
+                sy=float(coarse.scale[1]),
+                tx=float(coarse.shift[0]),
+                ty=float(coarse.shift[1]),
+                score=float(coarse.score),
+                rmse=0.0,
+                p95=0.0,
+                median=0.0,
+                flip_x=flip_x,
+                flip_y=flip_y,
+                transform=transform,
+                quality_notes=(),
+            )
+            return model
 
     sampling_cfg = cfg_local.setdefault("sampling", {})  # type: ignore[assignment]
     if not isinstance(sampling_cfg, dict):

@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import logging
 import math
+import tempfile
 import sys
 import textwrap
 import traceback
@@ -321,6 +322,26 @@ def _parse_cli_override(entry: str) -> Tuple[Tuple[str, ...], Any]:
     return path, value
 
 
+def _parse_allow_flips(value: str) -> List[str]:
+    tokens = [token.strip().lower() for token in value.split(",")]
+    valid = {"none", "x", "y"}
+    result: List[str] = []
+    seen = set()
+    for token in tokens:
+        if not token:
+            continue
+        if token not in valid:
+            raise ValueError(
+                "Ungültiger Flip-Wert – erlaubt sind none, x, y (Komma-separiert)"
+            )
+        if token not in seen:
+            result.append(token)
+            seen.add(token)
+    if not result:
+        raise ValueError("--allow-flips erwartet eine Liste aus none,x,y")
+    return result
+
+
 def _load_config_with_defaults(path: Path, rng_seed: Optional[int]) -> Dict[str, Any]:
     raw_cfg: Dict[str, Any] = {}
     loaded = load_config(str(path))
@@ -535,6 +556,67 @@ def _build_summary_table(matches: Sequence[Match]) -> Tuple[Sequence[str], List[
     return headers, rows
 
 
+def _needs_mirror_notice(model: Model) -> bool:
+    rot_norm = int(model.rot_deg) % 360
+    has_flip = (model.flip_x < 0) or (model.flip_y < 0)
+    return has_flip and 0 < rot_norm < 180
+
+
+def _write_coarse_segments_temp(segments: Sequence[Segment]) -> Path:
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="coarse_segments_", suffix=".csv", delete=False, mode="w", encoding="utf-8"
+    )
+    with tmp as handle:
+        handle.write("x1,y1,x2,y2\n")
+        for seg in segments:
+            handle.write(
+                f"{seg.x1:.6f},{seg.y1:.6f},{seg.x2:.6f},{seg.y2:.6f}\n"
+            )
+    return Path(tmp.name)
+
+
+def _report_coarse_only(
+    logger: Logger,
+    model: Model,
+    coarse_info: Mapping[str, Any],
+) -> None:
+    rot_norm = int(model.rot_deg) % 360
+    flip_desc = f"(x={model.flip_x:+.0f}, y={model.flip_y:+.0f})"
+    logger.info("Grobausrichtung abgeschlossen.")
+    logger.info(
+        f"rot={rot_norm}° | flips={flip_desc} | "
+        f"sx={model.sx:.6f} | sy={model.sy:.6f} | tx={model.tx:.3f}px | ty={model.ty:.3f}px"
+    )
+    logger.info(f"Score≈{model.score:.4f} (Grobausrichtung)")
+    if _needs_mirror_notice(model):
+        logger.warn("Spiegelung erkannt")
+
+    matrix = coarse_info.get("transform_matrix")
+    translation = coarse_info.get("translation")
+    if (
+        isinstance(matrix, tuple)
+        and len(matrix) == 2
+        and all(isinstance(row, tuple) and len(row) == 2 for row in matrix)
+        and isinstance(translation, tuple)
+        and len(translation) == 2
+    ):
+        logger.info("Transformationsmatrix (SVG→PDF):")
+        logger.info(f"[{matrix[0][0]: .6f} {matrix[0][1]: .6f}]")
+        logger.info(f"[{matrix[1][0]: .6f} {matrix[1][1]: .6f}]")
+        logger.info(
+            f"Translation: ({translation[0]:.3f}px, {translation[1]:.3f}px)"
+        )
+    else:
+        logger.warn("Transformationsmatrix nicht verfügbar.")
+
+    segments = coarse_info.get("svg_segments_coarse")
+    if isinstance(segments, Sequence) and segments and isinstance(segments[0], Segment):
+        temp_path = _write_coarse_segments_temp(segments)
+        logger.info(f"Transformierte SVG-Segmente gespeichert: {temp_path}")
+    else:
+        logger.warn("Keine transformierten Segmente für Ausgabe erhalten.")
+
+
 def _summarize(
     logger: Logger,
     model: Model,
@@ -561,6 +643,8 @@ def _summarize(
             )
         ),
     ]
+    if _needs_mirror_notice(model):
+        summary_lines.append("Spiegelung erkannt")
     if alignment is not None:
         tol_source = alignment.get("tol_source", "config")
         summary_lines.append(
@@ -742,6 +826,21 @@ def run(
         min=0.0,
         help="Suchradius in Pixel für die Verifikation",
     ),
+    coarse_only: bool = typer.Option(
+        False,
+        "--coarse-only",
+        help="Nur Grobausrichtung ausführen und anschließend Bericht ausgeben",
+    ),
+    coarse_debug: bool = typer.Option(
+        False,
+        "--coarse-debug",
+        help="Debug-Ausgaben der Grobausrichtung (Profile, Heatmaps, Scores) speichern",
+    ),
+    allow_flips: Optional[str] = typer.Option(
+        None,
+        "--allow-flips",
+        help="Grobausrichtungs-Flips überschreiben (none,x,y Komma-separiert)",
+    ),
     opts: List[str] = typer.Option(
         [],
         "--opts",
@@ -768,6 +867,7 @@ def run(
 
     tracker = MetricsTracker()
     stats: Dict[str, float] = {}
+    coarse_debug_dir_path: Optional[Path] = None
 
     try:
         with use_tracker(tracker):
@@ -782,6 +882,10 @@ def run(
 
                 neighbors = cfg.setdefault("neighbors", {})
                 neighbors["use"] = True
+
+                allow_flips_values: Optional[List[str]] = None
+                if allow_flips is not None:
+                    allow_flips_values = _parse_allow_flips(allow_flips)
 
                 overrides: List[Tuple[Tuple[str, ...], Any]] = [
                     (("orientation", "enabled"), orientation_enabled),
@@ -816,6 +920,16 @@ def run(
                         continue
                     _set_nested(cfg, path, value)
 
+                coarse_cfg_raw = cfg.setdefault("coarse", {})
+                if not isinstance(coarse_cfg_raw, MutableMapping):
+                    raise ValueError("coarse config must be a mapping")
+                coarse_cfg_map = coarse_cfg_raw
+                if allow_flips_values is not None:
+                    coarse_cfg_map["flips"] = allow_flips_values
+                coarse_debug_enabled = coarse_debug or bool(coarse_cfg_map.get("debug"))
+                if coarse_debug_enabled:
+                    coarse_cfg_map["debug"] = True
+
                 config_yaml = yaml.safe_dump(
                     cfg,
                     sort_keys=False,
@@ -833,6 +947,11 @@ def run(
                         )
 
                 outdir.mkdir(parents=True, exist_ok=True)
+                if coarse_debug_enabled:
+                    coarse_debug_dir_path = outdir / "coarse-debug"
+                    coarse_debug_dir_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    coarse_debug_dir_path = None
 
                 logger.step("PDF-Segmente laden")
                 with logger.status("PDF analysieren"):
@@ -851,121 +970,146 @@ def run(
 
                 logger.step("Modell kalibrieren")
                 with logger.status("Kalibrierung läuft"):
-                    model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg, stats=stats)
-
-                alignment = _alignment_diagnostics(model, svg_size, cfg)
-
-                alignment_warnings: List[str] = []
-                rot_norm = alignment.get("rot_norm", model.rot_deg % 360)
-                if rot_norm != 0 and not alignment.get("det_negative", False):
-                    alignment_warnings.append(
-                        f"Rotation {rot_norm}° erkannt – automatische Exporte erwarten 0°."
+                    coarse_outputs: Dict[str, Any] = {}
+                    coarse_outputs_ref: Optional[MutableMapping[str, Any]] = (
+                        coarse_outputs if coarse_only else None
                     )
-                if alignment.get("flip_x") or alignment.get("flip_y"):
-                    axes: List[str] = []
-                    if alignment.get("flip_x"):
-                        axes.append("horizontal (sx < 0)")
-                    if alignment.get("flip_y"):
-                        axes.append("vertical (sy < 0)")
-                    axis_desc = " & ".join(axes) if axes else "unbekannt"
-                    if alignment.get("det_negative", False):
-                        alignment_warnings.append(
-                            "Automatisch erzeugte SVG wirkt gespiegelt: "
-                            f"{axis_desc}."
-                        )
-                    else:
-                        alignment_warnings.append(
-                            "SVG-Export enthält Flip(s): "
-                            f"{axis_desc}."
-                        )
-                if alignment.get("shift", 0.0) > alignment.get("tol", 0.0):
-                    tol_source = alignment.get("tol_source", "config")
-                    alignment_warnings.append(
-                        "Automatischer SVG-Export wirkt verschoben: "
-                        f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px (Grenze {tol_source}). "
-                        "Bitte Ursprung der SVG-Exportdatei prüfen."
+                    model = calibrate(
+                        pdf_segs,
+                        svg_segs,
+                        pdf_size,
+                        svg_size,
+                        cfg,
+                        stats=stats,
+                        coarse_only=coarse_only,
+                        coarse_outputs=coarse_outputs_ref,
+                        coarse_debug_dir=coarse_debug_dir_path,
                     )
 
-                logger.step("Top-Linien auswählen")
-                with logger.status("Linienauswahl"):
-                    with Timer("seed.select"):
-                        pdf_lines, line_info = select_lines(pdf_segs, model, svg_segs, cfg)
-                logger.debug(f"Ausgewählte Linien: {len(pdf_lines)}")
+                if coarse_only:
+                    _report_coarse_only(logger, model, coarse_outputs)
+                else:
+                    alignment = _alignment_diagnostics(model, svg_size, cfg)
 
-                verify_cfg = cfg.get("verify", {}) if isinstance(cfg, Mapping) else {}
-                verify_mode = ""
-                if isinstance(verify_cfg, Mapping):
-                    verify_mode = str(verify_cfg.get("mode", "")).strip().lower()
-                step_label = "Distanz-Map QA" if verify_mode == "distmap" else "Linien abgleichen"
-                status_label = "Distanz-Map" if verify_mode == "distmap" else "Matching"
-                logger.step(step_label)
-                with logger.status(status_label):
-                    with timer(stats, "Verify"):
-                        if verify_mode == "distmap":
-                            verify_cfg_map = verify_cfg if isinstance(verify_cfg, Mapping) else {}
-                            raw_matches = _distmap_placeholder_matches(pdf_lines, verify_cfg_map)
-                            if isinstance(line_info, MutableMapping):
-                                notes = line_info.setdefault("notes", [])
-                                if isinstance(notes, list):
-                                    notes.append("verify.mode=distmap – pairwise matching skipped.")
+                    alignment_warnings: List[str] = []
+                    rot_norm = alignment.get("rot_norm", model.rot_deg % 360)
+                    if rot_norm != 0 and not alignment.get("det_negative", False):
+                        alignment_warnings.append(
+                            f"Rotation {rot_norm}° erkannt – automatische Exporte erwarten 0°."
+                        )
+                    if alignment.get("flip_x") or alignment.get("flip_y"):
+                        axes: List[str] = []
+                        if alignment.get("flip_x"):
+                            axes.append("horizontal (sx < 0)")
+                        if alignment.get("flip_y"):
+                            axes.append("vertical (sy < 0)")
+                        axis_desc = " & ".join(axes) if axes else "unbekannt"
+                        if alignment.get("det_negative", False):
+                            alignment_warnings.append(
+                                "Automatisch erzeugte SVG wirkt gespiegelt: "
+                                f"{axis_desc}."
+                            )
                         else:
-                            raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
-                matches = _renumber_matches(raw_matches)
+                            alignment_warnings.append(
+                                "SVG-Export enthält Flip(s): "
+                                f"{axis_desc}."
+                            )
+                    if alignment.get("shift", 0.0) > alignment.get("tol", 0.0):
+                        tol_source = alignment.get("tol_source", "config")
+                        alignment_warnings.append(
+                            "Automatischer SVG-Export wirkt verschoben: "
+                            f"|t|={alignment['shift']:.3f}px > {alignment['tol']:.3f}px (Grenze {tol_source}). "
+                            "Bitte Ursprung der SVG-Exportdatei prüfen."
+                        )
 
-                extra_warnings: List[str] = alignment_warnings
-                if len(matches) < 5:
-                    extra_warnings.append(
-                        f"Nur {len(matches)} Linien verfügbar – verbleibende Slots bleiben leer."
+                    logger.step("Top-Linien auswählen")
+                    with logger.status("Linienauswahl"):
+                        with Timer("seed.select"):
+                            pdf_lines, line_info = select_lines(pdf_segs, model, svg_segs, cfg)
+                    logger.debug(f"Ausgewählte Linien: {len(pdf_lines)}")
+
+                    verify_cfg = cfg.get("verify", {}) if isinstance(cfg, Mapping) else {}
+                    verify_mode = ""
+                    if isinstance(verify_cfg, Mapping):
+                        verify_mode = str(verify_cfg.get("mode", "")).strip().lower()
+                    step_label = "Distanz-Map QA" if verify_mode == "distmap" else "Linien abgleichen"
+                    status_label = "Distanz-Map" if verify_mode == "distmap" else "Matching"
+                    logger.step(step_label)
+                    with logger.status(status_label):
+                        with timer(stats, "Verify"):
+                            if verify_mode == "distmap":
+                                verify_cfg_map = verify_cfg if isinstance(verify_cfg, Mapping) else {}
+                                raw_matches = _distmap_placeholder_matches(pdf_lines, verify_cfg_map)
+                                if isinstance(line_info, MutableMapping):
+                                    notes = line_info.setdefault("notes", [])
+                                    if isinstance(notes, list):
+                                        notes.append("verify.mode=distmap – pairwise matching skipped.")
+                            else:
+                                raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
+                    matches = _renumber_matches(raw_matches)
+
+                    extra_warnings: List[str] = alignment_warnings
+                    if len(matches) < 5:
+                        extra_warnings.append(
+                            f"Nur {len(matches)} Linien verfügbar – verbleibende Slots bleiben leer."
+                        )
+                    if any(match.svg_seg is None for match in matches):
+                        extra_warnings.append(
+                            "Mindestens eine Linie konnte keinem SVG-Segment zugeordnet werden."
+                        )
+
+                    logger.step("Overlays & Bericht schreiben")
+                    with timer(stats, "IO/Overlays"):
+                        with logger.status("SVG-Overlay"):
+                            overlay_svg = Path(
+                                write_svg_overlay(
+                                    str(svg_path),
+                                    str(outdir),
+                                    str(pdf),
+                                    page,
+                                    model,
+                                    matches,
+                                    alignment,
+                                )
+                            )
+                        with logger.status("PDF-Overlay"):
+                            overlay_pdf = Path(
+                                write_pdf_overlay(
+                                    str(pdf),
+                                    page,
+                                    str(outdir),
+                                    model,
+                                    matches,
+                                    alignment,
+                                )
+                            )
+                        with logger.status("CSV-Bericht"):
+                            report_csv = Path(
+                                write_report_csv(
+                                    str(outdir),
+                                    str(pdf),
+                                    page,
+                                    model,
+                                    matches,
+                                    alignment,
+                                )
+                            )
+
+                    outputs = {
+                        "SVG": overlay_svg,
+                        "PDF": overlay_pdf,
+                        "CSV": report_csv,
+                    }
+
+                    _summarize(
+                        logger,
+                        model,
+                        matches,
+                        outputs,
+                        line_info,
+                        extra_warnings,
+                        alignment,
                     )
-                if any(match.svg_seg is None for match in matches):
-                    extra_warnings.append(
-                        "Mindestens eine Linie konnte keinem SVG-Segment zugeordnet werden."
-                    )
-
-                logger.step("Overlays & Bericht schreiben")
-                with timer(stats, "IO/Overlays"):
-                    with logger.status("SVG-Overlay"):
-                        overlay_svg = Path(
-                            write_svg_overlay(
-                                str(svg_path),
-                                str(outdir),
-                                str(pdf),
-                                page,
-                                model,
-                                matches,
-                                alignment,
-                            )
-                        )
-                    with logger.status("PDF-Overlay"):
-                        overlay_pdf = Path(
-                            write_pdf_overlay(
-                                str(pdf),
-                                page,
-                                str(outdir),
-                                model,
-                                matches,
-                                alignment,
-                            )
-                        )
-                    with logger.status("CSV-Bericht"):
-                        report_csv = Path(
-                            write_report_csv(
-                                str(outdir),
-                                str(pdf),
-                                page,
-                                model,
-                                matches,
-                                alignment,
-                            )
-                        )
-
-                outputs = {
-                    "SVG": overlay_svg,
-                    "PDF": overlay_pdf,
-                    "CSV": report_csv,
-                }
-
-                _summarize(logger, model, matches, outputs, line_info, extra_warnings, alignment)
 
             _log_timing_summary(tracker, stats)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
