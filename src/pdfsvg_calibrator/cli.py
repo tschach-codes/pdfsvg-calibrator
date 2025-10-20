@@ -24,7 +24,7 @@ from .io_svg_pdf import (
 from .metrics import MetricsTracker, Timer, use_tracker
 from .match_verify import match_lines, select_lines
 from .overlays import write_pdf_overlay, write_report_csv, write_svg_overlay
-from .types import Match, Model
+from .types import Match, Model, Segment
 
 
 _RICH_AVAILABLE = importlib.util.find_spec("rich") is not None
@@ -258,6 +258,49 @@ def _ensure_exists(path: Path, description: str) -> None:
 
 def _renumber_matches(matches: Sequence[Match]) -> List[Match]:
     return [replace(match, id=index) for index, match in enumerate(matches, start=1)]
+
+
+def _segment_axis(seg: Segment, angle_tol_deg: float) -> str:
+    dx = seg.x2 - seg.x1
+    dy = seg.y2 - seg.y1
+    if dx == 0.0 and dy == 0.0:
+        return "H"
+    angle = math.degrees(math.atan2(dy, dx)) % 180.0
+    delta_h = min(angle, 180.0 - angle)
+    delta_v = abs(angle - 90.0)
+    tol = max(angle_tol_deg, 0.0)
+    if delta_h <= tol and delta_h <= delta_v:
+        return "H"
+    if delta_v <= tol:
+        return "V"
+    return "H" if abs(dx) >= abs(dy) else "V"
+
+
+def _distmap_placeholder_matches(
+    pdf_lines: Sequence[Segment], verify_cfg: Mapping[str, Any]
+) -> List[Match]:
+    pick_k = int(verify_cfg.get("pick_k", 5)) if verify_cfg else 5
+    pick_k = max(0, pick_k)
+    angle_tol = float(verify_cfg.get("angle_tol_deg", 4.0)) if verify_cfg else 4.0
+    matches: List[Match] = []
+    for seg in list(pdf_lines)[:pick_k]:
+        axis = _segment_axis(seg, angle_tol)
+        length = math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
+        matches.append(
+            Match(
+                id=len(matches) + 1,
+                axis=axis,
+                pdf_seg=seg,
+                svg_seg=None,
+                cost=0.0,
+                confidence=0.0,
+                pdf_len=length,
+                svg_len=None,
+                rel_error=None,
+                pass01=None,
+            )
+        )
+    return matches
 
 
 def _model_flip_label(model: Model) -> str:
@@ -739,10 +782,24 @@ def run(
                         pdf_lines, line_info = select_lines(pdf_segs, model, svg_segs, cfg)
                 logger.debug(f"Ausgewählte Linien: {len(pdf_lines)}")
 
-                logger.step("Linien abgleichen")
-                with logger.status("Matching"):
+                verify_cfg = cfg.get("verify", {}) if isinstance(cfg, Mapping) else {}
+                verify_mode = ""
+                if isinstance(verify_cfg, Mapping):
+                    verify_mode = str(verify_cfg.get("mode", "")).strip().lower()
+                step_label = "Distanz-Map QA" if verify_mode == "distmap" else "Linien abgleichen"
+                status_label = "Distanz-Map" if verify_mode == "distmap" else "Matching"
+                logger.step(step_label)
+                with logger.status(status_label):
                     with Timer("verify.match"):
-                        raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
+                        if verify_mode == "distmap":
+                            verify_cfg_map = verify_cfg if isinstance(verify_cfg, Mapping) else {}
+                            raw_matches = _distmap_placeholder_matches(pdf_lines, verify_cfg_map)
+                            if isinstance(line_info, MutableMapping):
+                                notes = line_info.setdefault("notes", [])
+                                if isinstance(notes, list):
+                                    notes.append("verify.mode=distmap – pairwise matching skipped.")
+                        else:
+                            raw_matches = match_lines(pdf_lines, svg_segs, model, cfg)
                 matches = _renumber_matches(raw_matches)
 
                 extra_warnings: List[str] = alignment_warnings

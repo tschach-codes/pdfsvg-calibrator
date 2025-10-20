@@ -11,6 +11,7 @@ from .orientation import pick_flip_rot_and_shift
 from .types import Model, Segment
 from .metrics import Timer
 from .transform import Transform2D
+from .verify_distmap import evaluate_rmse
 
 log = logging.getLogger(__name__)
 
@@ -229,8 +230,85 @@ def calibrate(
             issues.append(f"Score {result.score:.4f} < {score_gate:.4f}")
         return issues
 
+    verify_cfg = cfg_local.setdefault("verify", {})  # type: ignore[assignment]
+    if not isinstance(verify_cfg, dict):
+        raise ValueError("verify config must be a mapping")
+    verify_mode = str(verify_cfg.get("mode", "")).strip().lower()
+
+    distmap_cfg_raw = verify_cfg.get("distmap", {})
+    distmap_cfg = distmap_cfg_raw if isinstance(distmap_cfg_raw, Mapping) else {}
+
+    def _distmap_sizes() -> tuple[int, int]:
+        size_cfg = distmap_cfg.get("raster")
+        if size_cfg is None:
+            size_cfg = verify_cfg.get("distmap_raster")
+        if size_cfg is None:
+            size_cfg = distmap_cfg.get("size")
+        if isinstance(size_cfg, (tuple, list)) and len(size_cfg) == 2:
+            w = max(1, int(round(float(size_cfg[0]))))
+            h = max(1, int(round(float(size_cfg[1]))))
+            return w, h
+        if isinstance(size_cfg, (int, float)) and size_cfg > 0:
+            val = max(1, int(round(float(size_cfg))))
+            return val, val
+        return 768, 768
+
+    def _distmap_samples() -> int:
+        samples = distmap_cfg.get("samples_per_seg")
+        if samples is None:
+            samples = verify_cfg.get("distmap_samples")
+        if samples is None:
+            samples = distmap_cfg.get("samples")
+        try:
+            value = int(samples) if samples is not None else 16
+        except (TypeError, ValueError):
+            value = 16
+        return max(1, value)
+
+    def _apply_distmap_metrics(model: Model) -> Model:
+        if verify_mode != "distmap":
+            return model
+        transform = model.transform
+        if transform is None:
+            transform = Transform2D(
+                flip=(model.flip_x, model.flip_y),
+                rot_deg=model.rot_deg,
+                sx=model.sx,
+                sy=model.sy,
+                tx=model.tx,
+                ty=model.ty,
+            )
+        W, H = _distmap_sizes()
+        samples = _distmap_samples()
+        metrics = evaluate_rmse(
+            transform,
+            pdf_segments,
+            svg_segments,
+            svg_w,
+            svg_h,
+            W=W,
+            H=H,
+            n_per_seg=samples,
+        )
+        model.rmse = float(metrics.get("rmse", model.rmse))
+        model.p95 = float(metrics.get("p95", model.p95))
+        model.median = float(metrics.get("median", model.median))
+        model.score = float(metrics.get("score", model.score))
+        log.info(
+            "[distmap] RMSE=%.3fpx P95=%.3fpx Median=%.3fpx Score=%.5f (samples=%d, raster=%dx%d)",
+            model.rmse,
+            model.p95,
+            model.median,
+            model.score,
+            int(metrics.get("n", 0)),
+            W,
+            H,
+        )
+        return model
+
     with Timer("refine.total"):
         model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+    model = _apply_distmap_metrics(model)
 
     quality_notes: list[str] = []
     if gate_enabled:
@@ -253,6 +331,7 @@ def calibrate(
             _apply_refine_window(fallback_scale_window, fallback_trans_window, max_iters=fallback_iters)
             ransac_cfg["iters"] = fallback_iters
             model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
+            model = _apply_distmap_metrics(model)
             post_failures = _quality_failures(model)
             if post_failures:
                 message = (
