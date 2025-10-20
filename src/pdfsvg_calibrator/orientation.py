@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
-from typing import Iterable, List, Mapping, Sequence, Tuple
+from typing import Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
 
 from .types import Segment
+from .utils.timer import timer
 
 
 try:  # pragma: no cover - optional dependency
@@ -285,6 +287,8 @@ def pick_flip_rot_and_shift(
     page_pdf,
     page_svg,
     cfg,
+    *,
+    stats: MutableMapping[str, float] | None = None,
 ):
     """Pick best orientation and translation seed between PDF and SVG segments."""
 
@@ -315,15 +319,15 @@ def pick_flip_rot_and_shift(
     candidates = []
     for rot in (0, 180):
         for flip in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
-            svg_trans = _transform_segments(svg_top, page_pdf.w, page_pdf.h, flip, rot)
-            svg_hist_x = x_histogram_of_verticals(svg_trans, hist_bin_px, page_pdf.w, axis_tol)
-            svg_hist_y = y_histogram_of_horizontals(svg_trans, hist_bin_px, page_pdf.h, axis_tol)
-
             dx_doc = 0.0
             dy_doc = 0.0
             used_hist_x = False
             used_hist_y = False
             responses: List[float] = []
+
+            svg_trans = _transform_segments(svg_top, page_pdf.w, page_pdf.h, flip, rot)
+            svg_hist_x = x_histogram_of_verticals(svg_trans, hist_bin_px, page_pdf.w, axis_tol)
+            svg_hist_y = y_histogram_of_horizontals(svg_trans, hist_bin_px, page_pdf.h, axis_tol)
 
             if pdf_hist_x.size > 1 and svg_hist_x.size > 1:
                 shift_x, resp_x = argmax_xcorr(pdf_hist_x, svg_hist_x)
@@ -339,30 +343,36 @@ def pick_flip_rot_and_shift(
                 responses.append(resp_y)
                 used_hist_y = True
 
-            A = rasterize_segments(pdf_top, page_pdf.w, page_pdf.h, raster_size, raster_size, (1, 1), 0)
-            B = rasterize_segments(svg_top, page_pdf.w, page_pdf.h, raster_size, raster_size, flip, rot)
+            seed_ctx = timer(stats, "Seed") if stats is not None else contextlib.nullcontext()
+            with seed_ctx:
+                A = rasterize_segments(
+                    pdf_top, page_pdf.w, page_pdf.h, raster_size, raster_size, (1, 1), 0
+                )
+                B = rasterize_segments(
+                    svg_top, page_pdf.w, page_pdf.h, raster_size, raster_size, flip, rot
+                )
 
-            sx_canvas = raster_size / page_pdf.w if page_pdf.w else 1.0
-            sy_canvas = raster_size / page_pdf.h if page_pdf.h else 1.0
+                sx_canvas = raster_size / page_pdf.w if page_pdf.w else 1.0
+                sy_canvas = raster_size / page_pdf.h if page_pdf.h else 1.0
 
-            du = dx_doc * sx_canvas
-            dv = -dy_doc * sy_canvas
+                du = dx_doc * sx_canvas
+                dv = -dy_doc * sy_canvas
 
-            phase_resp = 0.0
-            if not (used_hist_x and used_hist_y):
-                du_pc, dv_pc, phase_resp = phase_correlation(B, A)
-                if not used_hist_x:
-                    dx_doc = du_pc / sx_canvas
-                    du = du_pc
-                if not used_hist_y:
-                    dy_doc = -dv_pc / sy_canvas
-                    dv = dv_pc
-                responses.append(phase_resp)
+                phase_resp = 0.0
+                if not (used_hist_x and used_hist_y):
+                    du_pc, dv_pc, phase_resp = phase_correlation(B, A)
+                    if not used_hist_x:
+                        dx_doc = du_pc / sx_canvas
+                        du = du_pc
+                    if not used_hist_y:
+                        dy_doc = -dv_pc / sy_canvas
+                        dv = dv_pc
+                    responses.append(phase_resp)
 
-            overlap = 0.0
-            if raster_size > 0:
-                shifted = np.roll(np.roll(B, int(round(du)), axis=1), int(round(dv)), axis=0)
-                overlap = float((A & shifted).mean() / 255.0)
+                overlap = 0.0
+                if raster_size > 0:
+                    shifted = np.roll(np.roll(B, int(round(du)), axis=1), int(round(dv)), axis=0)
+                    overlap = float((A & shifted).mean() / 255.0)
 
             response_score = float(np.mean(responses)) if responses else 0.0
 
@@ -373,7 +383,9 @@ def pick_flip_rot_and_shift(
             M = F @ R
             t_seed = M.T @ np.array([dx_doc, dy_doc], dtype=float)
 
-            norm_shift = (abs(dx_doc) / (page_pdf.w or 1.0)) + (abs(dy_doc) / (page_pdf.h or 1.0))
+            norm_shift = (abs(dx_doc) / (page_pdf.w or 1.0)) + (
+                abs(dy_doc) / (page_pdf.h or 1.0)
+            )
 
             candidates.append(
                 {

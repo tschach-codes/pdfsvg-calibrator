@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import copy
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Dict, Mapping, MutableMapping, Sequence, Tuple
 
 from .fit_model import calibrate as _calibrate_ransac
 from .orientation import pick_flip_rot_and_shift
-from .types import Model, Segment
-from .metrics import Timer
 from .transform import Transform2D
+from .types import Model, Segment
+from .utils.timer import timer
 from .verify_distmap import evaluate_rmse
 
 log = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ def calibrate(
     pdf_size: Tuple[float, float],
     svg_size: Tuple[float, float],
     cfg: Mapping[str, object],
+    *,
+    stats: MutableMapping[str, float] | None = None,
 ) -> Model:
     """Run full calibration with orientation seeding."""
 
@@ -60,14 +63,25 @@ def calibrate(
 
     orientation_result = None
 
+    def _timed(key: str):
+        return timer(stats, key) if stats is not None else nullcontext()
+
     if use_orientation:
-        with Timer("seed.orientation"):
+        seed_before = stats.get("Seed", 0.0) if stats is not None else 0.0
+        with _timed("Orientation"):
             orientation_result = pick_flip_rot_and_shift(
                 pdf_segments,
                 svg_segments,
                 page_pdf,
                 page_svg,
                 cfg_local,
+                stats=stats,
+            )
+        if stats is not None:
+            seed_after = stats.get("Seed", 0.0)
+            stats["Orientation"] = max(
+                0.0,
+                stats.get("Orientation", 0.0) - (seed_after - seed_before),
             )
         flip_xy = tuple(float(v) for v in orientation_result.get("flip", (1, 1)))  # type: ignore[assignment]
         rot_deg = int(orientation_result.get("rot_deg", 0))
@@ -306,9 +320,11 @@ def calibrate(
         )
         return model
 
-    with Timer("refine.total"):
+    with _timed("Refine"):
         model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
-    model = _apply_distmap_metrics(model)
+
+    with _timed("Verify"):
+        model = _apply_distmap_metrics(model)
 
     quality_notes: list[str] = []
     if gate_enabled:
@@ -330,8 +346,12 @@ def calibrate(
             )
             _apply_refine_window(fallback_scale_window, fallback_trans_window, max_iters=fallback_iters)
             ransac_cfg["iters"] = fallback_iters
-            model = _calibrate_ransac(pdf_segments, svg_segments, pdf_size, svg_size, cfg_local)
-            model = _apply_distmap_metrics(model)
+            with _timed("Refine"):
+                model = _calibrate_ransac(
+                    pdf_segments, svg_segments, pdf_size, svg_size, cfg_local
+                )
+            with _timed("Verify"):
+                model = _apply_distmap_metrics(model)
             post_failures = _quality_failures(model)
             if post_failures:
                 message = (
