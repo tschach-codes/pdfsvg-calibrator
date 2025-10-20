@@ -606,6 +606,44 @@ def _classify_segment_axes(segments: Sequence[Segment]) -> List[str]:
     return [str(axis) for axis in axes]
 
 
+def _snap_segments_to_axes(
+    segments: Sequence[Segment], cfg: Mapping[str, object]
+) -> Tuple[List[Segment], List[Optional[str]]]:
+    verify_cfg = cfg.get("verify") if isinstance(cfg, Mapping) else None
+    angle_tol = 4.0
+    if isinstance(verify_cfg, Mapping):
+        angle_tol = float(verify_cfg.get("angle_tol_deg", angle_tol))
+
+    snapped: List[Segment] = []
+    axes: List[Optional[str]] = []
+
+    for seg in segments:
+        angle = _segment_angle(seg)
+        if angle is None:
+            snapped.append(seg)
+            axes.append(None)
+            continue
+
+        diff_h = _angle_diff_deg(angle, 0.0)
+        diff_v = _angle_diff_deg(angle, 90.0)
+
+        if diff_h <= angle_tol and diff_h <= diff_v:
+            x_start, x_end = sorted((seg.x1, seg.x2))
+            y = float((seg.y1 + seg.y2) * 0.5)
+            snapped.append(Segment(float(x_start), y, float(x_end), y))
+            axes.append("H")
+        elif diff_v <= angle_tol:
+            y_start, y_end = sorted((seg.y1, seg.y2))
+            x = float((seg.x1 + seg.x2) * 0.5)
+            snapped.append(Segment(x, float(y_start), x, float(y_end)))
+            axes.append("V")
+        else:
+            snapped.append(seg)
+            axes.append(None)
+
+    return snapped, axes
+
+
 def _angle_diff_deg(a: float, b: float) -> float:
     diff = abs(a - b) % 180.0
     if diff > 90.0:
@@ -626,177 +664,137 @@ def _point_line_distance(pt: Tuple[float, float], start: Tuple[float, float], en
 
 
 def _merge_collinear_axis(
-    segments: Sequence[Segment],
-    axis: str,
-    diag: float,
-    angle_tol: float,
-    gap_tol: float,
-    offset_tol: float,
+    segments: Sequence[Segment], axis: str, diag: float, cfg: Mapping[str, object]
 ) -> List[Segment]:
     if not segments:
         return []
 
-    bin_size = max(offset_tol, max(diag * 1e-6, 1e-9))
+    merge_cfg = cfg.get("merge") if isinstance(cfg, Mapping) else {}
+    thresholds = merge_cfg.get("thresholds") if isinstance(merge_cfg, Mapping) else None
 
-    def _prepare(seg: Segment) -> Optional[Dict[str, object]]:
-        length = _segment_length(seg)
-        if length <= 1e-9:
-            return None
-        angle = _segment_angle(seg)
-        if axis == "H":
-            run_start = min(seg.x1, seg.x2)
-            run_end = max(seg.x1, seg.x2)
-            offset = 0.5 * (seg.y1 + seg.y2)
-            if seg.x1 <= seg.x2:
-                start_point = (seg.x1, seg.y1)
-                end_point = (seg.x2, seg.y2)
-            else:
-                start_point = (seg.x2, seg.y2)
-                end_point = (seg.x1, seg.y1)
-        else:
-            run_start = min(seg.y1, seg.y2)
-            run_end = max(seg.y1, seg.y2)
-            offset = 0.5 * (seg.x1 + seg.x2)
-            if seg.y1 <= seg.y2:
-                start_point = (seg.x1, seg.y1)
-                end_point = (seg.x2, seg.y2)
-            else:
-                start_point = (seg.x2, seg.y2)
-                end_point = (seg.x1, seg.y1)
+    def _resolve(key: str, default: float) -> float:
+        if isinstance(thresholds, Mapping) and key in thresholds:
+            return float(thresholds[key])
+        if isinstance(merge_cfg, Mapping) and key in merge_cfg:
+            return float(merge_cfg[key])
+        return default
 
-        bucket = int(round(offset / bin_size))
-        return {
-            "segment": seg,
-            "run_start": run_start,
-            "run_end": run_end,
-            "offset": offset,
-            "angle": angle,
-            "length": length,
-            "start_point": start_point,
-            "end_point": end_point,
-            "bucket": bucket,
-        }
+    gap_rel = _resolve("gap_max_rel", 0.003)
+    offset_rel = _resolve("offset_tol_rel", 0.002)
 
-    bins: Dict[int, List[Dict[str, object]]] = defaultdict(list)
-    passthrough: List[Segment] = []
+    off_tol = max(offset_rel * diag, diag * 1e-9, 1e-9)
+    gap_max = max(gap_rel * diag, 0.0)
+
+    bins: Dict[int, List[Segment]] = defaultdict(list)
 
     for seg in segments:
-        prepared = _prepare(seg)
-        if prepared is None:
-            passthrough.append(seg)
-            continue
-        bins[int(prepared["bucket"])].append(prepared)
+        if axis == "H":
+            offset = (seg.y1 + seg.y2) * 0.5
+        else:
+            offset = (seg.x1 + seg.x2) * 0.5
+        bucket = int(round(offset / off_tol))
+        bins[bucket].append(seg)
 
     merged: List[Segment] = []
 
-    def _finalize(group: Optional[Dict[str, object]]) -> None:
-        if not group:
-            return
-        sx, sy = group["start_point"]  # type: ignore[index]
-        ex, ey = group["end_point"]  # type: ignore[index]
-        merged.append(Segment(float(sx), float(sy), float(ex), float(ey)))
-
     for bucket in sorted(bins.keys()):
         items = bins[bucket]
-        items.sort(key=lambda data: float(data["run_start"]))
-        current: Optional[Dict[str, object]] = None
-        for data in items:
-            if current is None:
-                current = dict(data)
+        if axis == "H":
+            items.sort(key=lambda seg: min(seg.x1, seg.x2))
+        else:
+            items.sort(key=lambda seg: min(seg.y1, seg.y2))
+
+        current_start: Optional[float] = None
+        current_end: Optional[float] = None
+        coord_weighted: float = 0.0
+        coord_weight: float = 0.0
+
+        for seg in items:
+            if axis == "H":
+                seg_start = min(seg.x1, seg.x2)
+                seg_end = max(seg.x1, seg.x2)
+                coord = (seg.y1 + seg.y2) * 0.5
+            else:
+                seg_start = min(seg.y1, seg.y2)
+                seg_end = max(seg.y1, seg.y2)
+                coord = (seg.x1 + seg.x2) * 0.5
+
+            seg_len = max(seg_end - seg_start, 1e-9)
+
+            if current_start is None:
+                current_start = seg_start
+                current_end = seg_end
+                coord_weighted = coord * seg_len
+                coord_weight = seg_len
                 continue
 
-            run_gap = max(0.0, float(data["run_start"]) - float(current["run_end"]))
-            if run_gap > gap_tol:
-                _finalize(current)
-                current = dict(data)
+            gap = seg_start - current_end
+            if gap > gap_max:
+                if coord_weight > 0:
+                    coord_avg = coord_weighted / coord_weight
+                else:
+                    coord_avg = coord
+                if axis == "H":
+                    merged.append(Segment(current_start, coord_avg, current_end, coord_avg))
+                else:
+                    merged.append(Segment(coord_avg, current_start, coord_avg, current_end))
+                current_start = seg_start
+                current_end = seg_end
+                coord_weighted = coord * seg_len
+                coord_weight = seg_len
                 continue
 
-            offset_diff = abs(float(data["offset"]) - float(current["offset"]))
-            if offset_diff > offset_tol:
-                _finalize(current)
-                current = dict(data)
-                continue
+            current_end = max(current_end, seg_end)
+            coord_weighted += coord * seg_len
+            coord_weight += seg_len
 
-            angle_a = current.get("angle")
-            angle_b = data.get("angle")
-            angle_diff = 0.0
-            if angle_a is not None and angle_b is not None:
-                angle_diff = _angle_diff_deg(float(angle_a), float(angle_b))
-            if angle_diff > angle_tol:
-                _finalize(current)
-                current = dict(data)
-                continue
+        if current_start is not None and current_end is not None and coord_weight > 0:
+            coord_avg = coord_weighted / coord_weight
+            if axis == "H":
+                merged.append(Segment(current_start, coord_avg, current_end, coord_avg))
+            else:
+                merged.append(Segment(coord_avg, current_start, coord_avg, current_end))
 
-            length_a = float(current["length"])
-            length_b = float(data["length"])
-            if length_a < 0:
-                length_a = 0.0
-            if length_b < 0:
-                length_b = 0.0
-            total_length = length_a + length_b
-            if total_length <= 0:
-                total_length = 1.0
-
-            current["offset"] = (
-                float(current["offset"]) * length_a + float(data["offset"]) * length_b
-            ) / total_length
-
-            if angle_a is None:
-                current["angle"] = angle_b
-            elif angle_b is not None:
-                current["angle"] = (
-                    float(angle_a) * length_a + float(angle_b) * length_b
-                ) / total_length
-
-            if float(data["run_start"]) < float(current["run_start"]):
-                current["run_start"] = data["run_start"]
-                current["start_point"] = data["start_point"]
-
-            if float(data["run_end"]) >= float(current["run_end"]):
-                current["run_end"] = data["run_end"]
-                current["end_point"] = data["end_point"]
-
-            current["length"] = total_length
-
-        _finalize(current)
-
-    merged.extend(passthrough)
     return merged
 
 
 def _merge_collinear_segments(
     segments: List[Segment],
     diag: float,
-    cfg: dict,
-    axes: Optional[Sequence[str]] = None,
+    cfg: Mapping[str, object],
+    axes: Optional[Sequence[Optional[str]]] = None,
 ) -> List[Segment]:
-    merge_cfg = cfg.get("merge") or {}
-    if not merge_cfg.get("enable", False):
+    merge_cfg = cfg.get("merge") if isinstance(cfg, Mapping) else {}
+    if not isinstance(merge_cfg, Mapping) or not merge_cfg.get("enable", False):
         return segments
 
     if len(segments) < 2:
         return segments
 
-    thresholds = merge_cfg.get("thresholds")
-    if isinstance(thresholds, Mapping):
-        angle_tol = float(
-            thresholds.get("collinear_angle_tol_deg", merge_cfg.get("collinear_angle_tol_deg", 3.0))
-        )
-        gap_tol = float(thresholds.get("gap_max_rel", merge_cfg.get("gap_max_rel", 0.003))) * diag
-        offset_tol = float(thresholds.get("offset_tol_rel", merge_cfg.get("offset_tol_rel", 0.002))) * diag
+    segments_for_merge = segments
+    axis_labels: Sequence[Optional[str]]
+    if axes is None or len(axes) != len(segments):
+        segments_for_merge, snapped_axes = _snap_segments_to_axes(segments, cfg)
+        axis_labels = snapped_axes
     else:
-        angle_tol = float(merge_cfg.get("collinear_angle_tol_deg", 3.0))
-        gap_tol = float(merge_cfg.get("gap_max_rel", 0.003)) * diag
-        offset_tol = float(merge_cfg.get("offset_tol_rel", 0.002)) * diag
+        axis_labels = axes
 
-    axes_list = list(axes) if axes is not None else _classify_segment_axes(segments)
-    if len(axes_list) != len(segments):
-        axes_list = _classify_segment_axes(segments)
+    horiz: List[Segment] = []
+    vert: List[Segment] = []
+    passthrough: List[Segment] = []
+
+    for seg, axis in zip(segments_for_merge, axis_labels):
+        if axis == "H":
+            horiz.append(seg)
+        elif axis == "V":
+            vert.append(seg)
+        else:
+            passthrough.append(seg)
 
     merged: List[Segment] = []
-    for axis in ("H", "V"):
-        axis_segments = [seg for seg, seg_axis in zip(segments, axes_list) if seg_axis == axis]
-        merged.extend(_merge_collinear_axis(axis_segments, axis, diag, angle_tol, gap_tol, offset_tol))
+    merged.extend(_merge_collinear_axis(horiz, "H", diag, cfg))
+    merged.extend(_merge_collinear_axis(vert, "V", diag, cfg))
+    merged.extend(passthrough)
 
     return merged
 
@@ -954,17 +952,18 @@ def parse_svg_segments(svg_path: str, cfg: dict) -> List[Segment]:
     for child in root:
         process_node(child, root_matrix)
 
-    merge_cfg = cfg.get("merge") or {}
-    axes: Optional[Sequence[str]] = None
-    if merge_cfg.get("enable", False):
-        axes = _classify_segment_axes(segments)
+    merge_cfg = cfg.get("merge") if isinstance(cfg, Mapping) else {}
+    axes: Optional[List[Optional[str]]] = None
+    segments_for_merge = segments
+    if isinstance(merge_cfg, Mapping) and merge_cfg.get("enable", False):
+        segments_for_merge, axes = _snap_segments_to_axes(segments, cfg)
 
     merge_start = perf_counter()
-    merged = _merge_collinear_segments(segments, diag, cfg, axes=axes)
+    merged = _merge_collinear_segments(segments_for_merge, diag, cfg, axes=axes)
     merge_elapsed = perf_counter() - merge_start
 
-    if merge_cfg.get("enable", False):
-        before = len(segments)
+    if isinstance(merge_cfg, Mapping) and merge_cfg.get("enable", False):
+        before = len(segments_for_merge)
         after = len(merged)
         if before == 0:
             percent_str = "0%"
@@ -976,11 +975,11 @@ def parse_svg_segments(svg_path: str, cfg: dict) -> List[Segment]:
                 sign = "-" if percent < 0 else "+"
                 percent_str = f"{sign}{abs(percent):.0f}%"
         log.info(
-            "SVG segments: %s → %s after merge (%s) in %.3fs",
+            "SVG segments: %s → %s after merge (%s) in %.1f ms",
             f"{before:,}",
             f"{after:,}",
             percent_str,
-            merge_elapsed,
+            merge_elapsed * 1000.0,
         )
 
     return merged
