@@ -1,9 +1,10 @@
 """Orientation gating utilities for pdfsvg-calibrator."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import math
-from typing import Iterable, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -14,9 +15,35 @@ log = logging.getLogger(__name__)
 
 DEFAULT_RASTER_SIZE: Tuple[int, int] = (512, 512)
 DEFAULT_USE_PHASE_CORRELATION: bool = True
+DEFAULT_MIN_ACCEPT_SCORE: float = 0.05
+
+WIDE_TRANS_WINDOW_PX: float = 25.0
 
 _FLIPS = ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0))
 _ROTATIONS = (0, 180)
+
+
+@dataclass
+class OrientationPickResult:
+    """Container for the orientation hypothesis selection."""
+
+    flip_xy: Tuple[float, float]
+    rot_deg: int
+    tx: float
+    ty: float
+    score: float
+    overlap: float
+    response: float
+    path: str
+    primary_score: float
+    primary_overlap: float
+    fallback_score: Optional[float]
+    fallback_overlap: Optional[float]
+    widen_trans_window: bool
+    trans_window_hint_px: Optional[float]
+
+    def __iter__(self):
+        yield from (self.flip_xy, self.rot_deg, self.tx, self.ty)
 
 
 def _ensure_size_tuple(size: int | Sequence[int]) -> Tuple[int, int]:
@@ -248,8 +275,8 @@ def pick_flip_and_rot(
     svg_segments: Sequence[Segment],
     page_size_pdf: Tuple[float, float],
     page_size_svg: Tuple[float, float],
-) -> Tuple[Tuple[float, float], int, float, float]:
-    """Evaluate hypotheses and return the best (flip, rot, tx, ty)."""
+) -> OrientationPickResult:
+    """Evaluate hypotheses and return the best orientation candidate."""
 
     if not pdf_segments:
         raise ValueError("PDF segments are required")
@@ -272,6 +299,7 @@ def pick_flip_and_rot(
         best_rot = 0
         best_shift = (0.0, 0.0)
         best_response = 0.0
+        best_overlap = 0.0
 
         for rot_deg in _ROTATIONS:
             for flip in _FLIPS:
@@ -279,11 +307,13 @@ def pick_flip_and_rot(
                 if DEFAULT_USE_PHASE_CORRELATION:
                     du, dv, response = phase_correlation(svg_image, pdf_image)
                     shifted_svg = _fourier_shift(svg_image, du, dv)
-                    score = _normalized_overlap(pdf_image, shifted_svg) * response
+                    overlap = _normalized_overlap(pdf_image, shifted_svg)
+                    score = overlap * response
                 else:
                     du = dv = 0.0
-                    response = _normalized_overlap(pdf_image, svg_image)
-                    score = response
+                    overlap = _normalized_overlap(pdf_image, svg_image)
+                    response = overlap
+                    score = overlap
 
                 if score > best_score:
                     best_score = score
@@ -291,30 +321,79 @@ def pick_flip_and_rot(
                     best_rot = rot_deg
                     best_shift = (du, dv)
                     best_response = response
+                    best_overlap = overlap
 
+        svg_best = rasterize_segments(svg_norm, raster_size, best_flip, best_rot)
         if DEFAULT_USE_PHASE_CORRELATION:
-            svg_best = rasterize_segments(svg_norm, raster_size, best_flip, best_rot)
             du, dv, best_response = phase_correlation(svg_best, pdf_image)
+            shifted_best = _fourier_shift(svg_best, du, dv)
+            best_overlap = _normalized_overlap(pdf_image, shifted_best)
             best_shift = (du, dv)
+            best_score = best_overlap * best_response
         else:
-            svg_best = rasterize_segments(svg_norm, raster_size, best_flip, best_rot)
             best_shift = (0.0, 0.0)
-            best_response = _normalized_overlap(pdf_image, svg_best)
+            best_overlap = _normalized_overlap(pdf_image, svg_best)
+            best_response = best_overlap
+            best_score = best_overlap
+
+        primary_score = best_score
+        primary_overlap = best_overlap
+        fallback_score: Optional[float] = None
+        fallback_overlap: Optional[float] = None
+        chosen_flip = best_flip
+        chosen_rot = best_rot
+        chosen_shift = best_shift
+        chosen_response = best_response
+        chosen_overlap = best_overlap
+        chosen_score = best_score
+        widen_trans_window = False
+        trans_window_hint: Optional[float] = None
+        path = "primary"
+
+        if best_score < DEFAULT_MIN_ACCEPT_SCORE:
+            fallback_flip = (-1.0, -1.0)
+            fallback_rot = 0
+            svg_fallback = rasterize_segments(svg_norm, raster_size, fallback_flip, fallback_rot)
+            if DEFAULT_USE_PHASE_CORRELATION:
+                du_fb, dv_fb, response_fb = phase_correlation(svg_fallback, pdf_image)
+                shifted_fb = _fourier_shift(svg_fallback, du_fb, dv_fb)
+                fallback_overlap = _normalized_overlap(pdf_image, shifted_fb)
+                fallback_score = fallback_overlap * response_fb
+            else:
+                du_fb = dv_fb = 0.0
+                fallback_overlap = _normalized_overlap(pdf_image, svg_fallback)
+                response_fb = fallback_overlap
+                fallback_score = fallback_overlap
+
+            if fallback_score > chosen_score:
+                chosen_flip = fallback_flip
+                chosen_rot = fallback_rot
+                chosen_shift = (du_fb, dv_fb)
+                chosen_response = response_fb
+                chosen_overlap = fallback_overlap
+                chosen_score = fallback_score
+                path = "fallback_orientation"
+            else:
+                path = "fallback_wide_window"
+                widen_trans_window = True
+                trans_window_hint = WIDE_TRANS_WINDOW_PX
+
+        width, height = _ensure_size_tuple(raster_size)
 
         width, height = _ensure_size_tuple(raster_size)
         page_w, page_h = page_size_svg
         scale_x = page_w / float(width) if width > 0 else 0.0
         scale_y = page_h / float(height) if height > 0 else 0.0
-        dx_doc = best_shift[0] * scale_x
-        dy_doc = -best_shift[1] * scale_y
+        dx_doc = chosen_shift[0] * scale_x
+        dy_doc = -chosen_shift[1] * scale_y
         doc_shift = np.array([dx_doc, dy_doc], dtype=np.float64)
 
-        angle_rad = math.radians(best_rot % 360)
+        angle_rad = math.radians(chosen_rot % 360)
         cos_a = math.cos(angle_rad)
         sin_a = math.sin(angle_rad)
         rot_matrix = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
         flip_matrix = np.array(
-            [[best_flip[0], 0.0], [0.0, best_flip[1]]], dtype=np.float64
+            [[chosen_flip[0], 0.0], [0.0, chosen_flip[1]]], dtype=np.float64
         )
         M = flip_matrix @ rot_matrix
         t_seed = M.T @ doc_shift
@@ -322,22 +401,45 @@ def pick_flip_and_rot(
         ty0 = float(t_seed[1])
 
         log.debug(
-            "[orient] best rot=%d flip=%s score=%.4f response=%.4f shift=(%.2f, %.2f)px",
-            best_rot,
-            best_flip,
-            best_score,
-            best_response,
-            best_shift[0],
-            best_shift[1],
+            "[orient] best rot=%d flip=%s score=%.4f overlap=%.4f response=%.4f shift=(%.2f, %.2f)px",
+            chosen_rot,
+            chosen_flip,
+            chosen_score,
+            chosen_overlap,
+            chosen_response,
+            chosen_shift[0],
+            chosen_shift[1],
+        )
+        log.info(
+            "[orient] score primary=%.4f overlap=%.4f fallback=%s path=%s",
+            primary_score,
+            primary_overlap,
+            f"{fallback_score:.4f}" if fallback_score is not None else "n/a",
+            path,
         )
         log.info(
             "[orient] phase du=%.2fpx dv=%.2fpx -> doc=(%.2f, %.2f) units -> t_seed=(%.2f, %.2f)",
-            best_shift[0],
-            best_shift[1],
+            chosen_shift[0],
+            chosen_shift[1],
             dx_doc,
             dy_doc,
             tx0,
             ty0,
         )
 
-        return best_flip, best_rot, tx0, ty0
+        return OrientationPickResult(
+            flip_xy=chosen_flip,
+            rot_deg=chosen_rot,
+            tx=tx0,
+            ty=ty0,
+            score=chosen_score,
+            overlap=chosen_overlap,
+            response=chosen_response,
+            path=path,
+            primary_score=primary_score,
+            primary_overlap=primary_overlap,
+            fallback_score=fallback_score,
+            fallback_overlap=fallback_overlap,
+            widen_trans_window=widen_trans_window,
+            trans_window_hint_px=trans_window_hint,
+        )

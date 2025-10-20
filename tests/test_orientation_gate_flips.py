@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import pdfsvg_calibrator.orientation as orientation_module
 from pdfsvg_calibrator.orientation import pick_flip_and_rot
 from pdfsvg_calibrator.types import Segment
 
@@ -87,3 +88,63 @@ def test_orientation_gate_matches_expected_transform(
     assert result_matrix == expected_matrix
     assert abs(tx) < 1e-2
     assert abs(ty) < 1e-2
+
+
+def test_orientation_fallback_prefers_default_when_better(monkeypatch: pytest.MonkeyPatch) -> None:
+    pdf_size = (220.0, 170.0)
+    pdf_segments = _base_segments()
+    svg_segments = list(pdf_segments)
+
+    monkeypatch.setattr(orientation_module, "DEFAULT_USE_PHASE_CORRELATION", False)
+    monkeypatch.setattr(orientation_module, "DEFAULT_MIN_ACCEPT_SCORE", 0.05)
+
+    overlap_values = iter([0.01, 0.009, 0.008, 0.007, 0.006, 0.005, 0.004, 0.003, 0.01, 0.2])
+
+    def fake_overlap(_img_a, _img_b):
+        return next(overlap_values)
+
+    monkeypatch.setattr(orientation_module, "_normalized_overlap", fake_overlap)
+
+    result = orientation_module.pick_flip_and_rot(
+        pdf_segments,
+        svg_segments,
+        pdf_size,
+        pdf_size,
+    )
+
+    assert result.path == "fallback_orientation"
+    assert result.widen_trans_window is False
+    assert result.trans_window_hint_px is None
+    assert result.primary_score == pytest.approx(0.01)
+    assert result.fallback_score == pytest.approx(0.2)
+    assert result.score == pytest.approx(0.2)
+
+
+def test_orientation_fallback_requests_wide_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    pdf_size = (220.0, 170.0)
+    pdf_segments = _base_segments()
+    svg_segments = list(pdf_segments)
+
+    monkeypatch.setattr(orientation_module, "DEFAULT_USE_PHASE_CORRELATION", False)
+    monkeypatch.setattr(orientation_module, "DEFAULT_MIN_ACCEPT_SCORE", 0.05)
+
+    overlap_values = iter([0.01, 0.009, 0.008, 0.007, 0.006, 0.005, 0.004, 0.003, 0.01, 0.005])
+
+    def fake_overlap(_img_a, _img_b):
+        return next(overlap_values)
+
+    monkeypatch.setattr(orientation_module, "_normalized_overlap", fake_overlap)
+
+    result = orientation_module.pick_flip_and_rot(
+        pdf_segments,
+        svg_segments,
+        pdf_size,
+        pdf_size,
+    )
+
+    assert result.path == "fallback_wide_window"
+    assert result.widen_trans_window is True
+    assert result.trans_window_hint_px == pytest.approx(orientation_module.WIDE_TRANS_WINDOW_PX)
+    assert result.primary_score == pytest.approx(0.01)
+    assert result.fallback_score == pytest.approx(0.005)
+    assert result.score == pytest.approx(0.01)
