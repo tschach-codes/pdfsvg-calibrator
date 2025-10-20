@@ -1,6 +1,12 @@
 from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import MutableSequence
+
 import numpy as np
 from dataclasses import dataclass
+
 from .profiles import segment_features, make_projections, quantile_scale, raster_heatmap
 from .corr import xcorr_1d, Orientation, adjust_profile_for_orientation
 from .geom import apply_orientation_pts, apply_scale_shift_pts, transform_segments
@@ -16,7 +22,15 @@ class CoarseResult:
     score: float
 
 
-def coarse_align(pdf_segments, svg_segments, bbox_pdf, bbox_svg, cfg) -> CoarseResult:
+def coarse_align(
+    pdf_segments,
+    svg_segments,
+    bbox_pdf,
+    bbox_svg,
+    cfg,
+    *,
+    debug_dir: Path | None = None,
+) -> CoarseResult:
     if not cfg['coarse']['enabled']:
         return CoarseResult(False, None, None, None, 0.0)
 
@@ -26,6 +40,13 @@ def coarse_align(pdf_segments, svg_segments, bbox_pdf, bbox_svg, cfg) -> CoarseR
     min_long    = cfg['coarse']['adapt']['min_long_segments']
     chosen = None
     best = CoarseResult(False, None, None, None, -1e9)
+    debug_records: MutableSequence[dict[str, float | int | str]] = []
+    debug_path = None
+    best_profiles: dict[str, np.ndarray] | None = None
+
+    if debug_dir is not None:
+        debug_path = Path(debug_dir)
+        debug_path.mkdir(parents=True, exist_ok=True)
 
     for topk_rel in topk_levels:
         for hv_tol in hv_levels:
@@ -81,9 +102,30 @@ def coarse_align(pdf_segments, svg_segments, bbox_pdf, bbox_svg, cfg) -> CoarseR
                     )
                     score_total = score + cfg['coarse']['score_weights']['inliers']*inlier_score
 
+                    if debug_path is not None:
+                        debug_records.append(
+                            {
+                                "topk_rel": float(topk_rel),
+                                "hv_angle_tol_deg": float(hv_tol),
+                                "rot_deg": int(O.rot_deg),
+                                "flip": str(O.flip),
+                                "corr_x": float(cx),
+                                "corr_y": float(cy),
+                                "inlier_score": float(inlier_score),
+                                "score": float(score_total),
+                            }
+                        )
+
                     if score_total > best.score:
                         best = CoarseResult(True, O, (sx,sy), (dx,dy), score_total)
                         chosen = dict(topk_rel=topk_rel, hv_tol=hv_tol)
+                        if debug_path is not None:
+                            best_profiles = {
+                                "pdf_Hx": Ppdf.Hx.copy(),
+                                "pdf_Hy": Ppdf.Hy.copy(),
+                                "svg_Hx": Hx_svg.copy(),
+                                "svg_Hy": Hy_svg.copy(),
+                            }
 
     # Optionaler Heatmap-Fallback
     if not best.ok and cfg['coarse']['fallback_use_heatmap']:
@@ -98,5 +140,18 @@ def coarse_align(pdf_segments, svg_segments, bbox_pdf, bbox_svg, cfg) -> CoarseR
         dy = iy if iy < C.shape[0]//2 else iy - C.shape[0]
         dx = ix if ix < C.shape[1]//2 else ix - C.shape[1]
         best = CoarseResult(True, Orientation(0,'none'), (1.0,1.0), (dx,dy), float(C.max()))
+        if debug_path is not None:
+            np.save(debug_path / "heatmap_pdf.npy", Hp)
+            np.save(debug_path / "heatmap_svg.npy", Hs)
+
+    if debug_path is not None:
+        (debug_path / "correlations.json").write_text(
+            json.dumps(list(debug_records), indent=2, ensure_ascii=False)
+        )
+        if best_profiles is not None:
+            np.save(debug_path / "profile_pdf_x.npy", best_profiles["pdf_Hx"])
+            np.save(debug_path / "profile_pdf_y.npy", best_profiles["pdf_Hy"])
+            np.save(debug_path / "profile_svg_x.npy", best_profiles["svg_Hx"])
+            np.save(debug_path / "profile_svg_y.npy", best_profiles["svg_Hy"])
 
     return best
