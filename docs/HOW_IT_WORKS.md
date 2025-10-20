@@ -1,13 +1,13 @@
 # Wie pdfsvg-calibrator arbeitet
 
 ## Überblick
-`pdfsvg-calibrator` bestimmt eine affine Abbildung `X = sx * x + tx`, `Y = sy * y + ty`. Die vier unbekannten Skalierungs- und Verschiebungsparameter werden in einer gestuften Pipeline ermittelt, die Rotationen und Spiegelungen (standardmäßig 0°/180°) berücksichtigt und robuste Seeds an das RANSAC-/Chamfer-Matching weitergibt.【F:src/pdfsvg_calibrator/calibrate.py†L38-L205】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
+`pdfsvg-calibrator` bestimmt eine affine Abbildung `X = sx * x + tx`, `Y = sy * y + ty`. Die vier unbekannten Skalierungs- und Verschiebungsparameter werden in einer gestuften Pipeline ermittelt, die Rotationen und Spiegelungen (standardmäßig 0°/180°) berücksichtigt und robuste Seeds an das RANSAC-/Chamfer-Matching weitergibt.【F:src/pdfsvg_calibrator/calibrate.py†L38-L355】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
 
 ## Vierstufige Pipeline
 1. **Orientierung & Flip-Hypothesen** – `pick_flip_and_rot()` rasterisiert PDF- und SVG-Segmente (inkl. Hilfsrahmen) auf das Standardraster (`512×512`) und probiert vier Flip-Kombinationen über die konfigurierten Rotationen.【F:src/pdfsvg_calibrator/orientation.py†L246-L329】
 2. **Phase-Correlation & Translation-Seed** – Für jede Hypothese wird per FFT-basierter Phasenkorrelation der Versatz (`dx`, `dy`) geschätzt. Der Score kombiniert Spitzenhöhe und normalisierte Überlappung und liefert `tx₀`/`ty₀` in Seitenkoordinaten.【F:src/pdfsvg_calibrator/orientation.py†L179-L275】
-3. **Skalen-Seed & Schranken** – Aus den Seitenabmessungen werden `sx₀`/`sy₀` berechnet und mit dem Flip-Vorzeichen versehen. `calibrate()` hinterlegt daraus Seeds, Clamp-Bereiche und Fenster für die spätere Feinoptimierung.【F:src/pdfsvg_calibrator/calibrate.py†L90-L155】
-4. **Lokale Verfeinerung** – `fit_model.calibrate()` nutzt Chamfer-Distanzen auf einem grob→fein Raster, sampelt Segmentpunkte (max. 1 500) und führt RANSAC mit den gesetzten Fenstern aus, bis Score/RMSE stabil sind.【F:src/pdfsvg_calibrator/calibrate.py†L135-L205】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
+3. **Skalen-Seed & Schranken** – Aus den Seitenabmessungen werden `sx₀`/`sy₀` berechnet und mit dem Flip-Vorzeichen versehen. `calibrate()` hinterlegt daraus Seeds, Clamp-Bereiche und Fenster für die spätere Feinoptimierung.【F:src/pdfsvg_calibrator/calibrate.py†L91-L195】
+4. **Lokale Verfeinerung** – `fit_model.calibrate()` nutzt Chamfer-Distanzen auf einem grob→fein Raster, sampelt Segmentpunkte (max. 1 500) und führt RANSAC mit den gesetzten Fenstern aus, bis Score/RMSE stabil sind.【F:src/pdfsvg_calibrator/calibrate.py†L139-L355】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
 
 Danach folgen Linienauswahl, Matching und Reporting (Overlays + CSV).【F:src/pdfsvg_calibrator/match_verify.py†L334-L705】【F:src/pdfsvg_calibrator/overlays.py†L92-L205】
 
@@ -16,7 +16,7 @@ Danach folgen Linienauswahl, Matching und Reporting (Overlays + CSV).【F:src/pd
   - `_load_config_with_defaults()` → zusammengeführte Konfiguration (`dict`).
   - `convert_pdf_to_svg_if_needed()` → optionaler SVG-Export über PyMuPDF.【F:src/pdfsvg_calibrator/cli.py†L323-L374】
   - `load_pdf_segments()` / `load_svg_segments()` → Segmentlisten + Seitengrößen.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L235-L392】
-  - `calibrate.calibrate()` → Orientierungssaat + lokales `Model` Ergebnis.【F:src/pdfsvg_calibrator/calibrate.py†L38-L205】
+  - `calibrate.calibrate()` → Orientierungssaat + lokales `Model` Ergebnis.【F:src/pdfsvg_calibrator/calibrate.py†L38-L355】
   - `select_lines()` → Auswahl bis zu fünf repräsentativer Linien.【F:src/pdfsvg_calibrator/match_verify.py†L334-L548】
   - `match_lines()` → Ungarisches Matching + PASS/FAIL.【F:src/pdfsvg_calibrator/match_verify.py†L551-L705】
   - `write_*()` / `_summarize()` → Overlays, CSV, Konsolenausgabe.【F:src/pdfsvg_calibrator/cli.py†L258-L412】【F:src/pdfsvg_calibrator/overlays.py†L92-L205】
@@ -28,7 +28,7 @@ Danach folgen Linienauswahl, Matching und Reporting (Overlays + CSV).【F:src/pd
 
 ## Datenmodelle
 - `Segment(x1, y1, x2, y2)` – Repräsentiert eine Linie im Ursprungskoordinatensystem.【F:src/pdfsvg_calibrator/types.py†L4-L9】
-- `Model(...)` – Enthält Transformation + Qualitätskennzahlen (Score, RMSE, P95, Median) und optionale Qualitätsnotizen.【F:src/pdfsvg_calibrator/types.py†L10-L27】【F:src/pdfsvg_calibrator/calibrate.py†L200-L204】
+- `Model(...)` – Enthält Transformation + Qualitätskennzahlen (Score, RMSE, P95, Median) und optionale Qualitätsnotizen.【F:src/pdfsvg_calibrator/types.py†L10-L27】【F:src/pdfsvg_calibrator/calibrate.py†L332-L384】
 - `Match(...)` – Zeileneintrag für CSV/Overlay inkl. Kosten, Confidence und PASS-Flags.【F:src/pdfsvg_calibrator/types.py†L16-L27】【F:src/pdfsvg_calibrator/overlays.py†L117-L205】
 
 ## Parameter- und Konstantenverzeichnis
@@ -39,16 +39,16 @@ Danach folgen Linienauswahl, Matching und Reporting (Overlays + CSV).【F:src/pd
 | `orientation.enabled` | `true` | Aktiviert den Orientation-Gate. Abschalten nur zum Debuggen, da Seeds fehlen würden.【F:src/pdfsvg_calibrator/calibrate.py†L66-L124】 |
 | `orientation.raster_size` | `512` | Größer = genauere Korrelation, aber teurer im FFT.【F:src/pdfsvg_calibrator/orientation.py†L179-L329】 |
 | `orientation.use_phase_correlation` | `true` | Liefert den stabilsten Translationsseed; `false` nur bei starkem Rauschen verwenden.【F:src/pdfsvg_calibrator/orientation.py†L179-L275】 |
-| `refine.scale_max_dev_rel` | `0.02` | ±2 % Fenster um `sx₀`/`sy₀`. Enger für präzise Layouts, weiter bei verzogenen Exporten.【F:src/pdfsvg_calibrator/calibrate.py†L118-L155】 |
-| `refine.trans_max_dev_px` | `10.0` | Fenster in SVG-Pixeln für lokale Suche; größer wählen, wenn Phase-Seeds driftig sind.【F:src/pdfsvg_calibrator/calibrate.py†L118-L155】 |
-| `refine.max_iters` | `120` | Obergrenze für lokale Auswertungen. Wird als `ransac.iters` gespiegelt.【F:src/pdfsvg_calibrator/calibrate.py†L130-L205】 |
-| `refine.max_samples` | `1500` | Sicherer Deckel für Samplingpunkte, damit Läufe <10 s bleiben.【F:src/pdfsvg_calibrator/calibrate.py†L130-L150】 |
-| `refine.quality_gate.*` | siehe YAML | Fallback mit größeren Fenstern, falls Score/RMSE zu schlecht bleiben.【F:src/pdfsvg_calibrator/calibrate.py†L156-L204】 |
-| `grid.initial_cell_rel` / `grid.final_cell_rel` | `0.05` / `0.02` | Zweistufiges Chamfer-Grid (grob→fein). `initial` nicht kleiner als 0.03 wählen.【F:src/pdfsvg_calibrator/calibrate.py†L139-L148】【F:src/pdfsvg_calibrator/fit_model.py†L203-L316】 |
-| `sampling.step_rel` | `0.03` | Relative Abtastweite entlang PDF-Linien. 0.02 für höhere Genauigkeit, <0.01 nur bei Spezialfällen.【F:src/pdfsvg_calibrator/calibrate.py†L135-L138】【F:src/pdfsvg_calibrator/fit_model.py†L210-L241】 |
-| `sampling.max_points` | `1500` | Deckt sich mit `refine.max_samples`; schützt Chamfer vor Explosionen.【F:src/pdfsvg_calibrator/calibrate.py†L135-L150】 |
-| `ransac.iters` | `=refine.max_iters` | Automatisch gesetzt, ausreichend für stabile Seeds.【F:src/pdfsvg_calibrator/calibrate.py†L124-L138】【F:src/pdfsvg_calibrator/fit_model.py†L214-L316】 |
-| `ransac.refine_scale_step` / `refine_trans_px` | auto | Werden aus den Fenstern abgeleitet (1/10 bzw. 1/3). Nur manuell setzen, wenn Sampling extrem fein ist.【F:src/pdfsvg_calibrator/calibrate.py†L124-L138】 |
+| `refine.scale_max_dev_rel` | `0.02` | ±2 % Fenster um `sx₀`/`sy₀`. Enger für präzise Layouts, weiter bei verzogenen Exporten.【F:src/pdfsvg_calibrator/calibrate.py†L141-L175】 |
+| `refine.trans_max_dev_px` | `8.0` | Fenster in SVG-Pixeln für lokale Suche; größer wählen, wenn Phase-Seeds driftig sind.【F:src/pdfsvg_calibrator/calibrate.py†L141-L195】 |
+| `refine.max_iters` | `60` | Obergrenze für lokale Auswertungen. Wird als `ransac.iters` gespiegelt.【F:src/pdfsvg_calibrator/calibrate.py†L156-L215】 |
+| `refine.max_samples` | `1500` | Sicherer Deckel für Samplingpunkte, damit Läufe <10 s bleiben.【F:src/pdfsvg_calibrator/calibrate.py†L157-L215】 |
+| `refine.quality_gate.*` | siehe YAML | Fallback mit größeren Fenstern, falls Score/RMSE zu schlecht bleiben.【F:src/pdfsvg_calibrator/calibrate.py†L222-L355】 |
+| `grid.initial_cell_rel` / `grid.final_cell_rel` | `0.05` / `0.02` | Zweistufiges Chamfer-Grid (grob→fein). `initial` nicht kleiner als 0.03 wählen.【F:src/pdfsvg_calibrator/calibrate.py†L216-L220】【F:src/pdfsvg_calibrator/fit_model.py†L203-L316】 |
+| `sampling.step_rel` | `0.03` | Relative Abtastweite entlang PDF-Linien. 0.02 für höhere Genauigkeit, <0.01 nur bei Spezialfällen.【F:src/pdfsvg_calibrator/calibrate.py†L210-L214】【F:src/pdfsvg_calibrator/fit_model.py†L210-L241】 |
+| `sampling.max_points` | `1500` | Deckt sich mit `refine.max_samples`; schützt Chamfer vor Explosionen.【F:src/pdfsvg_calibrator/calibrate.py†L210-L215】 |
+| `ransac.iters` | `=refine.max_iters` | Automatisch gesetzt, ausreichend für stabile Seeds.【F:src/pdfsvg_calibrator/calibrate.py†L199-L208】【F:src/pdfsvg_calibrator/fit_model.py†L214-L316】 |
+| `ransac.refine_scale_step` / `refine_trans_px` | auto | Werden aus den Fenstern abgeleitet (1/10 bzw. 1/3). Nur manuell setzen, wenn Sampling extrem fein ist.【F:src/pdfsvg_calibrator/calibrate.py†L199-L208】 |
 | `verify.*` | Defaults übernehmen | Matching-/PASS-Checks. 1 %-Grenze über `verify.tol_rel` regulierbar.【F:configs/default.yaml†L21-L36】【F:src/pdfsvg_calibrator/match_verify.py†L334-L705】 |
 | `neighbors.*` | aktiv lassen | Stabilisiert Kostenmatrix. Radius 0.05–0.07 bewährt; Strafen nur bei Spezialfällen justieren.【F:configs/default.yaml†L27-L31】【F:src/pdfsvg_calibrator/match_verify.py†L171-L315】 |
 | `cost_weights.*` | `0.5/0.3/0.2/0.1` | Ausbalancierte Mischung von Endpunkt, Mittelpunkt, Richtung, Nachbarn.【F:configs/default.yaml†L32-L36】【F:src/pdfsvg_calibrator/match_verify.py†L288-L315】 |
@@ -74,16 +74,16 @@ Weitere I/O-Parameter wie `curve_tol_rel`, `straight_max_dev_rel` oder `min_len_
 
 ## Performance-Tipps
 - **Kollineare Segmente zusammenführen** – Entfernt doppelte Linien, reduziert Chamfer-Abtastungen und beschleunigt RANSAC. Extern mergen oder die vorbereiteten `merge.*`-Grenzen nutzen.【F:configs/default.yaml†L10-L18】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
-- **PDF-Diagonale als Referenz** – Alle relativen Toleranzen skalieren mit der Seitendiagonale. Größere Pläne benötigen daher keine manuelle Anpassung von `curve_tol_rel`, `straight_max_dev_rel` oder `sampling.step_rel`.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L235-L308】【F:src/pdfsvg_calibrator/calibrate.py†L118-L155】
-- **Chamfer-Grid zweistufig fahren** – Mit `grid.initial_cell_rel` (grob) und `grid.final_cell_rel` (fein) lassen sich Läufe unter 10 s halten, ohne Genauigkeit einzubüßen.【F:src/pdfsvg_calibrator/calibrate.py†L139-L148】【F:src/pdfsvg_calibrator/fit_model.py†L203-L316】
+- **PDF-Diagonale als Referenz** – Alle relativen Toleranzen skalieren mit der Seitendiagonale. Größere Pläne benötigen daher keine manuelle Anpassung von `curve_tol_rel`, `straight_max_dev_rel` oder `sampling.step_rel`.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L235-L308】【F:src/pdfsvg_calibrator/calibrate.py†L141-L175】
+- **Chamfer-Grid zweistufig fahren** – Mit `grid.initial_cell_rel` (grob) und `grid.final_cell_rel` (fein) lassen sich Läufe unter 10 s halten, ohne Genauigkeit einzubüßen.【F:src/pdfsvg_calibrator/calibrate.py†L216-L220】【F:src/pdfsvg_calibrator/fit_model.py†L203-L316】
 - **Rotationen einschränken** – Entfernen Sie ungenutzte Einträge aus `rot_degrees`, um weniger Hypothesen zu prüfen.【F:src/pdfsvg_calibrator/orientation.py†L246-L329】
 
 ## Debugging & Troubleshooting
 | Symptom | Mögliche Ursache | Gegenmittel |
 | --- | --- | --- |
 | Ergebnis wirkt gespiegelt | Falscher Flip/Rotation gewann Stufe 1 | `rot_degrees` um 90°-Schritte erweitern, Orientation aktiv lassen, optional `orientation.use_phase_correlation=false` bei extrem symmetrischen Plänen testen.【F:src/pdfsvg_calibrator/orientation.py†L246-L329】 |
-| Translation riesig oder driftet | Phase-Korrelation landet auf Nebenmaximum | `orientation.raster_size` erhöhen, `refine.trans_max_dev_px` auf 20–30 anheben und Quality-Gate-Fallback zulassen.【F:src/pdfsvg_calibrator/orientation.py†L179-L275】【F:src/pdfsvg_calibrator/calibrate.py†L118-L205】 |
-| Laufzeiten >10 s | Zu viele Samples/Hypothesen | `sampling.max_points` (→1200) senken, `rot_degrees` reduzieren, Segmente vorab mergen.【F:src/pdfsvg_calibrator/calibrate.py†L124-L150】【F:configs/default.yaml†L1-L18】 |
+| Translation riesig oder driftet | Phase-Korrelation landet auf Nebenmaximum | `orientation.raster_size` erhöhen, `refine.trans_max_dev_px` auf 20–30 anheben und Quality-Gate-Fallback zulassen.【F:src/pdfsvg_calibrator/orientation.py†L179-L275】【F:src/pdfsvg_calibrator/calibrate.py†L141-L355】 |
+| Laufzeiten >10 s | Zu viele Samples/Hypothesen | `sampling.max_points` (→1200) senken, `rot_degrees` reduzieren, Segmente vorab mergen.【F:src/pdfsvg_calibrator/calibrate.py†L199-L215】【F:configs/default.yaml†L1-L18】 |
 | Linien-Report ist verrauscht | Viele kurze/gebrochene Segmente | `straight_max_dev_rel` leicht erhöhen oder externe Glättung anwenden; `verify.radius_px` moderat vergrößern.【F:src/pdfsvg_calibrator/io_svg_pdf.py†L235-L308】【F:src/pdfsvg_calibrator/match_verify.py†L557-L706】 |
 
 ## Debugging falscher Matches

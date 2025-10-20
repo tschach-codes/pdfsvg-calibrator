@@ -209,7 +209,7 @@ def phase_correlation(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float
     if _skimage_pcc is not None:
         shift, response, _ = _skimage_pcc(a, b, upsample_factor=1)
         dv, du = float(shift[0]), float(shift[1])
-        return du, dv, float(response)
+        return float(-du), float(-dv), float(response)
 
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
