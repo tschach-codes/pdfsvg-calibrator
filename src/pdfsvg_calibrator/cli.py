@@ -53,6 +53,7 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "raster_size": 512,
         "use_phase_correlation": True,
+        "sample_topk_rel": 0.2,
     },
     "rot_degrees": [0, 180],
     "angle_tol_deg": 6.0,
@@ -89,6 +90,7 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
         "patience": 60,
     },
     "verify": {
+        "mode": "lines",
         "pick_k": 5,
         "diversity_rel": 0.10,
         "radius_px": 80.0,
@@ -115,8 +117,41 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _normalize_opts_arguments(argv: List[str]) -> None:
+    if not argv:
+        return
+    normalized: List[str] = [argv[0]]
+    idx = 1
+    argc = len(argv)
+    while idx < argc:
+        token = argv[idx]
+        if token == "--opts" and idx + 1 < argc:
+            normalized.append(token)
+            next_token = argv[idx + 1]
+            if "=" not in next_token and idx + 2 < argc:
+                value_token = argv[idx + 2]
+                is_short_option = (
+                    value_token.startswith("-")
+                    and not value_token.startswith("--")
+                    and len(value_token) == 2
+                    and value_token[1].isalpha()
+                )
+                if not value_token.startswith("--") and not is_short_option:
+                    normalized.append(f"{next_token}={value_token}")
+                    idx += 3
+                    continue
+            normalized.append(next_token)
+            idx += 2
+            continue
+        normalized.append(token)
+        idx += 1
+    argv[:] = normalized
+
+
 if len(sys.argv) > 1 and sys.argv[1] == "run":  # pragma: no cover - CLI convenience
     del sys.argv[1]
+
+_normalize_opts_arguments(sys.argv)
 
 
 class _PlainStatus:
@@ -234,6 +269,20 @@ def _set_nested(config: MutableMapping[str, Any], path: Sequence[str], value: An
     cursor[path[-1]] = value
 
 
+def _parse_cli_override(entry: str) -> Tuple[Tuple[str, ...], Any]:
+    if "=" not in entry:
+        raise ValueError("--opts erwartet 'pfad wert' oder 'pfad=wert'")
+    raw_path, raw_value = entry.split("=", 1)
+    path = tuple(part.strip() for part in raw_path.split(".") if part.strip())
+    if not path:
+        raise ValueError("--opts benötigt einen Schlüsselpfad, z. B. orientation.sample_topk_rel")
+    try:
+        value = yaml.safe_load(raw_value)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"--opts {raw_path}: Wert konnte nicht geparst werden ({exc})") from exc
+    return path, value
+
+
 def _load_config_with_defaults(path: Path, rng_seed: Optional[int]) -> Dict[str, Any]:
     raw_cfg: Dict[str, Any] = {}
     loaded = load_config(str(path))
@@ -339,6 +388,7 @@ def _alignment_diagnostics(
     det_negative = (model.flip_x * model.flip_y) < 0
 
     flip_label = _model_flip_label(model)
+    flip_desc = f"(x={model.flip_x:+.0f}, y={model.flip_y:+.0f})"
 
     bounds_parts: List[str] = []
     if scale_tol_cfg > 0.0:
@@ -350,7 +400,7 @@ def _alignment_diagnostics(
 
     header_lines = [
         (
-            f"rot={rot_norm}° | flips={flip_label} | "
+            f"rot={rot_norm}° | flips={flip_desc} | "
             f"sx={model.sx:.6f} | sy={model.sy:.6f}"
         ),
         (
@@ -457,13 +507,21 @@ def _summarize(
     alignment: Mapping[str, Any] | None,
 ) -> None:
     headers, rows = _build_summary_table(matches)
-    flip_label = _model_flip_label(model)
+    rot_norm = int(model.rot_deg) % 360
+    flip_desc = f"(x={model.flip_x:+.0f}, y={model.flip_y:+.0f})"
     summary_lines = [
         (
-            f"Model rot={model.rot_deg % 360}° | flips={flip_label} | "
-            f"sx={model.sx:.6f} sy={model.sy:.6f} tx={model.tx:.3f} ty={model.ty:.3f}"
+            f"rot={rot_norm}° | flips={flip_desc} | "
+            f"sx={model.sx:.6f} | sy={model.sy:.6f} | tx={model.tx:.3f}px | ty={model.ty:.3f}px"
         ),
-        f"Score={model.score:.4f} | RMSE={model.rmse:.4f} | P95={model.p95:.4f} | Median={model.median:.4f}",
+        (
+            "DT QA: RMSE={rmse:.4f}px | P95={p95:.4f}px | Median={median:.4f}px | Score={score:.4f}".format(
+                rmse=model.rmse,
+                p95=model.p95,
+                median=model.median,
+                score=model.score,
+            )
+        ),
     ]
     if alignment is not None:
         tol_source = alignment.get("tol_source", "config")
@@ -646,6 +704,16 @@ def run(
         min=0.0,
         help="Suchradius in Pixel für die Verifikation",
     ),
+    opts: List[str] = typer.Option(
+        [],
+        "--opts",
+        help=(
+            "Konfigurationswerte überschreiben; Pfad und Wert angeben, z. B."
+            " --opts verify.mode distmap oder --opts orientation.sample_topk_rel=0.4"
+        ),
+        show_default=False,
+        metavar="PATH=VALUE",
+    ),
 ) -> None:
     logger = Logger(verbose=verbose)
 
@@ -687,7 +755,9 @@ def run(
                     (("grid", "initial_cell_rel"), grid_initial_cell_rel),
                     (("grid", "final_cell_rel"), grid_final_cell_rel),
                     (("prefilter", "len_rel_ref"),
-                     prefilter_len_rel_ref.lower() if prefilter_len_rel_ref is not None else None),
+                     prefilter_len_rel_ref.lower()
+                     if isinstance(prefilter_len_rel_ref, str)
+                     else prefilter_len_rel_ref),
                     (("merge", "enable"), merge_enabled),
                     (("merge", "collinear_angle_tol_deg"), merge_collinear_angle_tol_deg),
                     (("merge", "gap_max_rel"), merge_gap_max_rel),
@@ -698,6 +768,10 @@ def run(
                     (("verify", "angle_tol_deg"), verify_angle_tol_deg),
                     (("verify", "radius_px"), verify_radius_px),
                 ]
+
+                for entry in opts:
+                    path, value = _parse_cli_override(entry)
+                    overrides.append((path, value))
 
                 for path, value in overrides:
                     if value is None:

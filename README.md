@@ -35,11 +35,12 @@
    - `plan_p000_check.csv` – Tabelle mit Modellwerten, pro Linie Länge, Fehler und PASS/FAIL.
 
 ## Wie es funktioniert
-Die Kalibrierung läuft in vier Stufen ab:
+Die Kalibrierung läuft in klar getrennten Stufen ab:
 1. **Orientierung & Flip-Hypothesen** – PDF- und SVG-Segmente werden in ein 512²-Raster projiziert, Flip-Kombinationen und die Rotationsliste (`rot_degrees`) getestet.【F:src/pdfsvg_calibrator/orientation.py†L246-L329】
-2. **Phase-Correlation & Translation-Seed** – Für jede Hypothese wird per FFT der Versatz zwischen beiden Rasterbildern geschätzt; die beste Kombination liefert `tx₀`/`ty₀`.【F:src/pdfsvg_calibrator/orientation.py†L179-L275】
+2. **Rasterprojektionen & Phase-Korrelation** – Für jede Hypothese wird per FFT der Versatz zwischen beiden Rasterbildern geschätzt; die beste Kombination liefert `tx₀`/`ty₀`.【F:src/pdfsvg_calibrator/orientation.py†L179-L275】
 3. **Skalen-Seed & Schranken** – Aus den Seitengrößen werden `sx₀`/`sy₀` abgeleitet und Clamp-Fenster für die Suche gesetzt.【F:src/pdfsvg_calibrator/calibrate.py†L91-L195】
-4. **Lokale Verfeinerung** – RANSAC + Chamfer-Grid optimieren das Modell innerhalb der Seeds, bevor Matching und Reporting starten.【F:src/pdfsvg_calibrator/calibrate.py†L139-L355】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】
+4. **DT-Qualitätsprüfung** – Je nach `verify.mode` werden Distanztransformationen berechnet (`distmap`) oder Linien gematcht, um RMSE/P95 zu bestimmen.【F:src/pdfsvg_calibrator/calibrate.py†L253-L313】【F:src/pdfsvg_calibrator/cli.py†L857-L875】
+5. **Optionale Feinabstimmung & Reporting** – RANSAC + Chamfer-Grid optimieren das Modell innerhalb der Seeds; anschließend folgen Matching/Overlays oder das Distanz-Reporting.【F:src/pdfsvg_calibrator/calibrate.py†L139-L355】【F:src/pdfsvg_calibrator/fit_model.py†L186-L316】【F:src/pdfsvg_calibrator/overlays.py†L92-L205】
 
 Mehr Hintergründe finden Sie in `docs/HOW_IT_WORKS.md`.
 
@@ -51,19 +52,31 @@ Mehr Hintergründe finden Sie in `docs/HOW_IT_WORKS.md`.
 | `rot_degrees` | `[0, 180]` (ggf. 90/270 ergänzen) | Reduziert Hypothesen, solange keine Querformat-Pläne erwartet werden.【F:configs/default.yaml†L1-L1】【F:src/pdfsvg_calibrator/orientation.py†L246-L329】 |
 | `orientation.enabled` & `use_phase_correlation` | `true` | Liefert zuverlässige Seeds für Translation und Flip.【F:src/pdfsvg_calibrator/calibrate.py†L66-L124】【F:src/pdfsvg_calibrator/orientation.py†L179-L275】 |
 | `orientation.raster_size` | `512` | Größere Werte nur bei extrem feinen Plänen nötig; sonst guter Kompromiss aus Präzision/Laufzeit.【F:src/pdfsvg_calibrator/orientation.py†L179-L329】 |
+| `orientation.sample_topk_rel` | `0.2` | Nimmt die längsten ~20 % der Segmente in die Orientation-Phase auf; höhere Werte machen sie robuster bei dünnen Plänen.【F:configs/default.yaml†L6-L8】【F:src/pdfsvg_calibrator/orientation.py†L300-L316】 |
 | `refine.scale_max_dev_rel` / `trans_max_dev_px` | `0.02` / `8.0` | Enges Fenster sorgt für schnelle Konvergenz, kann bei verzogenen Exports erweitert werden.【F:src/pdfsvg_calibrator/calibrate.py†L141-L195】 |
 | `refine.max_samples` | `1500` | Begrenzung der Samplingpunkte hält Chamfer-Auswertungen flott.【F:src/pdfsvg_calibrator/calibrate.py†L157-L215】 |
 | `grid.initial_cell_rel` / `final_cell_rel` | `0.05` / `0.02` | Zweistufiges Grid: zuerst grob cachen, dann fein validieren.【F:src/pdfsvg_calibrator/calibrate.py†L216-L220】【F:src/pdfsvg_calibrator/fit_model.py†L203-L316】 |
-| `verify.tol_rel` | `0.01` | PASS/FAIL-Kriterium für ±1 % Längenfehler; bei strengeren Plänen senken.【F:configs/default.yaml†L21-L26】【F:src/pdfsvg_calibrator/match_verify.py†L680-L703】 |
+| `verify.mode` | `lines` (oder `distmap`) | Wählt zwischen Linien-Matching (Standard) und DT-basiertem QA-Report (`--opts verify.mode distmap`).【F:src/pdfsvg_calibrator/cli.py†L857-L875】【F:src/pdfsvg_calibrator/calibrate.py†L253-L313】 |
+| `verify.tol_rel` | `0.01` | PASS/FAIL-Kriterium für ±1 % Längenfehler; bei strengeren Plänen senken.【F:configs/default.yaml†L51-L52】【F:src/pdfsvg_calibrator/match_verify.py†L680-L703】 |
 
 Weitere relative Toleranzen (`curve_tol_rel`, `straight_max_dev_rel`, …) skalieren automatisch mit der PDF-Diagonale; große Pläne benötigen daher keine manuellen Anpassungen.【F:configs/default.yaml†L3-L9】【F:src/pdfsvg_calibrator/io_svg_pdf.py†L235-L308】 Die vorbereiteten `merge.*`-Parameter helfen beim Zusammenführen kollinearer Segmente, falls Ihre Pre-Processing-Kette das nutzt.【F:configs/default.yaml†L10-L18】
 
 ### Was zeigt die Konsole?
 Nach einem erfolgreichen Lauf erscheint eine Zusammenfassung mit:
-- Modellparametern (`rot`, `sx`, `sy`, `tx`, `ty`), erkannte Spiegelungen und Qualitätskennzahlen (Score, RMSE, P95, Median).
+- Modellparametern (`rot`, `flips`, `sx`, `sy`, `tx`, `ty`) sowie DT-Kennzahlen (`RMSE`, `P95`, `Median`, `Score`).【F:src/pdfsvg_calibrator/cli.py†L509-L570】
 - Einer zusätzlichen Zeile mit dem Gesamtoffset `|t|` und einem tolerierten Grenzwert sowie dem mittleren Skalierungsfaktor.
 - Einer 5-zeiligen Tabelle: ID, Achse (H/V), Längen, Verhältnis, relativer Fehler, PASS/FAIL-Flag (`Pass01`), Vertrauenswert und Hinweise (z. B. „no match“).
 - Einer Liste der erzeugten Dateien (`SVG`, `PDF`, `CSV`) sowie etwaiger Warnungen (z. B. zu wenig Segmente).
+
+### CLI-Overrides per `--opts`
+Feinheiten lassen sich ohne separate YAML testen:
+
+```bash
+pdfsvg-calibrate run plan.pdf --page 0 --opts orientation.sample_topk_rel 0.35 \
+    --opts verify.mode distmap
+```
+
+Werte werden über Punkt-Pfade gesetzt und als YAML interpretiert, sodass auch Booleans (`true/false`) oder Zahlen verstanden werden.【F:src/pdfsvg_calibrator/cli.py†L120-L148】【F:src/pdfsvg_calibrator/cli.py†L748-L779】
 
 ## Output-Dateien
 - `*_overlay_lines.svg` – Zur Kontrolle in der CAD- oder Layout-Anwendung laden; Layer `CHECK_LINES` enthält nummerierte Linien und Hinweisboxen.
@@ -89,6 +102,7 @@ Nach einem erfolgreichen Lauf erscheint eine Zusammenfassung mit:
 - **Wie streng ist die ±0,01-Grenze?** – `verify.tol_rel` steuert, wann eine Linie als PASS gilt. Standard: 1 % Unterschied zwischen erwarteter und gemessener Länge.
 - **Kann ich 90°/270° aktivieren?** – Ja, setzen Sie in Ihrer YAML `rot_degrees: [0, 90, 180, 270]`. Dadurch prüft der Algorithmus auch Hochformat-Lagen oder gedrehte Scans.
 - **Was passiert, wenn weniger als fünf Linien gefunden werden?** – Die Tabelle wird mit Platzhaltern aufgefüllt; fehlende Linien erscheinen als „no match“ und werden im CSV markiert.
+- **Warum ist \|t\| so groß?** – Liegt der Gesamtversatz über der Toleranz, deutet das häufig auf einen verschobenen SVG-Exportursprung hin; Ursprung beim Export prüfen oder `verify.mode=distmap` laufen lassen, um die DT-Metriken gegenzuchecken.【F:src/pdfsvg_calibrator/cli.py†L390-L408】【F:src/pdfsvg_calibrator/cli.py†L857-L875】
 
 ## Support & Mitmachen
 Fehler gefunden oder Erweiterungsidee? Eröffnen Sie bitte ein Issue oder einen Pull Request. Für Beiträge gelten die bestehenden Tests und Formatierungen (`pytest`, `ruff`, `black`, `mypy`).
