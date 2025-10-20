@@ -7,6 +7,23 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Dict, Mapping, MutableMapping, Sequence, Tuple
 
+try:
+    from src.coarse.geom import transform_segments
+    from src.coarse.pipeline import coarse_align
+except ModuleNotFoundError:  # pragma: no cover - fallback for src-layout installs
+    import sys
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parents[2]
+    project_root_str = str(project_root)
+    src_root_str = str(project_root / "src")
+    if src_root_str not in sys.path:
+        sys.path.insert(0, src_root_str)
+    if project_root_str not in sys.path:
+        sys.path.insert(0, project_root_str)
+    from src.coarse.geom import transform_segments
+    from src.coarse.pipeline import coarse_align
+
 from .fit_model import calibrate as _calibrate_ransac
 from .orientation import pick_flip_rot_and_shift
 from .transform import Transform2D
@@ -206,6 +223,91 @@ def calibrate(
     if "refine_trans_px" not in ransac_cfg:
         trans_window = float(refine_cfg.get("trans_max_dev_px", 8.0))
         ransac_cfg["refine_trans_px"] = max(trans_window / 3.0, 0.5)
+
+    coarse_cfg_raw = cfg_local.get("coarse")
+    if isinstance(coarse_cfg_raw, Mapping):
+        bbox_pdf = (0.0, 0.0, float(pdf_w), float(pdf_h))
+        bbox_svg = (0.0, 0.0, float(svg_w), float(svg_h))
+        coarse_pdf_segments = [
+            (float(seg.x1), float(seg.y1), float(seg.x2), float(seg.y2))
+            for seg in pdf_segments
+        ]
+        coarse_svg_segments = [
+            (float(seg.x1), float(seg.y1), float(seg.x2), float(seg.y2))
+            for seg in svg_segments
+        ]
+        coarse = None
+        try:
+            coarse = coarse_align(
+                coarse_pdf_segments, coarse_svg_segments, bbox_pdf, bbox_svg, cfg_local
+            )
+        except Exception as exc:  # pragma: no cover - robustness against optional feature
+            log.warning(
+                "[coarse] Fehler bei Grobausrichtung (%s) – fahre mit bestehenden Defaults fort",
+                exc,
+            )
+        if coarse and coarse.ok and coarse.orientation and coarse.scale and coarse.shift:
+            log.info(
+                "[coarse] rot=%d flip=%s sx=%.6f sy=%.6f shift=(%.2f,%.2f) score=%.3f",
+                coarse.orientation.rot_deg,
+                coarse.orientation.flip,
+                coarse.scale[0],
+                coarse.scale[1],
+                coarse.shift[0],
+                coarse.shift[1],
+                coarse.score,
+            )
+
+            def _pipe_pts(P):
+                from src.coarse.geom import apply_orientation_pts, apply_scale_shift_pts
+
+                Q = apply_orientation_pts(P, coarse.orientation, bbox_svg)
+                Q = apply_scale_shift_pts(
+                    Q, coarse.scale[0], coarse.scale[1], coarse.shift[0], coarse.shift[1]
+                )
+                return Q
+
+            svg_segments_np = transform_segments(coarse_svg_segments, _pipe_pts)
+            svg_segments = [
+                Segment(
+                    x1=float(values[0]),
+                    y1=float(values[1]),
+                    x2=float(values[2]),
+                    y2=float(values[3]),
+                )
+                for values in svg_segments_np
+            ]
+
+            refine_windows = coarse_cfg_raw.get("refine_windows")
+            if isinstance(refine_windows, Mapping):
+                current_scale_step = float(ransac_cfg.get("refine_scale_step", float("inf")))
+                target_scale_step = refine_windows.get("scale_rel", current_scale_step)
+                try:
+                    target_scale_step = float(target_scale_step)
+                except (TypeError, ValueError):
+                    target_scale_step = current_scale_step
+                ransac_cfg["refine_scale_step"] = min(current_scale_step, target_scale_step)
+
+                current_trans_px = float(ransac_cfg.get("refine_trans_px", float("inf")))
+                target_trans_px = refine_windows.get("shift_px", current_trans_px)
+                try:
+                    target_trans_px = float(target_trans_px)
+                except (TypeError, ValueError):
+                    target_trans_px = current_trans_px
+                ransac_cfg["refine_trans_px"] = min(current_trans_px, target_trans_px)
+
+                try:
+                    current_angle_tol = float(cfg_local.get("angle_tol_deg", 6.0))
+                except (TypeError, ValueError):
+                    current_angle_tol = 6.0
+                target_angle = refine_windows.get("angle_deg", current_angle_tol)
+                try:
+                    target_angle = float(target_angle)
+                except (TypeError, ValueError):
+                    target_angle = current_angle_tol
+                cfg_local["angle_tol_deg"] = min(current_angle_tol, target_angle)
+        else:
+            log.warning("[coarse] keine robuste Grobausrichtung – fahre mit bestehenden Defaults fort")
 
     sampling_cfg = cfg_local.setdefault("sampling", {})  # type: ignore[assignment]
     if not isinstance(sampling_cfg, dict):
