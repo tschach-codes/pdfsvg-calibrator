@@ -44,6 +44,12 @@ Die Kalibrierung läuft in klar getrennten Stufen ab:
 
 Mehr Hintergründe finden Sie in `docs/HOW_IT_WORKS.md`.
 
+### Coarse Alignment
+- Standardmäßig verarbeitet die Grobphase nur die `k` längsten Segmente (`coarse.topk_rel_by_length`), um Kosten zu begrenzen; bei 80 000 Eingangselementen landen wir so typischerweise bei `k ≈ 8 000` oder weniger, Eskalationen senken den Wert weiter.
+- Die Korrelation über FFT läuft auf 4 000 Bins in `O(n log n)` und benötigt je Achse/Hypothese etwa 5–20 ms.
+- Das KD-Gating ist durch `max_pairs` gedeckelt (Standard 3 000); mehr als 95 % der Läufe bleiben damit unter 120 ms.
+- Insgesamt benötigt die Grob-Pipeline 0,3–1,2 s, bevor die anschließende Refinement-Phase startet.
+
 ## Konfiguration & empfohlene Defaults
 `configs/default.yaml` bündelt alle Schalter. Für robuste Läufe (<10 s) haben sich folgende Werte bewährt:
 
