@@ -117,7 +117,9 @@ def _apply_model(model: Model, x: float, y: float) -> Tuple[float, float]:
         rx, ry = y, -x
     else:
         raise ValueError(f"Unsupported rotation: {model.rot_deg}")
-    return model.sx * rx + model.tx, model.sy * ry + model.ty
+    scale_x = model.flip_x * model.sx
+    scale_y = model.flip_y * model.sy
+    return scale_x * rx + model.tx, scale_y * ry + model.ty
 
 
 def _transform_segment(seg: Segment, model: Model) -> Segment:

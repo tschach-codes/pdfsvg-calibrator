@@ -260,6 +260,18 @@ def _renumber_matches(matches: Sequence[Match]) -> List[Match]:
     return [replace(match, id=index) for index, match in enumerate(matches, start=1)]
 
 
+def _model_flip_label(model: Model) -> str:
+    fx = int(model.flip_x)
+    fy = int(model.flip_y)
+    if fx < 0 and fy < 0:
+        return "XY"
+    if fx < 0:
+        return "X"
+    if fy < 0:
+        return "Y"
+    return "none"
+
+
 def _alignment_diagnostics(
     model: Model, svg_size: Tuple[float, float], config: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -276,20 +288,13 @@ def _alignment_diagnostics(
         tol_source = "auto (0.2% diag, ≥0.5px)"
 
     shift = math.hypot(model.tx, model.ty)
-    scale_avg = 0.5 * (abs(model.sx) + abs(model.sy))
-    flip_x = model.sx < 0
-    flip_y = model.sy < 0
+    scale_avg = 0.5 * (model.sx + model.sy)
+    flip_x = model.flip_x < 0
+    flip_y = model.flip_y < 0
     rot_norm = model.rot_deg % 360
-    det_negative = (model.sx * model.sy) < 0
+    det_negative = (model.flip_x * model.flip_y) < 0
 
-    if flip_x and flip_y:
-        flip_label = "XY"
-    elif flip_x:
-        flip_label = "X"
-    elif flip_y:
-        flip_label = "Y"
-    else:
-        flip_label = "none"
+    flip_label = _model_flip_label(model)
 
     bounds_parts: List[str] = []
     if scale_tol_cfg > 0.0:
@@ -408,7 +413,7 @@ def _summarize(
     alignment: Mapping[str, Any] | None,
 ) -> None:
     headers, rows = _build_summary_table(matches)
-    flip_label = "XY" if model.sx < 0 and model.sy < 0 else "X" if model.sx < 0 else "Y" if model.sy < 0 else "none"
+    flip_label = _model_flip_label(model)
     summary_lines = [
         (
             f"Model rot={model.rot_deg % 360}° | flips={flip_label} | "
