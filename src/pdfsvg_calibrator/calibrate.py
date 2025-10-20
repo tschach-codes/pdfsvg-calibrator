@@ -6,25 +6,52 @@ import logging
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
 
-try:
-    from src.coarse.geom import apply_orientation_pts, apply_scale_shift_pts, transform_segments
-    from src.coarse.pipeline import coarse_align
-except ModuleNotFoundError:  # pragma: no cover - fallback for src-layout installs
-    import sys
+_CoarseModules = tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any], Callable[..., Any]]
+_COARSE_MODULES: _CoarseModules | None = None
 
-    project_root = Path(__file__).resolve().parents[2]
-    project_root_str = str(project_root)
-    src_root_str = str(project_root / "src")
-    if src_root_str not in sys.path:
-        sys.path.insert(0, src_root_str)
-    if project_root_str not in sys.path:
-        sys.path.insert(0, project_root_str)
-    from src.coarse.geom import apply_orientation_pts, apply_scale_shift_pts, transform_segments
-    from src.coarse.pipeline import coarse_align
+
+def _ensure_coarse_modules() -> _CoarseModules:
+    """Lazily import coarse alignment helpers to keep cold-start fast."""
+
+    global _COARSE_MODULES
+    if _COARSE_MODULES is not None:
+        return _COARSE_MODULES
+
+    try:
+        from src.coarse.pipeline import coarse_align as _coarse_align
+        from src.coarse.geom import (
+            apply_orientation_pts as _apply_orientation_pts,
+            apply_scale_shift_pts as _apply_scale_shift_pts,
+            transform_segments as _transform_segments,
+        )
+    except ModuleNotFoundError:  # pragma: no cover - fallback for src-layout installs
+        import sys
+
+        project_root = Path(__file__).resolve().parents[2]
+        project_root_str = str(project_root)
+        src_root_str = str(project_root / "src")
+        if src_root_str not in sys.path:
+            sys.path.insert(0, src_root_str)
+        if project_root_str not in sys.path:
+            sys.path.insert(0, project_root_str)
+        from src.coarse.pipeline import coarse_align as _coarse_align
+        from src.coarse.geom import (
+            apply_orientation_pts as _apply_orientation_pts,
+            apply_scale_shift_pts as _apply_scale_shift_pts,
+            transform_segments as _transform_segments,
+        )
+
+    _COARSE_MODULES = (
+        _coarse_align,
+        _apply_orientation_pts,
+        _apply_scale_shift_pts,
+        _transform_segments,
+    )
+    return _COARSE_MODULES
 
 from .fit_model import calibrate as _calibrate_ransac
 from .orientation import pick_flip_rot_and_shift
@@ -37,16 +64,19 @@ log = logging.getLogger(__name__)
 
 
 def _coarse_affine_matrix(
-    orientation,
+    orientation: Any,
     scale: tuple[float, float],
     shift: tuple[float, float],
     bbox_svg: tuple[float, float, float, float],
+    *,
+    apply_orientation_pts_fn: Callable[..., np.ndarray],
+    apply_scale_shift_pts_fn: Callable[..., np.ndarray],
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """Compute 2×2 matrix (columns) and translation for coarse alignment."""
 
     pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=float)
-    oriented = apply_orientation_pts(pts, orientation, bbox_svg)
-    mapped = apply_scale_shift_pts(oriented, scale[0], scale[1], shift[0], shift[1])
+    oriented = apply_orientation_pts_fn(pts, orientation, bbox_svg)
+    mapped = apply_scale_shift_pts_fn(oriented, scale[0], scale[1], shift[0], shift[1])
     origin = mapped[0]
     e1 = mapped[1] - origin
     e2 = mapped[2] - origin
@@ -114,30 +144,38 @@ def calibrate(
         return timer(stats, key) if stats is not None else nullcontext()
 
     coarse_cfg_raw = cfg_local.get("coarse")
+    coarse_cfg = coarse_cfg_raw if isinstance(coarse_cfg_raw, Mapping) else None
+    coarse_enabled = bool(coarse_cfg.get("enabled", True)) if coarse_cfg else False
     scale_window_limit: float | None = None
     trans_window_limit: float | None = None
     angle_window_limit: float | None = None
-    if isinstance(coarse_cfg_raw, Mapping):
-        refine_windows_cfg = coarse_cfg_raw.get("refine_windows")
+    if coarse_cfg and coarse_enabled:
+        refine_windows_cfg = coarse_cfg.get("refine_windows")
         if isinstance(refine_windows_cfg, Mapping):
             try:
-                scale_window_limit = abs(float(refine_windows_cfg.get("scale_rel")))
-            except (TypeError, ValueError):
+                scale_window_limit_val = refine_windows_cfg.get("scale_rel")
+                if scale_window_limit_val is not None:
+                    scale_window_limit = abs(float(scale_window_limit_val))
+            except (TypeError, ValueError):  # pragma: no cover - defensive parsing
                 scale_window_limit = None
             try:
-                trans_window_limit = abs(float(refine_windows_cfg.get("shift_px")))
-            except (TypeError, ValueError):
+                trans_window_limit_val = refine_windows_cfg.get("shift_px")
+                if trans_window_limit_val is not None:
+                    trans_window_limit = abs(float(trans_window_limit_val))
+            except (TypeError, ValueError):  # pragma: no cover - defensive parsing
                 trans_window_limit = None
             try:
-                angle_window_limit = abs(float(refine_windows_cfg.get("angle_deg")))
-            except (TypeError, ValueError):
+                angle_window_limit_val = refine_windows_cfg.get("angle_deg")
+                if angle_window_limit_val is not None:
+                    angle_window_limit = abs(float(angle_window_limit_val))
+            except (TypeError, ValueError):  # pragma: no cover - defensive parsing
                 angle_window_limit = None
-    if angle_window_limit is not None:
-        try:
-            current_angle_tol = float(cfg_local.get("angle_tol_deg", 6.0))
-        except (TypeError, ValueError):
-            current_angle_tol = 6.0
-        cfg_local["angle_tol_deg"] = min(current_angle_tol, angle_window_limit)
+        if angle_window_limit is not None:
+            try:
+                current_angle_tol = float(cfg_local.get("angle_tol_deg", 6.0))
+            except (TypeError, ValueError):
+                current_angle_tol = 6.0
+            cfg_local["angle_tol_deg"] = min(current_angle_tol, angle_window_limit)
 
     if use_orientation:
         seed_before = stats.get("Seed", 0.0) if stats is not None else 0.0
@@ -291,7 +329,16 @@ def calibrate(
         trans_window = float(refine_cfg.get("trans_max_dev_px", 8.0))
         ransac_cfg["refine_trans_px"] = max(trans_window / 3.0, 0.5)
 
-    if isinstance(coarse_cfg_raw, Mapping):
+    if coarse_only and not coarse_enabled:
+        raise RuntimeError("Grobausrichtung deaktiviert – coarse-only ist nicht verfügbar")
+
+    if coarse_cfg and coarse_enabled:
+        (
+            coarse_align_fn,
+            apply_orientation_pts_fn,
+            apply_scale_shift_pts_fn,
+            transform_segments_fn,
+        ) = _ensure_coarse_modules()
         bbox_pdf = (0.0, 0.0, float(pdf_w), float(pdf_h))
         bbox_svg = (0.0, 0.0, float(svg_w), float(svg_h))
         coarse_pdf_segments = [
@@ -305,7 +352,7 @@ def calibrate(
         coarse = None
         debug_path = Path(coarse_debug_dir) if coarse_debug_dir is not None else None
         try:
-            coarse = coarse_align(
+            coarse = coarse_align_fn(
                 coarse_pdf_segments,
                 coarse_svg_segments,
                 bbox_pdf,
@@ -335,13 +382,13 @@ def calibrate(
             )
 
             def _pipe_pts(P):
-                Q = apply_orientation_pts(P, coarse.orientation, bbox_svg)
-                Q = apply_scale_shift_pts(
+                Q = apply_orientation_pts_fn(P, coarse.orientation, bbox_svg)
+                Q = apply_scale_shift_pts_fn(
                     Q, coarse.scale[0], coarse.scale[1], coarse.shift[0], coarse.shift[1]
                 )
                 return Q
 
-            svg_segments_np = transform_segments(coarse_svg_segments, _pipe_pts)
+            svg_segments_np = transform_segments_fn(coarse_svg_segments, _pipe_pts)
             svg_segments = [
                 Segment(
                     x1=float(values[0]),
@@ -358,12 +405,14 @@ def calibrate(
                     (float(coarse.scale[0]), float(coarse.scale[1])),
                     (float(coarse.shift[0]), float(coarse.shift[1])),
                     bbox_svg,
+                    apply_orientation_pts_fn=apply_orientation_pts_fn,
+                    apply_scale_shift_pts_fn=apply_scale_shift_pts_fn,
                 )
                 coarse_outputs["transform_matrix"] = matrix
                 coarse_outputs["translation"] = translation
                 coarse_outputs["svg_segments_coarse"] = svg_segments
 
-            refine_windows = coarse_cfg_raw.get("refine_windows")
+            refine_windows = coarse_cfg.get("refine_windows")
             if isinstance(refine_windows, Mapping):
                 current_scale_step = float(ransac_cfg.get("refine_scale_step", float("inf")))
                 target_scale_step = refine_windows.get("scale_rel", current_scale_step)
