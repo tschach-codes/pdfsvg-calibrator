@@ -25,6 +25,7 @@ from .metrics import MetricsTracker, Timer, use_tracker
 from .match_verify import match_lines, select_lines
 from .overlays import write_pdf_overlay, write_report_csv, write_svg_overlay
 from .types import Match, Model, Segment
+from .utils.timer import timer
 
 
 _RICH_AVAILABLE = importlib.util.find_spec("rich") is not None
@@ -511,21 +512,17 @@ def _summarize(
                 logger.warn(f"  - {item}")
 
 
-def _log_timing_summary(tracker: MetricsTracker) -> None:
-    total = tracker.get_time("total.run")
-    orientation = tracker.get_time("orientation.total")
-    seed = tracker.get_time("seed.select")
-    refine = tracker.get_time("refine.total")
-    verify = tracker.get_time("verify.match")
-    io_overlays = (
-        tracker.get_time("io.overlay_svg")
-        + tracker.get_time("io.overlay_pdf")
-        + tracker.get_time("io.report_csv")
-    )
+def _log_timing_summary(tracker: MetricsTracker, stats: Mapping[str, float]) -> None:
+    total = sum(stats.values())
+    orientation = stats.get("Orientation", 0.0)
+    seed = stats.get("Seed", 0.0)
+    refine = stats.get("Refine", 0.0)
+    verify = stats.get("Verify", 0.0)
+    io_overlays = stats.get("IO/Overlays", 0.0)
     summary = (
-        f"Total={total:.2f} s | Orientation={orientation:.2f} s | "
-        f"Seed={seed:.2f} s | Refine={refine:.2f} s | "
-        f"Verify={verify:.2f} s | IO/Overlays={io_overlays:.2f} s"
+        f"Total={total:.3f}s | Orientation={orientation:.2f}s | "
+        f"Seed={seed:.2f}s | Refine={refine:.2f}s | "
+        f"Verify={verify:.2f}s | IO/Overlays={io_overlays:.2f}s"
     )
     log.info("[timing] " + summary)
     chamfer_calls = int(tracker.get_count("chamfer.calls"))
@@ -664,6 +661,7 @@ def run(
     package_logger.addHandler(bridge)
 
     tracker = MetricsTracker()
+    stats: Dict[str, float] = {}
 
     try:
         with use_tracker(tracker):
@@ -741,7 +739,7 @@ def run(
 
                 logger.step("Modell kalibrieren")
                 with logger.status("Kalibrierung läuft"):
-                    model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg)
+                    model = calibrate(pdf_segs, svg_segs, pdf_size, svg_size, cfg, stats=stats)
 
                 alignment = _alignment_diagnostics(model, svg_size, cfg)
 
@@ -790,7 +788,7 @@ def run(
                 status_label = "Distanz-Map" if verify_mode == "distmap" else "Matching"
                 logger.step(step_label)
                 with logger.status(status_label):
-                    with Timer("verify.match"):
+                    with timer(stats, "Verify"):
                         if verify_mode == "distmap":
                             verify_cfg_map = verify_cfg if isinstance(verify_cfg, Mapping) else {}
                             raw_matches = _distmap_placeholder_matches(pdf_lines, verify_cfg_map)
@@ -813,8 +811,8 @@ def run(
                     )
 
                 logger.step("Overlays & Bericht schreiben")
-                with logger.status("SVG-Overlay"):
-                    with Timer("io.overlay_svg"):
+                with timer(stats, "IO/Overlays"):
+                    with logger.status("SVG-Overlay"):
                         overlay_svg = Path(
                             write_svg_overlay(
                                 str(svg_path),
@@ -826,8 +824,7 @@ def run(
                                 alignment,
                             )
                         )
-                with logger.status("PDF-Overlay"):
-                    with Timer("io.overlay_pdf"):
+                    with logger.status("PDF-Overlay"):
                         overlay_pdf = Path(
                             write_pdf_overlay(
                                 str(pdf),
@@ -838,8 +835,7 @@ def run(
                                 alignment,
                             )
                         )
-                with logger.status("CSV-Bericht"):
-                    with Timer("io.report_csv"):
+                    with logger.status("CSV-Bericht"):
                         report_csv = Path(
                             write_report_csv(
                                 str(outdir),
@@ -859,7 +855,7 @@ def run(
 
                 _summarize(logger, model, matches, outputs, line_info, extra_warnings, alignment)
 
-            _log_timing_summary(tracker)
+            _log_timing_summary(tracker, stats)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         _handle_known_exception(logger, exc, prefix="Fehler")
         raise typer.Exit(code=2) from exc
