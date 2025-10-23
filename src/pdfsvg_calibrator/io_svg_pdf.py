@@ -688,8 +688,11 @@ def _process_commands(
 
 
 def load_pdf_segments(
-    pdf_path: str, page_index: int, cfg: dict
+    pdf_path: str, page_index: int, cfg: dict, *, use_pdfium: bool = True
 ) -> Tuple[List[Segment], Tuple[float, float]]:
+    if not use_pdfium:
+        return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+
     try:
         import pypdfium2 as pdfium  # type: ignore[import-not-found]
     except ModuleNotFoundError:

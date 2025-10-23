@@ -724,6 +724,11 @@ app = typer.Typer(help="PDF→SVG calibration & verification")
 def run(
     pdf: Path = typer.Argument(..., exists=True, readable=True, resolve_path=True, help="Pfad zur PDF-Datei"),
     page: int = typer.Option(..., "--page", min=0, help="0-basierter Seitenindex"),
+    no_pdfium: bool = typer.Option(
+        False,
+        "--no-pdfium",
+        help="PDF-Parsing ohne pypdfium2 erzwingen (PyMuPDF-Fallback verwenden)",
+    ),
     config: Path = typer.Option(
         DEFAULT_CONFIG_PATH,
         "--config",
@@ -955,7 +960,9 @@ def run(
 
                 logger.step("PDF-Segmente laden")
                 with logger.status("PDF analysieren"):
-                    pdf_segs, pdf_size = load_pdf_segments(str(pdf), page, cfg)
+                    pdf_segs, pdf_size = load_pdf_segments(
+                        str(pdf), page, cfg, use_pdfium=not no_pdfium
+                    )
                 logger.debug(
                     f"PDF-Segmente: {len(pdf_segs)} (Seite {page}, Größe {pdf_size})"
                 )
