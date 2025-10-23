@@ -618,22 +618,32 @@ def calibrate(
                 )
             except (TypeError, ValueError):
                 current_trans_window = trans_window_base
-            log.info("[refine] expand windows and retry")
-            _apply_refine_window(current_scale_window * 2.0, current_trans_window * 2.0)
+            scale_cap = 0.12
+            trans_cap = 64.0
+            next_scale_window = current_scale_window
+            if current_scale_window < scale_cap:
+                next_scale_window = min(current_scale_window * 2.0, scale_cap)
+            next_trans_window = current_trans_window
+            if current_trans_window < trans_cap:
+                next_trans_window = min(current_trans_window * 2.0, trans_cap)
+            _apply_refine_window(next_scale_window, next_trans_window)
             try:
                 updated_scale_window = float(
-                    refine_cfg.get("scale_max_dev_rel", current_scale_window)
+                    refine_cfg.get("scale_max_dev_rel", next_scale_window)
                 )
             except (TypeError, ValueError):
-                updated_scale_window = current_scale_window
+                updated_scale_window = next_scale_window
             try:
                 updated_trans_window = float(
-                    refine_cfg.get("trans_max_dev_px", current_trans_window)
+                    refine_cfg.get("trans_max_dev_px", next_trans_window)
                 )
             except (TypeError, ValueError):
-                updated_trans_window = current_trans_window
-            ransac_cfg["refine_scale_step"] = max(updated_scale_window / 10.0, 1e-4)
-            ransac_cfg["refine_trans_px"] = max(updated_trans_window / 3.0, 0.5)
+                updated_trans_window = next_trans_window
+            log.info(
+                "[refine] expand windows and retry -> trans_max_dev_px=%.1f scale_max_dev_rel=%.4f",
+                updated_trans_window,
+                updated_scale_window,
+            )
             continue
         break
 
