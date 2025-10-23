@@ -731,6 +731,12 @@ def load_pdf_segments(
         for seg in raw_segments
     ]
 
+    if not segments:
+        log.warning(
+            "pypdfium2 lieferte keine Segmente, PyMuPDF-Fallback wird verwendet"
+        )
+        return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+
     log.debug(
         "[pdf] Seite %d: Größe=(%.2f×%.2f), Diagonale=%.2f, Segmente=%d in %.3fs",
         page_index,

@@ -106,8 +106,8 @@ def raster_heatmap(centers: np.ndarray, bbox, raster: int, blur_sigma_px: float)
     H = zeros2d(raster, raster, dtype=float)
     np.add.at(H, (iy, ix), 1.0)
     if blur_sigma_px and blur_sigma_px > 0:
-        fy = np.fft.rfftfreq(raster)
-        fx = np.fft.fftfreq(raster)
+        fy = np.fft.fftfreq(raster)
+        fx = np.fft.rfftfreq(raster)
         sig = blur_sigma_px / raster
         Gy = np.exp(-0.5 * (fy / (sig + 1e-9)) ** 2)[:, None]
         Gx = np.exp(-0.5 * (fx / (sig + 1e-9)) ** 2)[None, :]
