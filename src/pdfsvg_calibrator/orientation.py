@@ -379,8 +379,11 @@ def pick_flip_rot_and_shift(
 
                 overlap = 0.0
                 if raster_size > 0:
-                    shifted = np.roll(np.roll(B, int(round(du)), axis=1), int(round(dv)), axis=0)
-                    overlap = float((A & shifted).mean() / 255.0)
+                    shifted = np.roll(
+                        np.roll(B, int(round(du)), axis=1), int(round(dv)), axis=0
+                    )
+                    acc = ensure_ndarray2d("acc", A & shifted)
+                    overlap = float(acc.mean() / 255.0)
 
             response_score = float(np.mean(responses)) if responses else 0.0
 
