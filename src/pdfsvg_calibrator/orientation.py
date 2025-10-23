@@ -318,7 +318,7 @@ def pick_flip_rot_and_shift(
 
     candidates = []
     for rot in (0, 180):
-        for flip in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+        for flip in ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)):
             dx_doc = 0.0
             dy_doc = 0.0
             used_hist_x = False
@@ -392,7 +392,7 @@ def pick_flip_rot_and_shift(
                     "overlap": overlap,
                     "response": response_score,
                     "rot_deg": rot,
-                    "flip": flip,
+                    "flip": (float(flip[0]), float(flip[1])),
                     "dx_doc": float(dx_doc),
                     "dy_doc": float(dy_doc),
                     "du_dv": (float(du), float(dv)),
@@ -407,7 +407,7 @@ def pick_flip_rot_and_shift(
         reverse=True,
     )
     best = candidates[0] if candidates else {
-        "flip": (1, 1),
+        "flip": (1.0, 1.0),
         "rot_deg": 0,
         "dx_doc": 0.0,
         "dy_doc": 0.0,
@@ -416,6 +416,17 @@ def pick_flip_rot_and_shift(
         "overlap": 0.0,
         "response": 0.0,
     }
+
+    flip_raw = best.get("flip", (1.0, 1.0))
+    fx, fy = float(flip_raw[0]), float(flip_raw[1])
+    flip_norm = (1.0 if fx >= 0 else -1.0, 1.0 if fy >= 0 else -1.0)
+    assert flip_norm in {
+        (1.0, 1.0),
+        (-1.0, 1.0),
+        (1.0, -1.0),
+        (-1.0, -1.0),
+    }
+    best["flip"] = flip_norm
 
     best["min_accept_score"] = min_accept
     best["widen_window"] = best.get("overlap", 0.0) < min_accept

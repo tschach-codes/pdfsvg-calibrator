@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -194,10 +195,25 @@ def calibrate(
                 0.0,
                 stats.get("Orientation", 0.0) - (seed_after - seed_before),
             )
-        flip_xy = tuple(float(v) for v in orientation_result.get("flip", (1, 1)))  # type: ignore[assignment]
+        flip_vals = orientation_result.get("flip", (1.0, 1.0))
+        flip_xy = (float(flip_vals[0]), float(flip_vals[1]))
+        flip_xy = (1.0 if flip_xy[0] >= 0 else -1.0, 1.0 if flip_xy[1] >= 0 else -1.0)
+        if flip_xy not in {
+            (1.0, 1.0),
+            (-1.0, 1.0),
+            (1.0, -1.0),
+            (-1.0, -1.0),
+        }:
+            raise ValueError(f"Ungültiger Flip-Wert aus Orientation: {flip_xy}")
         rot_deg = int(orientation_result.get("rot_deg", 0))
         tx0 = float(orientation_result.get("t_seed", (0.0, 0.0))[0])
         ty0 = float(orientation_result.get("t_seed", (0.0, 0.0))[1])
+
+        ang = math.radians(rot_deg % 360)
+        ca, sa = math.cos(ang), math.sin(ang)
+        R = np.array([[ca, -sa], [sa, ca]], dtype=float)
+        F = np.array([[flip_xy[0], 0.0], [0.0, flip_xy[1]]], dtype=float)
+        seed_matrix = R @ F
 
         orientation_cfg["flip_xy"] = flip_xy
         orientation_cfg["rot_deg"] = rot_deg
@@ -211,11 +227,28 @@ def calibrate(
             float(orientation_result.get("dy_doc", 0.0)),
         )
         orientation_cfg["t_seed"] = (tx0, ty0)
+        orientation_cfg["seed_matrix"] = (
+            (float(seed_matrix[0, 0]), float(seed_matrix[0, 1])),
+            (float(seed_matrix[1, 0]), float(seed_matrix[1, 1])),
+        )
 
         log.info(
-            "[orient] best rot=%d flip=%s overlap=%.3f resp=%.3f",
+            "[orient] Applying orientation seed: rot=%d°, flip=(%.1f, %.1f)",
             rot_deg,
-            flip_xy,
+            flip_xy[0],
+            flip_xy[1],
+        )
+        log.info(
+            "[orient] Seed transform T0: [[%.5f, %.5f], [%.5f, %.5f]] tx=%.3f ty=%.3f",
+            float(seed_matrix[0, 0]),
+            float(seed_matrix[0, 1]),
+            float(seed_matrix[1, 0]),
+            float(seed_matrix[1, 1]),
+            tx0,
+            ty0,
+        )
+        log.info(
+            "[orient] overlap=%.3f resp=%.3f",
             orientation_cfg["overlap"],
             orientation_cfg["response"],
         )
@@ -233,6 +266,10 @@ def calibrate(
         orientation_cfg["flip_xy"] = flip_xy
         orientation_cfg["rot_deg"] = rot_deg
         orientation_cfg["translation"] = (tx0, ty0)
+        orientation_cfg["seed_matrix"] = (
+            (1.0, 0.0),
+            (0.0, 1.0),
+        )
 
     if coarse_outputs is not None:
         coarse_outputs["orientation"] = orientation_result
