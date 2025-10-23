@@ -64,6 +64,23 @@ from .verify_distmap import evaluate_rmse
 log = logging.getLogger(__name__)
 
 
+PX_TO_PT = 72.0 / 96.0
+
+
+def _px_to_pt(segments: Sequence[Segment]) -> list[Segment]:
+    """Return a new list of segments scaled from px to pt."""
+
+    return [
+        Segment(
+            s.x1 * PX_TO_PT,
+            s.y1 * PX_TO_PT,
+            s.x2 * PX_TO_PT,
+            s.y2 * PX_TO_PT,
+        )
+        for s in segments
+    ]
+
+
 def _coarse_affine_matrix(
     orientation: Any,
     scale: tuple[float, float],
@@ -109,6 +126,8 @@ def calibrate(
         raise ValueError("Keine SVG-Segmente für die Kalibrierung übergeben")
 
     cfg_local: Dict[str, object] = copy.deepcopy(dict(cfg))
+
+    svg_segments = _px_to_pt(svg_segments)
 
     orientation_cfg = cfg_local.setdefault("orientation", {})  # type: ignore[assignment]
     if not isinstance(orientation_cfg, dict):
