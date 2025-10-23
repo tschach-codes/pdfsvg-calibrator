@@ -4,7 +4,7 @@ from typing import Iterable, Sequence, Tuple
 
 import numpy as np
 
-from .core.grid_safety import zeros2d
+from .core.grid_safety import ensure_ndarray2d, zeros2d
 
 from .types import Segment
 from .transform import Transform2D
@@ -13,6 +13,7 @@ _LARGE_DISTANCE = 1e12
 
 
 def _draw_line(mask: np.ndarray, u1: int, v1: int, u2: int, v2: int) -> None:
+    mask = ensure_ndarray2d("mask", mask)
     height, width = mask.shape
     du = abs(u2 - u1)
     dv = abs(v2 - v1)
@@ -57,6 +58,7 @@ def _edt_1d(f: np.ndarray) -> np.ndarray:
 
 
 def _distance_transform(mask: np.ndarray) -> np.ndarray:
+    mask = ensure_ndarray2d("mask", mask)
     height, width = mask.shape
     features = mask > 0
     if not np.any(features):
