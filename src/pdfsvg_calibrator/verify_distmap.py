@@ -4,6 +4,8 @@ from typing import Iterable, Sequence, Tuple
 
 import numpy as np
 
+from .core.grid_safety import zeros2d
+
 from .types import Segment
 from .transform import Transform2D
 
@@ -81,7 +83,7 @@ def svg_mask_from_segments(
     W: int = 768,
     H: int = 768,
 ) -> np.ndarray:
-    mask = np.zeros((H, W), dtype=np.uint8)
+    mask = zeros2d(H, W, dtype=np.uint8)
     if page_w <= 0 or page_h <= 0:
         return mask
     sx, sy = W / page_w, H / page_h
