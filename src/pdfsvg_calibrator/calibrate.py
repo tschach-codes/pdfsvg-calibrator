@@ -441,8 +441,10 @@ def calibrate(
             for seg in svg_segments
         ]
         coarse = None
+        coarse_attempted = False
         debug_path = Path(coarse_debug_dir) if coarse_debug_dir is not None else None
-        try:
+        if coarse_pdf_segments and coarse_svg_segments:
+            coarse_attempted = True
             coarse = coarse_align_fn(
                 coarse_pdf_segments,
                 coarse_svg_segments,
@@ -451,10 +453,11 @@ def calibrate(
                 cfg_local,
                 debug_dir=debug_path,
             )
-        except Exception as exc:  # pragma: no cover - robustness against optional feature
+        else:
             log.warning(
-                "[coarse] Fehler bei Grobausrichtung (%s) – fahre mit bestehenden Defaults fort",
-                exc,
+                "[coarse] Grobausrichtung übersprungen – keine Segmente (pdf=%d, svg=%d)",
+                len(coarse_pdf_segments),
+                len(coarse_svg_segments),
             )
         if coarse_outputs is not None:
             coarse_outputs["bbox_pdf"] = bbox_pdf
@@ -531,7 +534,7 @@ def calibrate(
                 except (TypeError, ValueError):
                     target_angle = current_angle_tol
                 cfg_local["angle_tol_deg"] = min(current_angle_tol, target_angle)
-        else:
+        elif coarse_attempted:
             log.warning("[coarse] keine robuste Grobausrichtung – fahre mit bestehenden Defaults fort")
 
         if coarse_only:
