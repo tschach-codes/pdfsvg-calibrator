@@ -7,6 +7,8 @@ from typing import MutableSequence
 import numpy as np
 from dataclasses import dataclass
 
+from pdfsvg_calibrator.core.grid_safety import ensure_ndarray2d, safe_index
+
 from .profiles import segment_features, make_projections, quantile_scale, raster_heatmap
 from .corr import xcorr_1d, Orientation, adjust_profile_for_orientation
 from .geom import apply_orientation_pts, apply_scale_shift_pts, transform_segments
@@ -132,11 +134,24 @@ def coarse_align(
         # Phase-Korrelation über 2D-Heatmaps (vereinfachter Ansatz)
         feats_pdf = segment_features(pdf_segments, cfg['coarse']['hv_angle_tol_deg'])
         feats_svg = segment_features(svg_segments, cfg['coarse']['hv_angle_tol_deg'])
-        Hp = raster_heatmap(feats_pdf.centers, bbox_pdf, cfg['coarse']['heatmap']['raster'], cfg['coarse']['heatmap']['blur_sigma_px'])
-        Hs = raster_heatmap(feats_svg.centers, bbox_svg, cfg['coarse']['heatmap']['raster'], cfg['coarse']['heatmap']['blur_sigma_px'])
+        Hp = raster_heatmap(
+            feats_pdf.centers,
+            bbox_pdf,
+            cfg['coarse']['heatmap']['raster'],
+            cfg['coarse']['heatmap']['blur_sigma_px'],
+        )
+        Hs = raster_heatmap(
+            feats_svg.centers,
+            bbox_svg,
+            cfg['coarse']['heatmap']['raster'],
+            cfg['coarse']['heatmap']['blur_sigma_px'],
+        )
+        Hp = ensure_ndarray2d("heatmap_pdf", Hp)
+        Hs = ensure_ndarray2d("heatmap_svg", Hs)
         # einfache max-Korrelation via FFT (keine Subpixel)
         C = np.fft.ifft2(np.fft.fft2(Hp)*np.conj(np.fft.fft2(Hs))).real
-        iy, ix = np.unravel_index(np.argmax(C), C.shape)
+        iy_raw, ix_raw = np.unravel_index(np.argmax(C), C.shape)
+        iy, ix = safe_index(iy_raw, ix_raw)
         dy = iy if iy < C.shape[0]//2 else iy - C.shape[0]
         dx = ix if ix < C.shape[1]//2 else ix - C.shape[1]
         best = CoarseResult(True, Orientation(0,'none'), (1.0,1.0), (dx,dy), float(C.max()))

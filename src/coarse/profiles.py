@@ -1,6 +1,9 @@
 from __future__ import annotations
+
 import numpy as np
 from dataclasses import dataclass
+
+from pdfsvg_calibrator.core.grid_safety import ensure_ndarray2d, zeros2d
 
 
 @dataclass
@@ -20,7 +23,9 @@ class Features:
 
 def segment_features(segments, hv_angle_tol_deg: float) -> Features:
     # segments: Iterable of (x1,y1,x2,y2)
-    segs = np.asarray(segments, dtype=float)
+    segs = ensure_ndarray2d("segments", segments).astype(float, copy=False)
+    if segs.shape[1] != 4:
+        raise ValueError(f"segments must have shape (N,4), got {segs.shape}")
     v = segs[:, 2:4] - segs[:, 0:2]
     lengths = np.linalg.norm(v, axis=1) + 1e-9
     angles = np.arctan2(v[:, 1], v[:, 0])  # rad
@@ -44,11 +49,12 @@ def make_projections(
     bbox_svg,
 ):
     # bbox = (xmin,ymin,xmax,ymax)
+    bins = int(bins)
     def _proj(feats: Features, bbox, axis: int, is_h: bool):
         # axis: 0->x, 1->y; is_h True => horizontale summieren entlang x, sonst vertikale entlang y
         mask = feats.hv_mask[:, 0] if is_h else feats.hv_mask[:, 1]
         if not np.any(mask):
-            return np.zeros(bins)
+            return np.zeros(int(bins))
         pts = feats.centers[mask, axis]
         lengths = feats.lengths[mask]
         lo, hi = bbox[axis], bbox[2 + axis]
@@ -89,12 +95,15 @@ def quantile_scale(feats_pdf: Features, feats_svg: Features, q_lo: float, q_hi: 
 
 def raster_heatmap(centers: np.ndarray, bbox, raster: int, blur_sigma_px: float):
     # returns heatmap normalized to [0,1]
+    centers = ensure_ndarray2d("centers", centers).astype(float, copy=False)
+    if centers.shape[1] != 2:
+        raise ValueError(f"centers must have shape (N,2), got {centers.shape}")
     xmin, ymin, xmax, ymax = bbox
     xs = np.clip((centers[:, 0] - xmin) / (xmax - xmin + 1e-6), 0, 1 - 1e-9)
     ys = np.clip((centers[:, 1] - ymin) / (ymax - ymin + 1e-6), 0, 1 - 1e-9)
     ix = (xs * raster).astype(int)
     iy = (ys * raster).astype(int)
-    H = np.zeros((raster, raster), dtype=float)
+    H = zeros2d(raster, raster, dtype=float)
     np.add.at(H, (iy, ix), 1.0)
     if blur_sigma_px and blur_sigma_px > 0:
         fy = np.fft.rfftfreq(raster)

@@ -1,7 +1,14 @@
 import numpy as np
 from scipy.spatial import cKDTree
 
+from pdfsvg_calibrator.core.grid_safety import ensure_ndarray2d
+
 def gate_matches(pdf_segs, svg_segs, angle_tol_deg, len_tol_rel, dist_tol_px, max_pairs=3000):
+    pdf_segs = ensure_ndarray2d("pdf_segs", pdf_segs).astype(float, copy=False)
+    svg_segs = ensure_ndarray2d("svg_segs", svg_segs).astype(float, copy=False)
+    if pdf_segs.shape[1] != 4 or svg_segs.shape[1] != 4:
+        raise ValueError("segments must have shape (N,4)")
+
     def _feat(segs):
         v = segs[:, 2:4] - segs[:, 0:2]
         center = 0.5 * (segs[:, 0:2] + segs[:, 2:4])
