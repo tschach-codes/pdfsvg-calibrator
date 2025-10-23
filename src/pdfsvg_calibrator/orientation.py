@@ -9,6 +9,8 @@ from typing import Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
 
+from .core.grid_safety import zeros2d
+
 from .types import Segment
 from .utils.timer import timer
 
@@ -124,7 +126,7 @@ def rasterize_segments(
 ) -> np.ndarray:
     """Draw thin lines into a binary mask using Bresenham."""
 
-    mask = np.zeros((H, W), dtype=np.uint8)
+    mask = zeros2d(H, W, dtype=np.uint8)
     if not segments:
         return mask
 
