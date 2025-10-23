@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import math
 from typing import Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -24,6 +25,9 @@ except Exception:  # pragma: no cover - fallback
 
 
 SegmentInfo = Tuple[Tuple[float, float], Tuple[float, float], float, float]
+
+
+logger = logging.getLogger(__name__)
 
 
 def snap_axis(theta_deg: float, tol_deg: float = 0.5) -> int:
@@ -316,7 +320,7 @@ def pick_flip_rot_and_shift(
     pdf_hist_x = x_histogram_of_verticals(pdf_top, hist_bin_px, page_pdf.w, axis_tol)
     pdf_hist_y = y_histogram_of_horizontals(pdf_top, hist_bin_px, page_pdf.h, axis_tol)
 
-    candidates = []
+    hypotheses: dict[Tuple[int, Tuple[float, float]], dict] = {}
     for rot in (0, 180):
         for flip in ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)):
             dx_doc = 0.0
@@ -387,8 +391,9 @@ def pick_flip_rot_and_shift(
                 abs(dy_doc) / (page_pdf.h or 1.0)
             )
 
-            candidates.append(
-                {
+            key = (rot, (float(flip[0]), float(flip[1])))
+            try:
+                hypotheses[key] = {
                     "overlap": overlap,
                     "response": response_score,
                     "rot_deg": rot,
@@ -400,13 +405,38 @@ def pick_flip_rot_and_shift(
                     "phase_response": phase_resp,
                     "norm_shift": float(norm_shift),
                 }
-            )
+            except TypeError as exc:  # pragma: no cover - defensive guard
+                logger.error(
+                    "Orientation hypothesis container 'hypotheses' misused with key %s", key,
+                    exc_info=exc,
+                )
+                raise TypeError(
+                    "Orientation hypotheses must be stored in a mapping keyed by (rot, flip)."
+                ) from exc
 
-    candidates.sort(
-        key=lambda item: (item["overlap"] - 0.25 * item.get("norm_shift", 0.0), item["response"]),
-        reverse=True,
-    )
-    best = candidates[0] if candidates else {
+    if hypotheses:
+        try:
+            ordered_hypotheses = sorted(
+                hypotheses.items(),
+                key=lambda item: (
+                    item[1]["overlap"] - 0.25 * item[1].get("norm_shift", 0.0),
+                    item[1]["response"],
+                ),
+                reverse=True,
+            )
+        except TypeError as exc:
+            logger.error(
+                "Orientation hypothesis container 'hypotheses' produced a tuple index error.",
+                exc_info=exc,
+            )
+            raise TypeError(
+                "Orientation hypotheses sorting failed because the container is not a mapping keyed by (rot, flip)."
+            ) from exc
+        (rot_key, flip_key), best = ordered_hypotheses[0]
+    else:
+        rot_key = 0
+        flip_key = (1.0, 1.0)
+        best = {
         "flip": (1.0, 1.0),
         "rot_deg": 0,
         "dx_doc": 0.0,
@@ -417,7 +447,11 @@ def pick_flip_rot_and_shift(
         "response": 0.0,
     }
 
-    flip_raw = best.get("flip", (1.0, 1.0))
+    rot_best = best.get("rot_deg", rot_key)
+    assert isinstance(rot_best, (int, float))
+
+    flip_raw = best.get("flip", flip_key)
+    assert isinstance(flip_raw, tuple) and len(flip_raw) == 2
     fx, fy = float(flip_raw[0]), float(flip_raw[1])
     flip_norm = (1.0 if fx >= 0 else -1.0, 1.0 if fy >= 0 else -1.0)
     assert flip_norm in {
@@ -427,9 +461,18 @@ def pick_flip_rot_and_shift(
         (-1.0, -1.0),
     }
     best["flip"] = flip_norm
+    best["rot_best"] = rot_best
+    best["flip_best"] = flip_norm
 
     best["min_accept_score"] = min_accept
     best["widen_window"] = best.get("overlap", 0.0) < min_accept
     best.setdefault("phase_response", 0.0)
+    logger.info(
+        "Orientation coarse OK: rot=%s, flip=(%.1f, %.1f), resp=%.6f",
+        rot_best,
+        flip_norm[0],
+        flip_norm[1],
+        best.get("response", 0.0),
+    )
     return best
 
