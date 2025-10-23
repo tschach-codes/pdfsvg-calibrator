@@ -10,11 +10,14 @@ from typing import List, Sequence, Tuple
 import fitz
 
 from .geom import fit_straight_segment
+from .pdfium_extract import extract_segments as pdfium_extract_segments
 from .svg_path import parse_svg_segments
 from .types import Segment
 
 
 log = logging.getLogger(__name__)
+
+PT_PER_PX = 72.0 / 96.0
 
 
 def _angle_spread_deg(points: Sequence[Tuple[float, float]]) -> float:
@@ -240,6 +243,60 @@ def _process_commands(
 def load_pdf_segments(
     pdf_path: str, page_index: int, cfg: dict
 ) -> Tuple[List[Segment], Tuple[float, float]]:
+    try:
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        log.warning("pypdfium2 nicht gefunden, PyMuPDF-Fallback wird verwendet")
+        return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        if page_index < 0 or page_index >= len(doc):
+            raise ValueError(
+                f"Seite {page_index} existiert nicht (gültig: 0..{len(doc) - 1})."
+            )
+        page = doc[page_index]
+        try:
+            width, height = page.get_size()
+        finally:
+            close_page = getattr(page, "close", None)
+            if callable(close_page):
+                close_page()
+    finally:
+        doc.close()
+
+    width = float(width)
+    height = float(height)
+    diag = math.hypot(width, height) or 1.0
+
+    curve_tol_rel = cfg.get("curve_tol_rel", 0.001)
+    curve_tol = max(float(curve_tol_rel) * diag, 1e-6)
+
+    parse_start = perf_counter()
+    raw_segments = pdfium_extract_segments(pdf_path, page_index, curve_tol)
+    duration = perf_counter() - parse_start
+
+    segments = [
+        Segment(float(seg["x1"]), float(seg["y1"]), float(seg["x2"]), float(seg["y2"]))
+        for seg in raw_segments
+    ]
+
+    log.debug(
+        "[pdf] Seite %d: Größe=(%.2f×%.2f), Diagonale=%.2f, Segmente=%d in %.3fs",
+        page_index,
+        width,
+        height,
+        diag,
+        len(segments),
+        duration,
+    )
+
+    return segments, (width, height)
+
+
+def _load_pdf_segments_pymupdf(
+    pdf_path: str, page_index: int, cfg: dict
+) -> Tuple[List[Segment], Tuple[float, float]]:
     doc = fitz.open(pdf_path)
     try:
         page = doc.load_page(page_index)
@@ -274,7 +331,9 @@ def load_pdf_segments(
             if path:
                 total_subpaths += len(path)
                 for subpath in path:
-                    _process_commands(subpath, segments, curve_tol, max_dev, angle_spread_max)
+                    _process_commands(
+                        subpath, segments, curve_tol, max_dev, angle_spread_max
+                    )
             items = drawing.get("items")
             if items:
                 total_items += len(items)
@@ -433,16 +492,27 @@ def _parse_viewbox(root) -> Tuple[float, float]:
 
 def load_svg_segments(svg_path: str, cfg: dict):
     segs = parse_svg_segments(svg_path, cfg)
+    segs = [
+        Segment(
+            float(seg.x1) * PT_PER_PX,
+            float(seg.y1) * PT_PER_PX,
+            float(seg.x2) * PT_PER_PX,
+            float(seg.y2) * PT_PER_PX,
+        )
+        for seg in segs
+    ]
     try:
         tree = ET.parse(svg_path)
     except ET.ParseError:
         return segs, (0.0, 0.0)
     root = tree.getroot()
-    width = _parse_length(root.get("width"))
-    height = _parse_length(root.get("height"))
-    vb_w, vb_h = _parse_viewbox(root)
-    if width == 0.0 and vb_w:
-        width = vb_w
-    if height == 0.0 and vb_h:
-        height = vb_h
+    width_px = _parse_length(root.get("width"))
+    height_px = _parse_length(root.get("height"))
+    vb_w_px, vb_h_px = _parse_viewbox(root)
+    if width_px == 0.0 and vb_w_px:
+        width_px = vb_w_px
+    if height_px == 0.0 and vb_h_px:
+        height_px = vb_h_px
+    width = float(width_px) * PT_PER_PX if width_px else 0.0
+    height = float(height_px) * PT_PER_PX if height_px else 0.0
     return segs, (width, height)

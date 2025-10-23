@@ -1,45 +1,98 @@
 import math
 import sys
-from pathlib import Path
+import types
+from typing import Iterable, List
 
 import pytest
-
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from pdfsvg_calibrator import io_svg_pdf
 from pdfsvg_calibrator.geom import classify_hv, fit_straight_segment
 from pdfsvg_calibrator.io_svg_pdf import load_pdf_segments, load_svg_segments
+from pdfsvg_calibrator.pdfium_extract import extract_segments
 from pdfsvg_calibrator.types import Segment
 
 
-class DummyRect:
-    def __init__(self, width: float, height: float) -> None:
-        self.width = width
-        self.height = height
+class FakePathSegment:
+    def __init__(
+        self,
+        seg_type: str,
+        pos: Iterable[float] | None = None,
+        ctrl1: Iterable[float] | None = None,
+        ctrl2: Iterable[float] | None = None,
+    ) -> None:
+        self.type = seg_type
+        self.pos = tuple(pos) if pos is not None else None
+        self.ctrl1 = tuple(ctrl1) if ctrl1 is not None else None
+        self.ctrl2 = tuple(ctrl2) if ctrl2 is not None else None
 
 
-class DummyPage:
-    def __init__(self, drawings, width: float, height: float) -> None:
-        self._drawings = drawings
-        self.rect = DummyRect(width, height)
+class FakePathObject:
+    type = "path"
 
-    def get_drawings(self):
-        return self._drawings
+    def __init__(self, segments: List[FakePathSegment], matrix=None) -> None:
+        self._segments = segments
+        self._matrix = matrix or (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+    def get_path(self):
+        return self._segments
+
+    def get_matrix(self):
+        return self._matrix
 
 
-class DummyDoc:
-    def __init__(self, page: DummyPage) -> None:
-        self._page = page
+class FakeFormObject:
+    type = "form"
+
+    def __init__(self, objects: List, matrix=None) -> None:
+        self._objects = list(objects)
+        self._matrix = matrix or (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+    def get_form(self):
+        return self
+
+    def get_matrix(self):
+        return self._matrix
+
+    def get_objects_count(self):
+        return len(self._objects)
+
+    def get_object(self, idx: int):
+        return self._objects[idx]
+
+    @property
+    def objects(self):
+        return list(self._objects)
+
+
+class FakePage:
+    def __init__(self, objects: List, size: tuple[float, float]) -> None:
+        self._objects = list(objects)
+        self._size = size
         self.closed = False
 
-    def load_page(self, index: int) -> DummyPage:
-        assert index == 0
-        return self._page
+    def get_objects_count(self):
+        return len(self._objects)
 
-    def close(self) -> None:
+    def get_object(self, idx: int):
+        return self._objects[idx]
+
+    def get_size(self):
+        return self._size
+
+    def close(self):
+        self.closed = True
+
+
+class FakeDoc:
+    def __init__(self, pages: List[FakePage]) -> None:
+        self._pages = list(pages)
+        self.closed = False
+
+    def __len__(self):
+        return len(self._pages)
+
+    def __getitem__(self, idx: int):
+        return self._pages[idx]
+
+    def close(self):
         self.closed = True
 
 
@@ -50,6 +103,33 @@ def straight_cfg():
         "straight_max_dev_rel": 0.002,
         "straight_max_angle_spread_deg": 4.0,
     }
+
+
+@pytest.fixture
+def pdfium_stub(monkeypatch):
+    state: dict[str, List] = {"docs": [], "pages": []}
+
+    def install(objects: List, size: tuple[float, float] = (100.0, 200.0)):
+        def factory():
+            page = FakePage(objects, size)
+            doc = FakeDoc([page])
+            state["pages"].append(page)
+            state["docs"].append(doc)
+            return doc
+
+        module = types.SimpleNamespace(PdfDocument=lambda *args, **kwargs: factory())
+        monkeypatch.setitem(sys.modules, "pypdfium2", module)
+        return state
+
+    return install
+
+
+def _assert_segments_plain(segments: List[Segment]) -> None:
+    for seg in segments:
+        assert isinstance(seg, Segment)
+        for value in (seg.x1, seg.y1, seg.x2, seg.y2):
+            assert not hasattr(value, "__array__")
+            assert not isinstance(value, (list, tuple))
 
 
 def test_fit_straight_segment_perfect_line():
@@ -112,7 +192,8 @@ def test_load_svg_segments_viewbox_only(tmp_path):
     )
     segments, size = load_svg_segments(str(svg), {})
     assert len(segments) == 1
-    assert size == (200.0, 100.0)
+    assert size == (150.0, 75.0)
+    _assert_segments_plain(segments)
 
 
 def test_load_svg_segments_width_height_units(tmp_path):
@@ -126,8 +207,9 @@ def test_load_svg_segments_width_height_units(tmp_path):
     )
     segments, size = load_svg_segments(str(svg), {})
     assert len(segments) == 1
-    assert size[0] == pytest.approx(75.590551, rel=1e-6)
-    assert size[1] == pytest.approx(37.795275, rel=1e-6)
+    assert size[0] == pytest.approx(56.692913, rel=1e-6)
+    assert size[1] == pytest.approx(28.346457, rel=1e-6)
+    _assert_segments_plain(segments)
 
 
 def test_load_svg_segments_viewbox_fallback(tmp_path):
@@ -141,79 +223,97 @@ def test_load_svg_segments_viewbox_fallback(tmp_path):
     )
     segments, size = load_svg_segments(str(svg), {})
     assert len(segments) == 1
-    assert size == (50.0, 25.0)
+    assert size == (37.5, 18.75)
+    _assert_segments_plain(segments)
 
 
-def _patch_fitz(monkeypatch, doc):
-    monkeypatch.setattr(io_svg_pdf.fitz, "open", lambda *args, **kwargs: doc)
-
-
-def test_load_pdf_segments_straight_path(monkeypatch, straight_cfg):
-    drawings = [
-        {
-            "path": [
-                [("m", 0.0, 0.0), ("l", 50.0, 0.05), ("l", 100.0, -0.02)],
+def test_extract_segments_simple_line(pdfium_stub):
+    pdfium_stub([
+        FakePathObject(
+            [
+                FakePathSegment("move", (0.0, 0.0)),
+                FakePathSegment("line", (100.0, 0.0)),
             ]
-        }
-    ]
-    page = DummyPage(drawings, width=100.0, height=200.0)
-    doc = DummyDoc(page)
-    _patch_fitz(monkeypatch, doc)
+        )
+    ])
+    segments = extract_segments("dummy.pdf", 0, curve_tol_pt=0.01)
+    assert segments == [{"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 0.0}]
+
+
+def test_extract_segments_bezier(pdfium_stub):
+    pdfium_stub([
+        FakePathObject(
+            [
+                FakePathSegment("move", (0.0, 0.0)),
+                FakePathSegment(
+                    "bezier",
+                    (100.0, 0.0),
+                    ctrl1=(33.0, 0.0),
+                    ctrl2=(66.0, 0.0),
+                ),
+            ]
+        )
+    ])
+    segments = extract_segments("dummy.pdf", 0, curve_tol_pt=0.01)
+    assert len(segments) >= 1
+    assert segments[0]["x1"] == pytest.approx(0.0)
+    assert segments[-1]["x2"] == pytest.approx(100.0)
+
+
+def test_extract_segments_form_matrix(pdfium_stub):
+    child = FakePathObject(
+        [
+            FakePathSegment("move", (0.0, 0.0)),
+            FakePathSegment("line", (0.0, 10.0)),
+        ]
+    )
+    form = FakeFormObject([child], matrix=(1.0, 0.0, 5.0, 0.0, 1.0, 7.0))
+    pdfium_stub([form])
+    segments = extract_segments("dummy.pdf", 0, curve_tol_pt=0.01)
+    assert segments == [{"x1": 5.0, "y1": 7.0, "x2": 5.0, "y2": 17.0}]
+
+
+def test_load_pdf_segments_uses_pdfium(pdfium_stub, straight_cfg):
+    state = pdfium_stub(
+        [
+            FakePathObject(
+                [
+                    FakePathSegment("move", (0.0, 0.0)),
+                    FakePathSegment("line", (0.0, 10.0)),
+                ]
+            )
+        ],
+        size=(200.0, 100.0),
+    )
     segments, size = load_pdf_segments("dummy.pdf", 0, straight_cfg)
-    assert doc.closed is True
-    assert size == (100.0, 200.0)
+    assert size == (200.0, 100.0)
     assert len(segments) == 1
-    seg = segments[0]
-    xs = sorted([seg.x1, seg.x2])
-    ys = [seg.y1, seg.y2]
-    assert xs[0] == pytest.approx(0.0, abs=1e-5)
-    assert xs[1] == pytest.approx(100.0, abs=1e-5)
-    for val in ys:
-        assert val == pytest.approx(0.0, abs=3e-2)
+    _assert_segments_plain(segments)
+    assert all(doc.closed for doc in state["docs"])
+    assert all(page.closed for page in state["pages"])
 
 
-def test_load_pdf_segments_curved_rejected(monkeypatch, straight_cfg):
-    drawings = [
-        {
-            "path": [
-                [("m", 0.0, 0.0), ("l", 50.0, 0.0), ("l", 50.0, 50.0)],
-            ]
-        }
-    ]
-    page = DummyPage(drawings, width=100.0, height=200.0)
-    doc = DummyDoc(page)
-    _patch_fitz(monkeypatch, doc)
-    segments, _ = load_pdf_segments("dummy.pdf", 0, straight_cfg)
-    assert len(segments) == 0
+def test_public_api_no_tuple_outputs(pdfium_stub, tmp_path, straight_cfg):
+    pdfium_stub(
+        [
+            FakePathObject(
+                [
+                    FakePathSegment("move", (0.0, 0.0)),
+                    FakePathSegment("line", (10.0, 0.0)),
+                ]
+            )
+        ]
+    )
+    pdf_segments, _ = load_pdf_segments("dummy.pdf", 0, straight_cfg)
+    _assert_segments_plain(pdf_segments)
 
-
-def test_load_pdf_segments_curve_items(monkeypatch, straight_cfg):
-    drawings = [
-        {
-            "items": [
-                ("m", (0.0, 0.0)),
-                ("c", (33.0, 0.01), (66.0, -0.02), (100.0, 0.0)),
-            ]
-        }
-    ]
-    page = DummyPage(drawings, width=100.0, height=200.0)
-    doc = DummyDoc(page)
-    _patch_fitz(monkeypatch, doc)
-    segments, _ = load_pdf_segments("dummy.pdf", 0, straight_cfg)
-    assert len(segments) == 1
-    seg = segments[0]
-    assert seg.x1 == pytest.approx(0.0, abs=1e-6)
-    assert seg.x2 == pytest.approx(100.0, abs=1e-6)
-
-
-def test_load_pdf_segments_rectangle(monkeypatch, straight_cfg):
-    drawings = [
-        {"path": [[("re", 10.0, 20.0, 30.0, 40.0)]]}
-    ]
-    page = DummyPage(drawings, width=100.0, height=200.0)
-    doc = DummyDoc(page)
-    _patch_fitz(monkeypatch, doc)
-    segments, _ = load_pdf_segments("dummy.pdf", 0, straight_cfg)
-    assert len(segments) == 4
-    lengths = [math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1) for seg in segments]
-    assert all(length > 0 for length in lengths)
+    svg = tmp_path / "segments.svg"
+    svg.write_text(
+        """
+        <svg width=\"10\" height=\"10\">
+            <line x1=\"0\" y1=\"0\" x2=\"10\" y2=\"0\" />
+        </svg>
+        """
+    )
+    svg_segments, _ = load_svg_segments(str(svg), {})
+    _assert_segments_plain(svg_segments)
