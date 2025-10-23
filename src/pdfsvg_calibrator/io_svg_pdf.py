@@ -989,6 +989,35 @@ def _viewbox_matrix(node: ET.Element) -> Matrix:
     return matrix
 
 
+def _pdf_segments_pymupdf(pdf_path: str, page_index: int) -> List[dict]:
+    cfg = {
+        "curve_tol_rel": 0.001,
+        "straight_max_dev_rel": 0.002,
+        "straight_max_angle_spread_deg": 4.0,
+    }
+    segments, _ = _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+    return [
+        {
+            "x1": float(seg.x1),
+            "y1": float(seg.y1),
+            "x2": float(seg.x2),
+            "y2": float(seg.y2),
+        }
+        for seg in segments
+    ]
+
+
+def pdf_to_segments(pdf_path: str, page: int, use_pdfium: bool = True) -> List[dict]:
+    if use_pdfium:
+        segs = pdfium_extract_segments(
+            pdf_path, page_index=page, curve_tol_pt=0.1
+        )
+        return sanitize_segments(segs)
+
+    segs = _pdf_segments_pymupdf(pdf_path, page)
+    return sanitize_segments(segs)
+
+
 def sanitize_segments(segments) -> List[dict]:
     out: List[dict] = []
     for s in segments:
