@@ -4,7 +4,7 @@ from typing import Iterable, Sequence, Tuple
 
 import numpy as np
 
-from .core.grid_safety import ensure_ndarray2d, zeros2d
+from .core.grid_safety import ensure_ndarray2d, safe_index, zeros2d
 
 from .types import Segment
 from .transform import Transform2D
@@ -19,15 +19,17 @@ def _draw_line(mask: np.ndarray, u1: int, v1: int, u2: int, v2: int) -> None:
     dv = abs(v2 - v1)
     steps = int(max(du, dv))
     if steps == 0:
-        if 0 <= v1 < height and 0 <= u1 < width:
-            mask[v1, u1] = 255
+        v_idx, u_idx = safe_index(v1, u1)
+        if 0 <= v_idx < height and 0 <= u_idx < width:
+            mask[v_idx, u_idx] = 255
         return
     for step in range(steps + 1):
         t = step / steps
         u = int(round(u1 + (u2 - u1) * t))
         v = int(round(v1 + (v2 - v1) * t))
-        if 0 <= v < height and 0 <= u < width:
-            mask[v, u] = 255
+        v_idx, u_idx = safe_index(v, u)
+        if 0 <= v_idx < height and 0 <= u_idx < width:
+            mask[v_idx, u_idx] = 255
 
 
 def _edt_1d(f: np.ndarray) -> np.ndarray:
