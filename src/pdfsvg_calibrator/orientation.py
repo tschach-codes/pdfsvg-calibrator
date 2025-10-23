@@ -9,7 +9,7 @@ from typing import Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
 
-from .core.grid_safety import zeros2d
+from .core.grid_safety import ensure_ndarray2d, zeros2d
 
 from .types import Segment
 from .utils.timer import timer
@@ -212,13 +212,15 @@ def argmax_xcorr(a: np.ndarray, b: np.ndarray) -> Tuple[int, float]:
 
 def phase_correlation(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float]:
     """Wrapper around :func:`skimage.registration.phase_cross_correlation`."""
+
+    a = ensure_ndarray2d("a", a).astype(float, copy=False)
+    b = ensure_ndarray2d("b", b).astype(float, copy=False)
+
     if _skimage_pcc is not None:
         shift, response, _ = _skimage_pcc(a, b, upsample_factor=1)
         dv, du = float(shift[0]), float(shift[1])
         return float(-du), float(-dv), float(response)
 
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
     axes = tuple(range(a.ndim))
     Fa = np.fft.rfftn(a, axes=axes)
     Fb = np.fft.rfftn(b, axes=axes)
