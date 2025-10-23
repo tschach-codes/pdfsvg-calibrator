@@ -299,15 +299,48 @@ def calibrate(
     if trans_window_limit is not None:
         trans_window_base = min(trans_window_base, trans_window_limit)
     trans_window_initial = trans_window_base
+    scale_window_current = scale_window_base_val
+    trans_window_current = trans_window_initial
+    scale_window_cap = 0.12
+    trans_window_cap = 64.0
     if use_orientation and orientation_result is not None:
         overlap = float(orientation_result.get("overlap", 0.0))
+        flip_seed = orientation_result.get("flip")
+        rot_seed = orientation_result.get("rot_deg")
+        has_orientation_seed = isinstance(flip_seed, tuple) and len(flip_seed) == 2
+        has_orientation_seed = has_orientation_seed and all(
+            isinstance(val, (int, float)) for val in flip_seed
+        )
+        has_orientation_seed = bool(has_orientation_seed) and isinstance(
+            rot_seed, (int, float)
+        )
         if overlap < min_accept_score:
+            if has_orientation_seed:
+                trans_target = max(trans_window_current, 16.0)
+                scale_target = max(scale_window_current, 0.04)
+            else:
+                trans_target = max(trans_window_current, 24.0)
+                scale_target = max(scale_window_current, 0.06)
+            trans_window_current = min(trans_target, trans_window_cap)
+            scale_window_current = min(scale_target, scale_window_cap)
             log.info(
-                "[orient] overlap %.3f below %.3f – keeping minimal refine window ±%.1fpx",
+                "[orient] Low overlap=%.3f → expanding refine windows to ±%.1f px / ±%.2f%%",
                 overlap,
-                min_accept_score,
-                trans_window_initial,
+                trans_window_current,
+                scale_window_current * 100.0,
             )
+        else:
+            scale_window_current = min(scale_window_current, scale_window_cap)
+            trans_window_current = min(trans_window_current, trans_window_cap)
+            log.info(
+                "[orient] Good overlap=%.3f → keeping minimal windows ±%.1f px / ±%.2f%%",
+                overlap,
+                trans_window_current,
+                scale_window_current * 100.0,
+            )
+    else:
+        scale_window_current = min(scale_window_current, scale_window_cap)
+        trans_window_current = min(trans_window_current, trans_window_cap)
     max_iters_base = int(refine_cfg.get("max_iters", 60))
     refine_cfg.setdefault("max_samples", 1500)
 
@@ -317,6 +350,8 @@ def calibrate(
         *,
         max_iters: int | None = None,
     ) -> None:
+        scale_window = min(scale_window, scale_window_cap)
+        trans_window = min(trans_window, trans_window_cap)
         if scale_window_limit is not None:
             scale_window = min(scale_window, scale_window_limit)
         if trans_window_limit is not None:
@@ -336,7 +371,7 @@ def calibrate(
             refine_cfg.pop("trans_seed", None)
             refine_cfg.pop("scale_abs_bounds", None)
 
-    _apply_refine_window(scale_window_base_val, trans_window_initial)
+    _apply_refine_window(scale_window_current, trans_window_current)
 
     if use_orientation:
         log.info(
