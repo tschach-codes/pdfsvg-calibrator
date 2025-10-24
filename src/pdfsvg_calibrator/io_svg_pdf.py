@@ -11,7 +11,7 @@ from typing import List, Optional, Sequence, Tuple
 import fitz
 import numpy as np
 
-from .geom import fit_straight_segment
+from .geom import classify_hv, fit_straight_segment
 from .debug.pdf_probe import probe_page
 from .pdfium_extract import extract_segments as pdfium_extract_segments
 from .types import Segment
@@ -724,6 +724,27 @@ def load_pdf_segments(
     curve_tol_rel = cfg.get("curve_tol_rel", 0.001)
     curve_tol = max(float(curve_tol_rel) * diag, 1e-6)
 
+    probe_stats = None
+    try:
+        probe_stats = probe_page(pdf_path, page_index)
+    except Exception as exc:  # pragma: no cover - diagnostic helper
+        log.debug(
+            "PDF-Probe vor Extraktion fehlgeschlagen: %s",
+            exc,
+            exc_info=isinstance(exc, RuntimeError),
+        )
+    else:
+        counts = (probe_stats.get("counts") or {}).copy()
+        notes = list(probe_stats.get("notes") or [])
+        forms = int(probe_stats.get("forms", 0) or 0)
+        log.debug(
+            "[pdf] Seite %d: Probe counts=%s, forms=%d, notes=%s",
+            page_index,
+            counts,
+            forms,
+            notes,
+        )
+
     parse_start = perf_counter()
     raw_segments = pdfium_extract_segments(pdf_path, page_index, curve_tol)
     duration = perf_counter() - parse_start
@@ -733,29 +754,39 @@ def load_pdf_segments(
         for seg in raw_segments
     ]
 
+    log.debug(
+        "[pdf] Seite %d: pypdfium2-Segmente extrahiert=%d",
+        page_index,
+        len(segments),
+    )
+
+    if segments:
+        angle_tol = float(cfg.get("angle_tol_deg", 6.0))
+        pdf_h, pdf_v = classify_hv(segments, angle_tol)
+        if not pdf_h and not pdf_v:
+            log.error(
+                "pypdfium2-Segmente enthalten keine horizontalen oder vertikalen Linien – PyMuPDF-Fallback wird verwendet"
+            )
+            return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+
     if not segments:
         needs_raster_fallback = False
-        try:
-            probe_stats = probe_page(pdf_path, page_index)
-        except Exception as exc:  # pragma: no cover - diagnostic helper
-            log.debug(
-                "PDF-Probe für Raster-Fallback fehlgeschlagen: %s", exc,
-                exc_info=isinstance(exc, RuntimeError),
-            )
-            probe_stats = None
 
         if probe_stats is not None:
             notes = probe_stats.get("notes") or []
             for note in notes:
                 if str(note) == "likely_scanned_raster_page":
-                    message = "Seite enthält nur Rasterbild, keine Vektoren"
-                    log.error(message)
-                    raise ValueError(message)
+                    log.error("Scan-Seite – kein Vektorinhalt")
+                    raise ValueError("Seite enthält nur Rasterbild, keine Vektoren")
 
             counts = probe_stats.get("counts", {})
             text_count = int(counts.get("text", 0) or 0)
             path_count = int(counts.get("path", 0) or 0)
             form_count = int(probe_stats.get("forms", 0) or 0)
+
+            if form_count > 0:
+                log.error("FORM-Walker defekt – %d FORM-XObjects gefunden", form_count)
+
             if (
                 text_count >= max(4, counts.get("total", 0) // 2)
                 and path_count == 0
