@@ -11,8 +11,9 @@ from typing import List, Optional, Sequence, Tuple
 import fitz
 import numpy as np
 
-from .geom import classify_hv, fit_straight_segment
+from .geom import fit_straight_segment
 from .debug.pdf_probe import probe_page
+from .debug.pdf_segments_debug import analyze_segments_basic, debug_print_segments
 from .pdfium_extract import extract_segments as pdfium_extract_segments
 from .types import Segment
 
@@ -746,30 +747,25 @@ def load_pdf_segments(
         )
 
     parse_start = perf_counter()
-    raw_segments = pdfium_extract_segments(pdf_path, page_index, curve_tol)
+    pdfium_segments = pdfium_extract_segments(pdf_path, page_index, curve_tol)
     duration = perf_counter() - parse_start
 
-    segments = [
-        Segment(float(seg["x1"]), float(seg["y1"]), float(seg["x2"]), float(seg["y2"]))
-        for seg in raw_segments
-    ]
+    print(f"Seite {page_index}: pypdfium2-Segmente extrahiert={len(pdfium_segments)}")
+    stats = analyze_segments_basic(pdfium_segments, angle_tol_deg=2.0)
+    debug_print_segments("PDFium raw", stats, pdfium_segments)
 
-    log.debug(
-        "[pdf] Seite %d: pypdfium2-Segmente extrahiert=%d",
-        page_index,
-        len(segments),
-    )
-
-    if segments:
-        angle_tol = float(cfg.get("angle_tol_deg", 6.0))
-        pdf_h, pdf_v = classify_hv(segments, angle_tol)
-        if not pdf_h and not pdf_v:
-            log.error(
-                "pypdfium2-Segmente enthalten keine horizontalen oder vertikalen Linien – PyMuPDF-Fallback wird verwendet"
+    if pdfium_segments:
+        print("INFO: using PDFium segments (skip PyMuPDF fallback)")
+        segments = [
+            Segment(
+                float(seg["x1"]),
+                float(seg["y1"]),
+                float(seg["x2"]),
+                float(seg["y2"]),
             )
-            return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
-
-    if not segments:
+            for seg in pdfium_segments
+        ]
+    else:
         needs_raster_fallback = False
 
         if probe_stats is not None:
@@ -800,10 +796,12 @@ def load_pdf_segments(
             )
             return _load_pdf_segments_raster(pdf_path, page_index, cfg, width, height)
 
-        log.warning(
-            "pypdfium2 lieferte keine Segmente, PyMuPDF-Fallback wird verwendet"
-        )
-        return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+        print("WARN: PDFium returned 0 segments, trying PyMuPDF fallback …")
+        segments, (width, height) = _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+        print(f"PyMuPDF fallback produced {len(segments)} segments")
+
+    if len(segments) == 0:
+        raise RuntimeError("PDF enthält keine vektoriellen Segmente -> Abbruch")
 
     log.debug(
         "[pdf] Seite %d: Größe=(%.2f×%.2f), Diagonale=%.2f, Segmente=%d in %.3fs",
