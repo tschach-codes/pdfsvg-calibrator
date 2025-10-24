@@ -322,6 +322,29 @@ def test_load_pdf_segments_uses_pdfium(pdfium_stub, straight_cfg):
     assert all(page.closed for page in state["pages"])
 
 
+def test_load_pdf_segments_detects_scanned_page(monkeypatch, pdfium_stub, straight_cfg):
+    pdfium_stub([], size=(200.0, 100.0))
+
+    def fake_probe(pdf_path: str, page_index: int):
+        return {
+            "page_index": page_index,
+            "counts": {"total": 1, "image": 1, "path": 0},
+            "notes": ["likely_scanned_raster_page"],
+        }
+
+    io_svg_pdf = sys.modules["pdfsvg_calibrator.io_svg_pdf"]
+    monkeypatch.setattr(io_svg_pdf, "probe_page", fake_probe)
+
+    def fail_fallback(*args, **kwargs):  # pragma: no cover - ensure early abort
+        raise AssertionError("Fallback should not be used for scanned pages")
+
+    monkeypatch.setattr(io_svg_pdf, "_load_pdf_segments_pymupdf", fail_fallback)
+    monkeypatch.setattr(io_svg_pdf, "_load_pdf_segments_raster", fail_fallback)
+
+    with pytest.raises(ValueError, match="Seite enthält nur Rasterbild, keine Vektoren"):
+        load_pdf_segments("dummy.pdf", 0, straight_cfg)
+
+
 def test_public_api_no_tuple_outputs(pdfium_stub, tmp_path, straight_cfg):
     pdfium_stub(
         [

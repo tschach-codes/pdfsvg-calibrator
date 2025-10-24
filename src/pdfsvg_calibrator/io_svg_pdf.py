@@ -745,11 +745,22 @@ def load_pdf_segments(
             probe_stats = None
 
         if probe_stats is not None:
+            notes = probe_stats.get("notes") or []
+            for note in notes:
+                if str(note) == "likely_scanned_raster_page":
+                    message = "Seite enthält nur Rasterbild, keine Vektoren"
+                    log.error(message)
+                    raise ValueError(message)
+
             counts = probe_stats.get("counts", {})
             text_count = int(counts.get("text", 0) or 0)
             path_count = int(counts.get("path", 0) or 0)
             form_count = int(probe_stats.get("forms", 0) or 0)
-            if text_count >= max(4, counts.get("total", 0) // 2) and path_count == 0 and form_count == 0:
+            if (
+                text_count >= max(4, counts.get("total", 0) // 2)
+                and path_count == 0
+                and form_count == 0
+            ):
                 needs_raster_fallback = True
 
         if needs_raster_fallback:
