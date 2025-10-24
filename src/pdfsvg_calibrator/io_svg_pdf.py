@@ -9,8 +9,10 @@ from time import perf_counter
 from typing import List, Optional, Sequence, Tuple
 
 import fitz
+import numpy as np
 
 from .geom import fit_straight_segment
+from .debug.pdf_probe import probe_page
 from .pdfium_extract import extract_segments as pdfium_extract_segments
 from .types import Segment
 
@@ -732,6 +734,30 @@ def load_pdf_segments(
     ]
 
     if not segments:
+        needs_raster_fallback = False
+        try:
+            probe_stats = probe_page(pdf_path, page_index)
+        except Exception as exc:  # pragma: no cover - diagnostic helper
+            log.debug(
+                "PDF-Probe für Raster-Fallback fehlgeschlagen: %s", exc,
+                exc_info=isinstance(exc, RuntimeError),
+            )
+            probe_stats = None
+
+        if probe_stats is not None:
+            counts = probe_stats.get("counts", {})
+            text_count = int(counts.get("text", 0) or 0)
+            path_count = int(counts.get("path", 0) or 0)
+            form_count = int(probe_stats.get("forms", 0) or 0)
+            if text_count >= max(4, counts.get("total", 0) // 2) and path_count == 0 and form_count == 0:
+                needs_raster_fallback = True
+
+        if needs_raster_fallback:
+            log.warning(
+                "PDF enthält überwiegend Textobjekt-Outlines – Raster-Fallback wird verwendet",
+            )
+            return _load_pdf_segments_raster(pdf_path, page_index, cfg, width, height)
+
         log.warning(
             "pypdfium2 lieferte keine Segmente, PyMuPDF-Fallback wird verwendet"
         )
@@ -864,9 +890,93 @@ def _load_pdf_segments_pymupdf(
             duration,
         )
 
-        return segments, (width, height)
+        result = segments, (width, height)
     finally:
         doc.close()
+
+    return result
+
+
+def _load_pdf_segments_raster(
+    pdf_path: str,
+    page_index: int,
+    cfg: dict,
+    page_width: float,
+    page_height: float,
+) -> Tuple[List[Segment], Tuple[float, float]]:
+    raster_cfg = cfg.get("pdf_raster_fallback", {})
+    zoom = float(raster_cfg.get("zoom", 4.0))
+    edge_percentile = float(raster_cfg.get("edge_percentile", 97.0))
+    edge_min_strength = float(raster_cfg.get("edge_min_strength", 10.0))
+    max_segments = int(raster_cfg.get("max_segments", 200_000))
+    if zoom <= 0:
+        zoom = 4.0
+
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc.load_page(page_index)
+        matrix = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY, alpha=False)
+    finally:
+        doc.close()
+
+    width_px = pix.width
+    height_px = pix.height
+    if width_px <= 0 or height_px <= 0:
+        return [], (page_width, page_height)
+
+    buf = np.frombuffer(pix.samples, dtype=np.uint8)
+    img = buf.reshape(height_px, width_px).astype(np.float32)
+    gy, gx = np.gradient(img)
+    mag = np.hypot(gx, gy)
+
+    if not np.any(mag):
+        return [], (page_width, page_height)
+
+    percentile = np.clip(edge_percentile, 0.0, 100.0)
+    thresh = float(np.percentile(mag, percentile))
+    thresh = max(thresh, edge_min_strength)
+    edges = mag >= thresh
+    if not np.any(edges):
+        return [], (page_width, page_height)
+
+    segments: List[Segment] = []
+
+    def _pixel_center(col: int, row: int) -> Tuple[float, float]:
+        x = (col + 0.5) / zoom
+        y = page_height - (row + 0.5) / zoom
+        return x, y
+
+    edges = edges.astype(bool, copy=False)
+    rows, cols = edges.shape
+    for r in range(rows):
+        row_mask = edges[r]
+        for c in range(cols):
+            if not row_mask[c]:
+                continue
+            if c + 1 < cols and row_mask[c + 1]:
+                x1, y1 = _pixel_center(c, r)
+                x2, y2 = _pixel_center(c + 1, r)
+                if x1 != x2 or y1 != y2:
+                    segments.append(Segment(x1, y1, x2, y2))
+            if r + 1 < rows and edges[r + 1, c]:
+                x1, y1 = _pixel_center(c, r)
+                x2, y2 = _pixel_center(c, r + 1)
+                if x1 != x2 or y1 != y2:
+                    segments.append(Segment(x1, y1, x2, y2))
+
+    if max_segments > 0 and len(segments) > max_segments:
+        step = max(1, len(segments) // max_segments)
+        segments = segments[::step]
+
+    log.warning(
+        "Raster-Fallback generierte %d Segmente (Zoom %.1f, Schwelle %.1f)",
+        len(segments),
+        zoom,
+        thresh,
+    )
+
+    return segments, (page_width, page_height)
 
 
 def convert_pdf_to_svg_if_needed(
