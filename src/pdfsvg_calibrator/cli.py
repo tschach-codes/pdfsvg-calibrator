@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 import typer
 import yaml
 
+from pprint import pformat
+
 from .config import load_config
 from .calibrate import calibrate
 from .io_svg_pdf import (
@@ -27,6 +29,7 @@ from .match_verify import match_lines, select_lines
 from .overlays import write_pdf_overlay, write_report_csv, write_svg_overlay
 from .types import Match, Model, Segment
 from .utils.timer import timer
+from .debug.pdf_probe import probe_page
 
 
 _RICH_AVAILABLE = importlib.util.find_spec("rich") is not None
@@ -966,6 +969,12 @@ def run(
                 logger.debug(
                     f"PDF-Segmente: {len(pdf_segs)} (Seite {page}, Größe {pdf_size})"
                 )
+                if verbose:
+                    try:
+                        probe_stats = probe_page(str(pdf), page)
+                        logger.debug("PDF-Probe:\n" + pformat(probe_stats, width=100))
+                    except Exception as exc:  # pragma: no cover - diagnostic fallback
+                        logger.debug(f"PDF-Probe fehlgeschlagen: {exc}")
 
                 logger.step("SVG-Segmente laden")
                 with logger.status("SVG analysieren"):
