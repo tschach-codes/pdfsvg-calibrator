@@ -963,9 +963,17 @@ def run(
 
                 logger.step("PDF-Segmente laden")
                 with logger.status("PDF analysieren"):
-                    pdf_segs, pdf_size = load_pdf_segments(
-                        str(pdf), page, cfg, use_pdfium=not no_pdfium
-                    )
+                    try:
+                        pdf_segs, pdf_size = load_pdf_segments(
+                            str(pdf), page, cfg, use_pdfium=not no_pdfium
+                        )
+                    except RuntimeError as exc:
+                        if (
+                            svg is None
+                            and "keine vektoriellen Segmente" in str(exc)
+                        ):
+                            raise ValueError("SVG enthält keine Vektoren") from exc
+                        raise
                 logger.debug(
                     f"PDF-Segmente: {len(pdf_segs)} (Seite {page}, Größe {pdf_size})"
                 )
