@@ -14,7 +14,7 @@ import numpy as np
 from .geom import fit_straight_segment
 from .debug.pdf_probe import probe_page
 from .debug.pdf_segments_debug import analyze_segments_basic, debug_print_segments
-from .pdfium_extract import extract_segments as pdfium_extract_segments
+from .pdfium_extract import debug_print_summary, extract_segments
 from .types import Segment
 
 
@@ -747,10 +747,11 @@ def load_pdf_segments(
         )
 
     parse_start = perf_counter()
-    pdfium_segments = pdfium_extract_segments(pdf_path, page_index, curve_tol)
+    pdfium_segments = extract_segments(str(pdf_path), page_index=page_index, tol_pt=0.1)
     duration = perf_counter() - parse_start
 
     print(f"Seite {page_index}: pypdfium2-Segmente extrahiert={len(pdfium_segments)}")
+    debug_print_summary("after CTM compose", pdfium_segments)
     stats = analyze_segments_basic(pdfium_segments, angle_tol_deg=2.0)
     debug_print_segments("PDFium raw", stats, pdfium_segments)
 
@@ -1168,9 +1169,7 @@ def _pdf_segments_pymupdf(pdf_path: str, page_index: int) -> List[dict]:
 
 def pdf_to_segments(pdf_path: str, page: int, use_pdfium: bool = True) -> List[dict]:
     if use_pdfium:
-        segs = pdfium_extract_segments(
-            pdf_path, page_index=page, curve_tol_pt=0.1
-        )
+        segs = extract_segments(pdf_path, page_index=page, tol_pt=0.1)
         return sanitize_segments(segs)
 
     segs = _pdf_segments_pymupdf(pdf_path, page)
