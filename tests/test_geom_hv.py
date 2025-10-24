@@ -17,11 +17,16 @@ class FakePathSegment:
         pos: Iterable[float] | None = None,
         ctrl1: Iterable[float] | None = None,
         ctrl2: Iterable[float] | None = None,
+        *,
+        width: float | None = None,
+        height: float | None = None,
     ) -> None:
         self.type = seg_type
         self.pos = tuple(pos) if pos is not None else None
         self.ctrl1 = tuple(ctrl1) if ctrl1 is not None else None
         self.ctrl2 = tuple(ctrl2) if ctrl2 is not None else None
+        self.width = width
+        self.height = height
 
 
 class FakePathObject:
@@ -271,6 +276,30 @@ def test_extract_segments_form_matrix(pdfium_stub):
     pdfium_stub([form])
     segments = extract_segments("dummy.pdf", 0, curve_tol_pt=0.01)
     assert segments == [{"x1": 5.0, "y1": 7.0, "x2": 5.0, "y2": 17.0}]
+
+
+def test_extract_segments_rect(pdfium_stub):
+    pdfium_stub(
+        [
+            FakePathObject(
+                [
+                    FakePathSegment(
+                        "rect",
+                        (10.0, 20.0),
+                        width=50.0,
+                        height=10.0,
+                    )
+                ]
+            )
+        ]
+    )
+    segments = extract_segments("dummy.pdf", 0, curve_tol_pt=0.01)
+    assert segments == [
+        {"x1": 10.0, "y1": 20.0, "x2": 60.0, "y2": 20.0},
+        {"x1": 60.0, "y1": 20.0, "x2": 60.0, "y2": 30.0},
+        {"x1": 60.0, "y1": 30.0, "x2": 10.0, "y2": 30.0},
+        {"x1": 10.0, "y1": 30.0, "x2": 10.0, "y2": 20.0},
+    ]
 
 
 def test_load_pdf_segments_uses_pdfium(pdfium_stub, straight_cfg):

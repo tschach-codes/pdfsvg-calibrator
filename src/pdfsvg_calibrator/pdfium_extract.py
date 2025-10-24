@@ -201,6 +201,35 @@ def extract_segments(
                                 poly = [flat[0]]
                             poly.extend(flat[1:])
                             current = p3
+                        elif seg_type in {"rect", "rectangle"}:
+                            pos = _extract_point(getattr(seg, "pos", None))
+                            if isinstance(seg, dict):
+                                pos = pos or _extract_point(seg.get("pos"))
+                                width = seg.get("width", seg.get("w"))
+                                height = seg.get("height", seg.get("h"))
+                            else:
+                                width = getattr(seg, "width", None)
+                                height = getattr(seg, "height", None)
+                            if pos is None or width is None or height is None:
+                                continue
+                            try:
+                                w = float(width)
+                                h = float(height)
+                            except (TypeError, ValueError):
+                                continue
+                            if poly:
+                                out.extend(_as_segments(poly))
+                                poly = []
+                            x0, y0 = pos
+                            rect_points = [
+                                _mapply(composed, x0, y0),
+                                _mapply(composed, x0 + w, y0),
+                                _mapply(composed, x0 + w, y0 + h),
+                                _mapply(composed, x0, y0 + h),
+                                _mapply(composed, x0, y0),
+                            ]
+                            out.extend(_as_segments(rect_points))
+                            current = rect_points[-1]
                         elif seg_type in {"close", "closepath"}:
                             if poly and poly[0] != poly[-1]:
                                 poly.append(poly[0])
