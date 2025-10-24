@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from ctypes import c_float
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 
@@ -111,6 +112,10 @@ def extract_segments(
 ) -> List[Dict[str, float]]:
     """Extract flattened line segments from a PDF page using pypdfium2."""
     import pypdfium2 as pdfium
+    try:
+        from pypdfium2.internal import pdfium_c  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - stub fallback
+        pdfium_c = None
 
     doc = pdfium.PdfDocument(pdf_path)
     try:
@@ -121,138 +126,241 @@ def extract_segments(
             out: List[Dict[str, float]] = []
             identity: Matrix = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 
-            def walk(obj, parent_matrix: Matrix) -> None:
-                matrix_attr = getattr(obj, "get_matrix", None)
-                if callable(matrix_attr):
-                    local = matrix_attr()
-                else:
-                    local = getattr(obj, "matrix", identity)
-                if isinstance(local, Sequence):
-                    local_tuple = tuple(float(v) for v in local[:6])
-                    if len(local_tuple) == 6:
-                        composed = _mmul(parent_matrix, local_tuple)
+            if pdfium_c is None or not hasattr(pdfium, "PdfObject"):
+
+                def walk(obj, parent_matrix: Matrix) -> None:
+                    matrix_attr = getattr(obj, "get_matrix", None)
+                    if callable(matrix_attr):
+                        local = matrix_attr()
+                    else:
+                        local = getattr(obj, "matrix", identity)
+                    if isinstance(local, Sequence):
+                        local_tuple = tuple(float(v) for v in local[:6])
+                        if len(local_tuple) == 6:
+                            composed = _mmul(parent_matrix, local_tuple)
+                        else:
+                            composed = parent_matrix
                     else:
                         composed = parent_matrix
+
+                    obj_type = getattr(obj, "type", None)
+                    if obj_type is None and isinstance(obj, dict):
+                        obj_type = obj.get("type")
+                    obj_type_str = str(obj_type).lower() if obj_type is not None else ""
+
+                    if obj_type_str == "path":
+                        path = getattr(obj, "get_path", None)
+                        if callable(path):
+                            segments = path()
+                        else:
+                            segments = getattr(obj, "path", None)
+                        if not segments:
+                            return
+                        current: Point | None = None
+                        poly: List[Point] = []
+                        for seg in segments:
+                            seg_type = getattr(seg, "type", None)
+                            if seg_type is None and isinstance(seg, dict):
+                                seg_type = seg.get("type")
+                            if seg_type is None:
+                                continue
+                            seg_name = str(seg_type).lower()
+                            if seg_name in {"move", "moveto"}:
+                                point = _extract_point(getattr(seg, "pos", None))
+                                if point is None and isinstance(seg, dict):
+                                    point = _extract_point(seg.get("pos"))
+                                if point is None:
+                                    continue
+                                mapped = _mapply(composed, point[0], point[1])
+                                if poly:
+                                    out.extend(_as_segments(poly))
+                                poly = [mapped]
+                                current = mapped
+                            elif seg_name in {"line", "line_to", "lineto"}:
+                                point = _extract_point(getattr(seg, "pos", None))
+                                if point is None and isinstance(seg, dict):
+                                    point = _extract_point(seg.get("pos"))
+                                if point is None:
+                                    continue
+                                mapped = _mapply(composed, point[0], point[1])
+                                if not poly:
+                                    poly = [mapped]
+                                else:
+                                    poly.append(mapped)
+                                current = mapped
+                            elif seg_name in {"bezier", "curve", "cubic", "cubic_bezier"}:
+                                if current is None:
+                                    continue
+                                pos = _extract_point(getattr(seg, "pos", None))
+                                ctrl1 = _extract_point(getattr(seg, "ctrl1", None))
+                                ctrl2 = _extract_point(getattr(seg, "ctrl2", None))
+                                if isinstance(seg, dict):
+                                    pos = pos or _extract_point(seg.get("pos"))
+                                    ctrl1 = ctrl1 or _extract_point(seg.get("ctrl1"))
+                                    ctrl2 = ctrl2 or _extract_point(seg.get("ctrl2"))
+                                if pos is None or ctrl1 is None or ctrl2 is None:
+                                    continue
+                                p0 = current
+                                p1 = _mapply(composed, ctrl1[0], ctrl1[1])
+                                p2 = _mapply(composed, ctrl2[0], ctrl2[1])
+                                p3 = _mapply(composed, pos[0], pos[1])
+                                flat = _flatten_cubic(p0, p1, p2, p3, tol=curve_tol_pt)
+                                if not poly:
+                                    poly = [flat[0]]
+                                poly.extend(flat[1:])
+                                current = p3
+                            elif seg_name in {"rect", "rectangle"}:
+                                pos = _extract_point(getattr(seg, "pos", None))
+                                width = getattr(seg, "width", None)
+                                height = getattr(seg, "height", None)
+                                if isinstance(seg, dict):
+                                    pos = pos or _extract_point(seg.get("pos"))
+                                    width = width if width is not None else seg.get("width", seg.get("w"))
+                                    height = height if height is not None else seg.get("height", seg.get("h"))
+                                if pos is None or width is None or height is None:
+                                    continue
+                                try:
+                                    w = float(width)
+                                    h = float(height)
+                                except (TypeError, ValueError):
+                                    continue
+                                if poly:
+                                    out.extend(_as_segments(poly))
+                                    poly = []
+                                x0, y0 = pos
+                                rect_points = [
+                                    _mapply(composed, x0, y0),
+                                    _mapply(composed, x0 + w, y0),
+                                    _mapply(composed, x0 + w, y0 + h),
+                                    _mapply(composed, x0, y0 + h),
+                                    _mapply(composed, x0, y0),
+                                ]
+                                out.extend(_as_segments(rect_points))
+                                current = rect_points[-1]
+                            elif seg_name in {"close", "closepath"}:
+                                if poly and poly[0] != poly[-1]:
+                                    poly.append(poly[0])
+                                current = poly[0] if poly else None
+                            else:
+                                continue
+                        if poly:
+                            out.extend(_as_segments(poly))
+                    elif obj_type_str == "form":
+                        form = getattr(obj, "get_form", None)
+                        if callable(form):
+                            container = form()
+                        else:
+                            container = getattr(obj, "form", None)
+                        if container is not None:
+                            for child in _iter_children(container):
+                                walk(child, composed)
+                    else:
+                        for child in _iter_children(obj):
+                            walk(child, composed)
+
+                for child in _iter_children(page):
+                    walk(child, identity)
+                return out
+
+            path_type = getattr(pdfium_c, "FPDF_PAGEOBJ_PATH", 2)
+            form_type = getattr(pdfium_c, "FPDF_PAGEOBJ_FORM", 5)
+            seg_move = getattr(pdfium_c, "FPDF_SEGMENT_MOVETO", 2)
+            seg_line = getattr(pdfium_c, "FPDF_SEGMENT_LINETO", 0)
+            seg_bezier = getattr(pdfium_c, "FPDF_SEGMENT_BEZIERTO", 1)
+
+            def _collect_path(raw_path, matrix: Matrix) -> None:
+                count = pdfium_c.FPDFPath_CountSegments(raw_path)
+                if count <= 0:
+                    return
+                current: Point | None = None
+                poly: List[Point] = []
+                bezier_points: List[Point] = []
+
+                for seg_index in range(count):
+                    segment = pdfium_c.FPDFPath_GetPathSegment(raw_path, seg_index)
+                    if not segment:
+                        continue
+                    seg_type = pdfium_c.FPDFPathSegment_GetType(segment)
+                    x = c_float()
+                    y = c_float()
+                    if not pdfium_c.FPDFPathSegment_GetPoint(segment, x, y):
+                        continue
+                    mapped = _mapply(matrix, float(x.value), float(y.value))
+                    close = bool(pdfium_c.FPDFPathSegment_GetClose(segment))
+
+                    if seg_type == seg_move:
+                        if poly:
+                            out.extend(_as_segments(poly))
+                        poly = [mapped]
+                        current = mapped
+                        bezier_points.clear()
+                    elif seg_type == seg_line:
+                        if not poly:
+                            if current is not None:
+                                poly = [current]
+                            else:
+                                poly = [mapped]
+                        poly.append(mapped)
+                        current = mapped
+                        bezier_points.clear()
+                    elif seg_type == seg_bezier:
+                        if current is None:
+                            bezier_points.clear()
+                        else:
+                            bezier_points.append(mapped)
+                            if len(bezier_points) == 3:
+                                ctrl1, ctrl2, end_point = bezier_points
+                                flattened = _flatten_cubic(
+                                    current, ctrl1, ctrl2, end_point, tol=curve_tol_pt
+                                )
+                                if not poly:
+                                    poly = [flattened[0]]
+                                elif poly[-1] != flattened[0]:
+                                    poly.append(flattened[0])
+                                poly.extend(flattened[1:])
+                                current = end_point
+                                bezier_points.clear()
+                    else:
+                        bezier_points.clear()
+
+                    if close and poly:
+                        if poly[0] != poly[-1]:
+                            poly.append(poly[0])
+                        out.extend(_as_segments(poly))
+                        poly = []
+                        current = None
+                        bezier_points.clear()
+
+                if poly:
+                    out.extend(_as_segments(poly))
+
+            def _walk(raw_obj, parent_matrix: Matrix) -> None:
+                helper = pdfium.PdfObject(raw_obj, page=page, pdf=doc)
+                try:
+                    local_matrix = helper.get_matrix().get()
+                except Exception:
+                    local_matrix = identity
+                if isinstance(local_matrix, Sequence) and len(local_matrix) >= 6:
+                    composed = _mmul(parent_matrix, tuple(float(v) for v in local_matrix[:6]))
                 else:
                     composed = parent_matrix
 
-                obj_type = getattr(obj, "type", None)
-                if obj_type is None and isinstance(obj, dict):
-                    obj_type = obj.get("type")
+                if helper.type == path_type:
+                    _collect_path(raw_obj, composed)
+                elif helper.type == form_type:
+                    count = pdfium_c.FPDFFormObj_CountObjects(raw_obj)
+                    for index in range(count):
+                        child = pdfium_c.FPDFFormObj_GetObject(raw_obj, index)
+                        if child:
+                            _walk(child, composed)
+                # Other object types do not contribute geometry for calibration.
 
-                if obj_type == "path":
-                    path = getattr(obj, "get_path", None)
-                    if callable(path):
-                        segments = path()
-                    else:
-                        segments = getattr(obj, "path", None)
-                    if not segments:
-                        return
-                    current: Point | None = None
-                    poly: List[Point] = []
-                    for seg in segments:
-                        seg_type = getattr(seg, "type", None)
-                        if seg_type is None and isinstance(seg, dict):
-                            seg_type = seg.get("type")
-                        if seg_type is None:
-                            continue
-                        seg_type = str(seg_type).lower()
-                        if seg_type == "move":
-                            point = _extract_point(getattr(seg, "pos", None))
-                            if point is None and isinstance(seg, dict):
-                                point = _extract_point(seg.get("pos"))
-                            if point is None:
-                                continue
-                            mapped = _mapply(composed, point[0], point[1])
-                            if poly:
-                                out.extend(_as_segments(poly))
-                            poly = [mapped]
-                            current = mapped
-                        elif seg_type in {"line", "line_to"}:
-                            point = _extract_point(getattr(seg, "pos", None))
-                            if point is None and isinstance(seg, dict):
-                                point = _extract_point(seg.get("pos"))
-                            if point is None:
-                                continue
-                            mapped = _mapply(composed, point[0], point[1])
-                            if not poly:
-                                poly = [mapped]
-                            else:
-                                poly.append(mapped)
-                            current = mapped
-                        elif seg_type in {"bezier", "curve", "cubic", "cubic_bezier"}:
-                            if current is None:
-                                continue
-                            pos = _extract_point(getattr(seg, "pos", None))
-                            ctrl1 = _extract_point(getattr(seg, "ctrl1", None))
-                            ctrl2 = _extract_point(getattr(seg, "ctrl2", None))
-                            if isinstance(seg, dict):
-                                pos = pos or _extract_point(seg.get("pos"))
-                                ctrl1 = ctrl1 or _extract_point(seg.get("ctrl1"))
-                                ctrl2 = ctrl2 or _extract_point(seg.get("ctrl2"))
-                            if pos is None or ctrl1 is None or ctrl2 is None:
-                                continue
-                            p0 = current
-                            p1 = _mapply(composed, ctrl1[0], ctrl1[1])
-                            p2 = _mapply(composed, ctrl2[0], ctrl2[1])
-                            p3 = _mapply(composed, pos[0], pos[1])
-                            flat = _flatten_cubic(p0, p1, p2, p3, tol=curve_tol_pt)
-                            if not poly:
-                                poly = [flat[0]]
-                            poly.extend(flat[1:])
-                            current = p3
-                        elif seg_type in {"rect", "rectangle"}:
-                            pos = _extract_point(getattr(seg, "pos", None))
-                            if isinstance(seg, dict):
-                                pos = pos or _extract_point(seg.get("pos"))
-                                width = seg.get("width", seg.get("w"))
-                                height = seg.get("height", seg.get("h"))
-                            else:
-                                width = getattr(seg, "width", None)
-                                height = getattr(seg, "height", None)
-                            if pos is None or width is None or height is None:
-                                continue
-                            try:
-                                w = float(width)
-                                h = float(height)
-                            except (TypeError, ValueError):
-                                continue
-                            if poly:
-                                out.extend(_as_segments(poly))
-                                poly = []
-                            x0, y0 = pos
-                            rect_points = [
-                                _mapply(composed, x0, y0),
-                                _mapply(composed, x0 + w, y0),
-                                _mapply(composed, x0 + w, y0 + h),
-                                _mapply(composed, x0, y0 + h),
-                                _mapply(composed, x0, y0),
-                            ]
-                            out.extend(_as_segments(rect_points))
-                            current = rect_points[-1]
-                        elif seg_type in {"close", "closepath"}:
-                            if poly and poly[0] != poly[-1]:
-                                poly.append(poly[0])
-                            current = poly[0] if poly else None
-                        else:
-                            continue
-                    if poly:
-                        out.extend(_as_segments(poly))
-                elif obj_type == "form":
-                    form = getattr(obj, "get_form", None)
-                    if callable(form):
-                        container = form()
-                    else:
-                        container = getattr(obj, "form", None)
-                    if container is not None:
-                        for child in _iter_children(container):
-                            walk(child, composed)
-                else:
-                    for child in _iter_children(obj):
-                        walk(child, composed)
-
-            for child in _iter_children(page):
-                walk(child, identity)
+            raw_page = page.raw
+            n_objects = pdfium_c.FPDFPage_CountObjects(raw_page)
+            for index in range(n_objects):
+                raw_obj = pdfium_c.FPDFPage_GetObject(raw_page, index)
+                if raw_obj:
+                    _walk(raw_obj, identity)
 
             return out
         finally:
