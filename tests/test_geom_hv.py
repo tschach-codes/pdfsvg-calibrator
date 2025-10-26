@@ -115,15 +115,128 @@ def pdfium_stub(monkeypatch):
     state: dict[str, List] = {"docs": [], "pages": []}
 
     def install(objects: List, size: tuple[float, float] = (100.0, 200.0)):
+        active_objects = [*objects]
+        active_size = size
+
         def factory():
-            page = FakePage(objects, size)
+            page = FakePage(active_objects, active_size)
             doc = FakeDoc([page])
             state["pages"].append(page)
             state["docs"].append(doc)
             return doc
 
-        module = types.SimpleNamespace(PdfDocument=lambda *args, **kwargs: factory())
+        raw_stub = types.SimpleNamespace()
+        module = types.SimpleNamespace(
+            PdfDocument=lambda *args, **kwargs: factory(), raw=raw_stub
+        )
         monkeypatch.setitem(sys.modules, "pypdfium2", module)
+
+        def compose(parent, local):
+            a, b, c, d, e, f = parent
+            A, B, C, D, E, F = local
+            return (
+                a * A + b * D,
+                a * B + b * E,
+                a * C + b * F + c,
+                d * A + e * D,
+                d * B + e * E,
+                d * C + e * F + f,
+            )
+
+        def apply_affine(matrix, x, y):
+            a, b, c, d, e, f = matrix
+            return (a * x + b * y + c, d * x + e * y + f)
+
+        def approximate_cubic(p0, p1, p2, p3, steps: int = 12):
+            pts = []
+            for i in range(steps + 1):
+                t = i / steps
+                omt = 1.0 - t
+                x = (
+                    omt ** 3 * p0[0]
+                    + 3 * omt ** 2 * t * p1[0]
+                    + 3 * omt * t ** 2 * p2[0]
+                    + t ** 3 * p3[0]
+                )
+                y = (
+                    omt ** 3 * p0[1]
+                    + 3 * omt ** 2 * t * p1[1]
+                    + 3 * omt * t ** 2 * p2[1]
+                    + t ** 3 * p3[1]
+                )
+                pts.append((x, y))
+            return pts
+
+        def collect_path(path_obj, ctm, out):
+            current = None
+            start = None
+            for seg in path_obj.get_path():
+                if seg.type == "move" and seg.pos is not None:
+                    current = apply_affine(ctm, seg.pos[0], seg.pos[1])
+                    start = current
+                elif seg.type == "line" and seg.pos is not None and current is not None:
+                    nxt = apply_affine(ctm, seg.pos[0], seg.pos[1])
+                    if current != nxt:
+                        out.append((current[0], current[1], nxt[0], nxt[1]))
+                    current = nxt
+                elif seg.type == "bezier" and seg.pos is not None and current is not None:
+                    if seg.ctrl1 is None or seg.ctrl2 is None:
+                        continue
+                    p0 = current
+                    p1 = apply_affine(ctm, seg.ctrl1[0], seg.ctrl1[1])
+                    p2 = apply_affine(ctm, seg.ctrl2[0], seg.ctrl2[1])
+                    p3 = apply_affine(ctm, seg.pos[0], seg.pos[1])
+                    points = approximate_cubic(p0, p1, p2, p3)
+                    for p_start, p_end in zip(points, points[1:]):
+                        if p_start != p_end:
+                            out.append((p_start[0], p_start[1], p_end[0], p_end[1]))
+                    current = p3
+                elif seg.type == "rect" and seg.pos is not None:
+                    x0, y0 = seg.pos
+                    w = float(seg.width or 0.0)
+                    h = float(seg.height or 0.0)
+                    local_pts = [
+                        (x0, y0),
+                        (x0 + w, y0),
+                        (x0 + w, y0 + h),
+                        (x0, y0 + h),
+                        (x0, y0),
+                    ]
+                    transformed = [apply_affine(ctm, px, py) for px, py in local_pts]
+                    for p_start, p_end in zip(transformed, transformed[1:]):
+                        if p_start != p_end:
+                            out.append((p_start[0], p_start[1], p_end[0], p_end[1]))
+                    current = transformed[-1]
+                    start = transformed[0]
+                elif seg.type == "close" and current is not None and start is not None:
+                    if current != start:
+                        out.append((current[0], current[1], start[0], start[1]))
+                    current = start
+
+        def collect(obj, ctm, out):
+            if isinstance(obj, FakePathObject):
+                local = obj.get_matrix()
+                collect_path(obj, compose(ctm, local), out)
+            elif isinstance(obj, FakeFormObject):
+                local = obj.get_matrix()
+                next_ctm = compose(ctm, local)
+                for child in obj.objects:
+                    collect(child, next_ctm, out)
+
+        identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+        def fake_extract(pdf_path: str, page_index: int = 0):
+            segments: List[tuple[float, float, float, float]] = []
+            for obj in active_objects:
+                collect(obj, identity, segments)
+            return segments
+
+        from pdfsvg_calibrator import pdfium_extrac_lowlevel as lowlevel
+
+        monkeypatch.setattr(
+            lowlevel, "extract_segments_pdfium_lowlevel", fake_extract
+        )
+
         return state
 
     return install

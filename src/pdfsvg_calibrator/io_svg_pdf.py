@@ -14,7 +14,7 @@ import numpy as np
 from .geom import fit_straight_segment
 from .debug.pdf_probe import probe_page
 from .debug.pdf_segments_debug import analyze_segments_basic, debug_print_segments
-from .pdfium_extract import debug_print_summary, extract_segments
+from .pdfium_extract import debug_print_summary
 from .types import Segment
 
 
@@ -747,24 +747,37 @@ def load_pdf_segments(
         )
 
     parse_start = perf_counter()
-    pdfium_segments = extract_segments(str(pdf_path), page_index=page_index, tol_pt=0.1)
+    try:
+        from .pdfium_extrac_lowlevel import (
+            extract_segments_pdfium_lowlevel as _extract_segments_pdfium_lowlevel,
+        )
+
+        pdfium_segment_tuples = _extract_segments_pdfium_lowlevel(
+            str(pdf_path), page_index
+        )
+    except Exception as exc:
+        print(f"PDF-Probe vor Extraktion fehlgeschlagen (lowlevel): {exc}")
+        pdfium_segment_tuples = []
     duration = perf_counter() - parse_start
 
-    print(f"Seite {page_index}: pypdfium2-Segmente extrahiert={len(pdfium_segments)}")
-    debug_print_summary("after CTM compose", pdfium_segments)
-    stats = analyze_segments_basic(pdfium_segments, angle_tol_deg=2.0)
-    debug_print_segments("PDFium raw", stats, pdfium_segments)
+    print(
+        f"Seite {page_index}: pypdfium2-Segmente extrahiert={len(pdfium_segment_tuples)}"
+    )
+    segment_dicts_for_debug = [
+        {
+            "x1": float(x0),
+            "y1": float(y0),
+            "x2": float(x1),
+            "y2": float(y1),
+        }
+        for x0, y0, x1, y1 in pdfium_segment_tuples
+    ]
 
-    if pdfium_segments:
+    if segment_dicts_for_debug:
         print("INFO: using PDFium segments (skip PyMuPDF fallback)")
         segments = [
-            Segment(
-                float(seg["x1"]),
-                float(seg["y1"]),
-                float(seg["x2"]),
-                float(seg["y2"]),
-            )
-            for seg in pdfium_segments
+            Segment(float(x0), float(y0), float(x1), float(y1))
+            for x0, y0, x1, y1 in pdfium_segment_tuples
         ]
     else:
         needs_raster_fallback = False
@@ -800,6 +813,19 @@ def load_pdf_segments(
         print("WARN: PDFium returned 0 segments, trying PyMuPDF fallback …")
         segments, (width, height) = _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
         print(f"PyMuPDF fallback produced {len(segments)} segments")
+        segment_dicts_for_debug = [
+            {
+                "x1": float(seg.x1),
+                "y1": float(seg.y1),
+                "x2": float(seg.x2),
+                "y2": float(seg.y2),
+            }
+            for seg in segments
+        ]
+
+    debug_print_summary("after CTM compose", segment_dicts_for_debug)
+    stats = analyze_segments_basic(segment_dicts_for_debug, angle_tol_deg=2.0)
+    debug_print_segments("PDFium raw", stats, segment_dicts_for_debug)
 
     if len(segments) == 0:
         raise RuntimeError("PDF enthält keine vektoriellen Segmente -> Abbruch")
@@ -1169,7 +1195,20 @@ def _pdf_segments_pymupdf(pdf_path: str, page_index: int) -> List[dict]:
 
 def pdf_to_segments(pdf_path: str, page: int, use_pdfium: bool = True) -> List[dict]:
     if use_pdfium:
-        segs = extract_segments(pdf_path, page_index=page, tol_pt=0.1)
+        from .pdfium_extrac_lowlevel import (
+            extract_segments_pdfium_lowlevel as _extract_segments_pdfium_lowlevel,
+        )
+
+        tuples = _extract_segments_pdfium_lowlevel(pdf_path, page_index=page)
+        segs = [
+            {
+                "x1": float(x0),
+                "y1": float(y0),
+                "x2": float(x1),
+                "y2": float(y1),
+            }
+            for x0, y0, x1, y1 in tuples
+        ]
         return sanitize_segments(segs)
 
     segs = _pdf_segments_pymupdf(pdf_path, page)
