@@ -3,6 +3,56 @@ from ctypes import c_double, byref
 import pypdfium2 as pdfium
 from pypdfium2 import raw as pdfraw
 
+
+def _matrix_to_tuple(m):
+    """
+    Return (a,b,c,d,e,f) for a pypdfium2.PdfMatrix, robustly.
+    Different builds expose PdfMatrix differently:
+    - Some allow indexing [0..5]
+    - Some expose attributes .a .b .c .d .e .f
+    - Some are simple tuples already
+    We'll try all strategies.
+    """
+    # already a tuple-like?
+    if isinstance(m, tuple) or isinstance(m, list):
+        if len(m) == 6:
+            return (
+                float(m[0]),
+                float(m[1]),
+                float(m[2]),
+                float(m[3]),
+                float(m[4]),
+                float(m[5]),
+            )
+
+    # try item access
+    try:
+        return (
+            float(m[0]),
+            float(m[1]),
+            float(m[2]),
+            float(m[3]),
+            float(m[4]),
+            float(m[5]),
+        )
+    except Exception:
+        pass
+
+    # try named attributes (PDFium's FPDF_MATRIX is {a,b,c,d,e,f})
+    cand_names = ["a", "b", "c", "d", "e", "f"]
+    if all(hasattr(m, name) for name in cand_names):
+        return (
+            float(m.a),
+            float(m.b),
+            float(m.c),
+            float(m.d),
+            float(m.e),
+            float(m.f),
+        )
+
+    # last resort: dir() dump for debugging
+    raise TypeError(f"PdfMatrix format not understood: {m!r}")
+
 # PDFium object type enums (stable in PDFium)
 PDFIUM_PAGEOBJ_PATH    = 1
 PDFIUM_PAGEOBJ_TEXT    = 2
@@ -13,30 +63,30 @@ PDFIUM_PAGEOBJ_FORM    = 5
 def _compose_matrix(parent, child):
     """
     Compose two PdfMatrix transforms: parent ∘ child.
-    PdfMatrix is (a,b,c,d,e,f) meaning:
+    PdfMatrix / FPDF_MATRIX:
       [ a c e ]
       [ b d f ]
       [ 0 0 1 ]
     """
-    pa, pb, pc, pd, pe, pf = parent
-    ca, cb, cc, cd, ce, cf = child
+    pa, pb, pc, pd, pe, pf = _matrix_to_tuple(parent)
+    ca, cb, cc, cd, ce, cf = _matrix_to_tuple(child)
 
     return pdfium.PdfMatrix(
-        pa*ca + pc*cb,
-        pb*ca + pd*cb,
-        pa*cc + pc*cd,
-        pb*cc + pd*cd,
-        pa*ce + pc*cf + pe,
-        pb*ce + pd*cf + pf,
+        pa * ca + pc * cb,
+        pb * ca + pd * cb,
+        pa * cc + pc * cd,
+        pb * cc + pd * cd,
+        pa * ce + pc * cf + pe,
+        pb * ce + pd * cf + pf,
     )
 
 def _apply_matrix(mat, x, y):
     """
     Apply PdfMatrix to point (x,y).
     """
-    a,b,c,d,e,f = mat
-    X = a*x + c*y + e
-    Y = b*x + d*y + f
+    a, b, c, d, e, f = _matrix_to_tuple(mat)
+    X = a * x + c * y + e
+    Y = b * x + d * y + f
     return (X, Y)
 
 def _iter_page_objects(page):

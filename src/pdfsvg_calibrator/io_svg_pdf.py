@@ -728,12 +728,8 @@ def load_pdf_segments(
     probe_stats = None
     try:
         probe_stats = probe_page(pdf_path, page_index)
-    except Exception as exc:  # pragma: no cover - diagnostic helper
-        log.debug(
-            "PDF-Probe vor Extraktion fehlgeschlagen: %s",
-            exc,
-            exc_info=isinstance(exc, RuntimeError),
-        )
+    except Exception:  # pragma: no cover - diagnostic helper
+        pass
     else:
         counts = (probe_stats.get("counts") or {}).copy()
         notes = list(probe_stats.get("notes") or [])
