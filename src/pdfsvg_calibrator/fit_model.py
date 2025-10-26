@@ -535,7 +535,16 @@ def calibrate(
         classify_start = perf_counter()
         pdf_h, pdf_v = classify_hv(rotated_pdf, angle_tol)
         classify_duration = perf_counter() - classify_start
-        _ensure_hv_non_empty("PDF", pdf_h, pdf_v)
+        hv_pdf_count = len(pdf_h) + len(pdf_v)
+        if hv_pdf_count == 0:
+            print(
+                "WARN: Keine ausreichend achs-parallelen Segmente erkannt (PDF). Fahre mit allen verfügbaren Segmente"
+                "n fort."
+            )
+            pdf_h = list(rotated_pdf)
+            pdf_v = list(rotated_pdf)
+        else:
+            _ensure_hv_non_empty("PDF", pdf_h, pdf_v)
 
         log.debug(
             "[calib] rot=%s rotiert in %.3fs, klassifiziert (%d horizontale, %d vertikale Segmente) in %.3fs",
