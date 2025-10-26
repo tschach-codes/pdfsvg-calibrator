@@ -60,6 +60,42 @@ PDFIUM_PAGEOBJ_IMAGE   = 3
 PDFIUM_PAGEOBJ_SHADING = 4
 PDFIUM_PAGEOBJ_FORM    = 5
 
+def _is_path_type(otype):
+    """
+    Return True if this object type represents a vector PATH.
+    We support both numeric enums (1 == PATH) and string types like "path".
+    """
+    if otype is None:
+        return False
+    # numeric?
+    try:
+        if int(otype) == PDFIUM_PAGEOBJ_PATH:
+            return True
+    except Exception:
+        pass
+    # string?
+    if isinstance(otype, str):
+        if otype.lower() in ("path", "shape", "stroke", "vector", "fpdf_pageobj_path"):
+            return True
+    return False
+
+def _is_form_type(otype):
+    """
+    Return True if this object type is a FORM/XObject container.
+    We support both numeric enums (5 == FORM) and string types like "form".
+    """
+    if otype is None:
+        return False
+    try:
+        if int(otype) == PDFIUM_PAGEOBJ_FORM:
+            return True
+    except Exception:
+        pass
+    if isinstance(otype, str):
+        if "form" in otype.lower() or "xobject" in otype.lower():
+            return True
+    return False
+
 def _compose_matrix(parent, child):
     """
     Compose two PdfMatrix transforms: parent ∘ child.
@@ -219,15 +255,20 @@ def _walk_object(obj, parent_ctm, out_segments):
     # compose
     ctm = _compose_matrix(parent_ctm, mat_local)
 
-    if otype == PDFIUM_PAGEOBJ_PATH:
+    # PATH-like?
+    if _is_path_type(otype):
         _extract_path_segments_from_obj(obj, ctm, out_segments)
+        return
 
-    elif otype == PDFIUM_PAGEOBJ_FORM:
+    # FORM-like?
+    if _is_form_type(otype):
         # recurse for each kid in the form, using ctm as new parent_ctm
         for kid in _iter_form_children(obj):
             _walk_object(kid, ctm, out_segments)
+        return
 
-    # TEXT / IMAGE etc. are ignored
+    # Otherwise ignore (text, image, etc.)
+    return
 
 def extract_segments_pdfium_lowlevel(pdf_path: str, page_index: int = 0):
     """
@@ -241,5 +282,19 @@ def extract_segments_pdfium_lowlevel(pdf_path: str, page_index: int = 0):
 
     for obj in _iter_page_objects(page):
         _walk_object(obj, identity, segments)
+
+    if len(segments) == 0:
+        # lightweight debug to understand otype values in this environment
+        try:
+            sample_types = []
+            count = 0
+            for o in _iter_page_objects(page):
+                sample_types.append(repr(getattr(o, "type", None)))
+                count += 1
+                if count >= 10:
+                    break
+            print("[PDFDBG] first object types:", ", ".join(sample_types))
+        except Exception as dbg_e:
+            print("[PDFDBG] type-scan failed:", dbg_e)
 
     return segments
