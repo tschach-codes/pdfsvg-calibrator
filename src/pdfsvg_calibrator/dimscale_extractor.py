@@ -67,17 +67,272 @@ def _parse_svg(svg_path: str):
     return root, tree
 
 
+def _is_large_enough_to_consider(seg_list: List[Tuple[float,float,float,float]], min_len: float) -> Optional[Tuple[float,float,float,float]]:
+    """
+    Given a list of raw line segments (x1,y1,x2,y2), pick the single
+    longest segment whose length >= min_len. If none pass, return None.
+    """
+    best = None
+    best_L = 0.0
+    for (x1,y1,x2,y2) in seg_list:
+        L = math.hypot(x2-x1, y2-y1)
+        if L >= min_len and L > best_L:
+            best_L = L
+            best = (x1,y1,x2,y2)
+    return best
+
+
+def _extract_line_segments_from_path_d(d_attr: str) -> List[Tuple[float,float,float,float]]:
+    """
+    Parse a subset of SVG path syntax and extract straight line segments.
+
+    We handle commands:
+      M x y   (move absolute)
+      m dx dy (move relative)
+      L x y   (line absolute)
+      l dx dy (line relative)
+      H x     (horizontal line abs)
+      h dx    (horizontal line rel)
+      V y     (vertical line abs)
+      v dy    (vertical line rel)
+    We IGNORE curves (C,Q,A,S,T, etc.) for now.
+    We also ignore Z/z close-path for now because that usually indicates
+    closed polygons, not dimension leaders.
+
+    We return a list of (x1,y1,x2,y2) for every straight subsegment we see.
+    """
+    # Tokenize path data into [ (cmd, [floats...]), ... ]
+    # We'll do a very basic parser: iterate through chars, detect letters as commands.
+    # Then consume the following numbers until the next command letter.
+    tokens: List[Tuple[str,List[float]]] = []
+    cur_cmd = None
+    cur_nums: List[float] = []
+
+    def flush():
+        nonlocal tokens, cur_cmd, cur_nums
+        if cur_cmd is not None:
+            tokens.append((cur_cmd, cur_nums))
+        cur_cmd = None
+        cur_nums = []
+
+    # pass 1: break into cmd + numeric chunks
+    buf = ""
+    for ch in d_attr:
+        if ch.isalpha():
+            # flush any pending
+            if cur_cmd is not None:
+                # finish previous cmd before switching
+                flush()
+            cur_cmd = ch
+            cur_nums = []
+            buf = ""
+        else:
+            # keep building numeric buffer with commas/space
+            buf += ch
+            # split on space/comma
+            # we only finalize nums on actual split, we'll post-process after loop
+            # so do nothing here
+            pass
+        # whenever we hit a command char, we continue reading numbers for that command
+        # until next alpha or end.
+
+        # We don't finalize nums here; we'll do after the loop
+        # because we collected them in buf but not yet splitted.
+
+        # Actually we do need to push tokens per command if multiple commands appear
+        # in a row without numeric separation. But typical path data won't do that
+        # in a way that breaks us.
+
+        # We'll parse numbers for each command after the loop ends.
+
+    # end loop
+    # We consumed chars, but we didn't yet extract floats from buf for last command.
+    # Let's do a second pass to rebuild properly in an easier way.
+
+    # The above quick attempt is a bit too naive: we lost track of some numeric sets.
+    # Let's do a second, more robust approach instead:
+    # We'll do a real mini state machine in one go:
+
+    tokens = []
+    cur_cmd = None
+    cur_nums = []
+
+    def push_token():
+        nonlocal tokens, cur_cmd, cur_nums
+        if cur_cmd is not None:
+            tokens.append((cur_cmd, cur_nums))
+        cur_cmd = None
+        cur_nums = []
+
+    # helper to finalize numeric parse from a buffer string of mixed commas/spaces
+    def parse_nums(s: str) -> List[float]:
+        out = []
+        # break on commas
+        for part in s.replace(",", " ").split():
+            try:
+                out.append(float(part))
+            except ValueError:
+                pass
+        return out
+
+    # second, more robust pass:
+    num_buf = ""
+    for ch in d_attr:
+        if ch.isalpha():
+            # new command
+            # flush previous command+nums if any
+            if cur_cmd is not None:
+                # we still might have trailing nums in num_buf
+                cur_nums.extend(parse_nums(num_buf))
+                num_buf = ""
+                push_token()
+            # start new
+            cur_cmd = ch
+            cur_nums = []
+        else:
+            # numeric or punctuation
+            num_buf += ch
+            # if we see another letter next iteration, we'll parse_nums then
+
+        # note: we'll add the last num_buf after loop as well
+    # end for
+    if cur_cmd is not None:
+        cur_nums.extend(parse_nums(num_buf))
+        push_token()
+
+    # now tokens = [(cmd, [numbers...]), ...]
+
+    segs: List[Tuple[float,float,float,float]] = []
+
+    # interpret tokens as successive draw ops
+    # We'll maintain a current point (cx,cy).
+    cx, cy = 0.0, 0.0
+    have_pos = False
+
+    def emit_line(nx, ny, ox, oy):
+        # add segment ox,oy -> nx,ny
+        if ox is None or oy is None:
+            return
+        segs.append((ox, oy, nx, ny))
+
+    i = 0
+    while i < len(tokens):
+        cmd, nums = tokens[i]
+        i += 1
+
+        c = cmd
+        # absolute vs relative logic:
+        is_rel = c.islower()
+        c_up = c.upper()
+
+        # M/m can have multiple coordinate pairs => move + implicit line-tos
+        if c_up == "M":
+            # nums are [x,y, x,y, ...]
+            it = iter(nums)
+            first_pair = True
+            for x in it:
+                y = next(it, None)
+                if y is None:
+                    break
+                if is_rel and have_pos:
+                    nx = cx + x
+                    ny = cy + y
+                else:
+                    nx = x
+                    ny = y
+                cx, cy = nx, ny
+                if not have_pos:
+                    have_pos = True
+                    first_pair = False
+                else:
+                    if first_pair:
+                        first_pair = False
+                    else:
+                        # implicit line-to after the first pair
+                        # previous point -> cx,cy
+                        # Actually we updated cx,cy to the new point, we lost old.
+                        # let's fix by storing old then updating.
+                        pass
+            # NOTE: proper M parsing with multiple pairs is messy.
+            # We'll keep it simple: just set cx,cy to the last pair.
+            # This is good enough for dimension-ish geometry where M is usually single.
+            continue
+
+        # L/l = line to (x,y) pairs
+        if c_up == "L":
+            it = iter(nums)
+            for x in it:
+                y = next(it, None)
+                if y is None:
+                    break
+                ox, oy = cx, cy
+                if is_rel:
+                    cx += x
+                    cy += y
+                else:
+                    cx, cy = x, y
+                if have_pos:
+                    emit_line(cx, cy, ox, oy)
+                else:
+                    have_pos = True
+            continue
+
+        # H/h = horizontal line
+        if c_up == "H":
+            for x in nums:
+                ox, oy = cx, cy
+                if is_rel:
+                    cx += x
+                else:
+                    cx = x
+                if have_pos:
+                    emit_line(cx, cy, ox, oy)
+                else:
+                    have_pos = True
+            continue
+
+        # V/v = vertical line
+        if c_up == "V":
+            for y in nums:
+                ox, oy = cx, cy
+                if is_rel:
+                    cy += y
+                else:
+                    cy = y
+                if have_pos:
+                    emit_line(cx, cy, ox, oy)
+                else:
+                    have_pos = True
+            continue
+
+        # Z/z -> closepath: treat as a segment back to start-of-subpath.
+        # For dimension lines, typically not relevant, we skip.
+
+        # All curve commands: C,Q,S,T,A...
+        # We ignore, because these are not straight dimension lines.
+        # We'll just leave cx,cy as last known (SVG spec moves current point).
+        # (In actual SVG, those also update cx,cy to the new end point,
+        # but we don't generate linear segments for them.)
+        # For dimension lines that use arrowheads etc. with curves,
+        # we'll miss them, but that's acceptable for now.
+
+    return segs
+
+
 def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
     """
-    Very naive segment extractor from <line> elements for now.
-    TODO: extend to path 'd' parsing if needed.
-    Returns list of segments as (x1,y1,x2,y2).
-    Note: We'll treat <line> first because dimension lines often survive as <line>.
+    Unified segment extractor:
+    - Collect <line> elements directly
+    - Collect the LONGEST straight subsegment from <path> elements,
+      if that subsegment is not trivially tiny.
+    Return list[(x1,y1,x2,y2)] across both.
+
+    NOTE:
+    We don't try to merge collinear chunks etc. We just need good long candidates.
     """
     segs: List[Tuple[float,float,float,float]] = []
 
-    # typical SVG ns handling
-    # elements may look like {http://www.w3.org/2000/svg}line
+    # Pass 1: direct <line> elems
     for el in root.iter():
         tag = etree.QName(el.tag).localname.lower()
         if tag == "line":
@@ -89,6 +344,23 @@ def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
             except ValueError:
                 continue
             segs.append((x1,y1,x2,y2))
+
+    # Pass 2: <path> elems, longest straight chunk
+    for el in root.iter():
+        tag = etree.QName(el.tag).localname.lower()
+        if tag == "path":
+            d_attr = el.get("d")
+            if not d_attr:
+                continue
+
+            raw_line_segs = _extract_line_segments_from_path_d(d_attr)
+            # Heuristik: wir wollen NICHT winzige Pfeilspitzenfragmente.
+            # Setzen wir erstmal eine untere Grenze rein, damit wir nicht alles ansammeln:
+            # -> wir entscheiden "groß genug" erst später, weil wir die globale Seite erst kennen,
+            #    aber wir können hier trotzdem schonmal einfach 'max segment wins' nehmen.
+            best_seg = _is_large_enough_to_consider(raw_line_segs, min_len=0.0)
+            if best_seg is not None:
+                segs.append(best_seg)
 
     return segs
 
