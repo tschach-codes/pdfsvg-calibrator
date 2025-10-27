@@ -17,6 +17,7 @@ import yaml
 
 from pprint import pformat
 
+from pdfsvg_calibrator.dimscale_extractor import estimate_dimline_scale
 from pdfsvg_calibrator.pagebox_align import (
     compute_pagebox_alignment,
     confidence_label,
@@ -1066,6 +1067,55 @@ def run(
                 else:
                     rich.print("[yellow]Raster-Fallback nicht verfügbar[/yellow]")
                 # ---- Ende Raster ----
+
+                # ---- Maßlinien-basierte Skalierung (Dimension Lines) ----
+                try:
+                    dimscale_res = estimate_dimline_scale(
+                        svg_path=svg_path,
+                        enable_ocr_paths=False,  # set True if you want OCR-path fallback
+                    )
+                except Exception as e:  # pragma: no cover - diagnostic only
+                    dimscale_res = None
+                    rich.print(f"[yellow]Maßlinien-Scale: Fehler bei Berechnung: {e}[/yellow]")
+
+                if dimscale_res is None:
+                    rich.print("[yellow]Maßlinien-Scale nicht verfügbar[/yellow]")
+                else:
+                    rich.print("[bold green]Maßlinien-Scale (Dimension Lines):[/bold green]")
+                    rich.print(
+                        f"  ok={dimscale_res.ok} reason='{dimscale_res.reason}' "
+                        f"candidates={dimscale_res.candidates_used} "
+                        f"inliers={dimscale_res.inlier_cluster_size}"
+                    )
+                    rich.print(
+                        "  scale_x: "
+                        f"{dimscale_res.scale_x_svg_per_unit} svg/unit  |  "
+                        f"{dimscale_res.scale_x_unit_per_svg} unit/svg"
+                    )
+                    rich.print(
+                        "  scale_y: "
+                        f"{dimscale_res.scale_y_svg_per_unit} svg/unit  |  "
+                        f"{dimscale_res.scale_y_unit_per_svg} unit/svg"
+                    )
+
+                    # Debug-Preview-Crops (horizontal / vertical)
+                    # We save them to outdir for visual QA if available.
+                    # We'll name them dimscale_preview_h.png / dimscale_preview_v.png
+                    try:
+                        if dimscale_res.preview_horizontal is not None:
+                            out_h_path = outdir / "dimscale_preview_h.png"
+                            dimscale_res.preview_horizontal.save(out_h_path)
+                            rich.print(f"  preview_horizontal: {out_h_path}")
+                        if dimscale_res.preview_vertical is not None:
+                            out_v_path = outdir / "dimscale_preview_v.png"
+                            dimscale_res.preview_vertical.save(out_v_path)
+                            rich.print(f"  preview_vertical: {out_v_path}")
+                    except Exception as e:  # pragma: no cover - diagnostic only
+                        rich.print(
+                            f"[yellow]Warnung: konnte Maßlinien-Preview nicht speichern: {e}[/yellow]"
+                        )
+
+                # ---- Ende Maßlinien-Scale ----
 
                 if not svg_segs:
                     raise ValueError("SVG enthält keine Vektoren")
