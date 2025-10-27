@@ -29,6 +29,7 @@ from .raster_align import estimate_raster_alignment
 
 from .config import load_config
 from .calibrate import calibrate
+from .calibrate_pipeline import calibrate_pdf_svg_preprocess
 from .io_svg_pdf import (
     convert_pdf_to_svg_if_needed,
     load_pdf_segments,
@@ -480,6 +481,32 @@ def _ensure_exists(path: Path, description: str) -> None:
         raise FileNotFoundError(f"{description} darf keine Ordner sein: {path}")
 
 
+def _load_pdf_page_bytes(pdf_path: Path, page_index: int) -> bytes:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - dependency issue
+        raise RuntimeError("PyMuPDF (fitz) ist erforderlich, wurde aber nicht gefunden") from exc
+
+    doc = fitz.open(str(pdf_path))
+    try:
+        page_count = doc.page_count
+        if page_index < 0 or page_index >= page_count:
+            max_index = max(page_count - 1, 0)
+            raise ValueError(
+                f"Seitenindex {page_index} außerhalb des gültigen Bereichs (0-{max_index})"
+            )
+        single = fitz.open()
+        try:
+            single.insert_pdf(doc, from_page=page_index, to_page=page_index)
+            pdf_bytes = single.write()
+        finally:
+            single.close()
+    finally:
+        doc.close()
+
+    return bytes(pdf_bytes)
+
+
 def _renumber_matches(matches: Sequence[Match]) -> List[Match]:
     return [replace(match, id=index) for index, match in enumerate(matches, start=1)]
 
@@ -865,6 +892,68 @@ def _handle_known_exception(logger: Logger, exc: Exception, *, prefix: str | Non
 
 
 app = typer.Typer(help="PDF→SVG calibration & verification")
+
+
+@app.command("preprocess")
+def preprocess(
+    pdf: Path = typer.Argument(
+        ..., exists=True, readable=True, resolve_path=True, help="Pfad zur PDF-Datei"
+    ),
+    svg: Path = typer.Option(
+        ..., "--svg", exists=True, readable=True, resolve_path=True, help="Pfad zur SVG-Datei"
+    ),
+    page: int = typer.Option(0, "--page", min=0, help="0-basierter Seitenindex"),
+    config: Path = typer.Option(
+        DEFAULT_CONFIG_PATH,
+        "--config",
+        resolve_path=True,
+        help="Pfad zur YAML-Konfiguration",
+    ),
+) -> None:
+    logger = Logger(verbose=False)
+    try:
+        pdf_bytes = _load_pdf_page_bytes(pdf, page)
+        svg_bytes = svg.read_bytes()
+
+        config_data = load_config(str(config))
+        if config_data is None:
+            config_dict: Dict[str, Any] = {}
+        elif isinstance(config_data, MutableMapping):
+            config_dict = dict(config_data)
+        else:
+            raise ValueError("Config root must be a Mapping")
+
+        result = calibrate_pdf_svg_preprocess(pdf_bytes, svg_bytes, config_dict)
+        if not isinstance(result, Mapping):
+            raise ValueError("Preprocess-Ergebnis hat unerwartetes Format")
+
+        coarse = result.get("coarse_alignment")
+        metric = result.get("metric_scale")
+        coarse_map = coarse if isinstance(coarse, Mapping) else {}
+        metric_map = metric if isinstance(metric, Mapping) else {}
+
+        typer.echo("Coarse alignment:")
+        typer.echo(f"  rotation_deg: {coarse_map.get('rotation_deg')}")
+        typer.echo(f"  flip_horizontal: {coarse_map.get('flip_horizontal')}")
+        typer.echo(f"  tx_px: {coarse_map.get('tx_px')}")
+        typer.echo(f"  ty_px: {coarse_map.get('ty_px')}")
+        typer.echo(f"  sx_seed: {coarse_map.get('sx_seed')}")
+        typer.echo(f"  sy_seed: {coarse_map.get('sy_seed')}")
+        typer.echo(f"  score: {coarse_map.get('score')}")
+
+        pixels_per_meter = metric_map.get("pixels_per_meter")
+        typer.echo("Metric scale:")
+        typer.echo(
+            "  pixels_per_meter: "
+            + ("None" if pixels_per_meter is None else str(pixels_per_meter))
+        )
+        typer.echo(f"  ok: {metric_map.get('ok')}")
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        _handle_known_exception(logger, exc, prefix="Fehler")
+        raise typer.Exit(code=2) from exc
+    except Exception as exc:  # pragma: no cover - fallback path
+        _handle_known_exception(logger, exc, prefix="Unerwarteter Fehler")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("run")
