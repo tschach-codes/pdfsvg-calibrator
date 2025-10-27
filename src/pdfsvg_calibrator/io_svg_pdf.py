@@ -1,20 +1,18 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import math
 import os
 import re
 import xml.etree.ElementTree as ET
-from time import perf_counter
 from typing import List, Optional, Sequence, Tuple
 
 import fitz
 import numpy as np
+import pypdfium2 as pdfium
 
 from .geom import fit_straight_segment
-from .debug.pdf_probe import probe_page
-from .debug.pdf_segments_debug import analyze_segments_basic, debug_print_segments
-from .pdfium_extract import debug_print_summary
 from .types import Segment
 
 
@@ -693,303 +691,64 @@ def _process_commands(
 def load_pdf_segments(
     pdf_path: str, page_index: int, cfg: dict, *, use_pdfium: bool = True
 ) -> Tuple[List[Segment], Tuple[float, float]]:
-    if not use_pdfium:
-        return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+    """Extract PDF segments via raster sampling only."""
 
-    try:
-        import pypdfium2 as pdfium  # type: ignore[import-not-found]
-    except ModuleNotFoundError:
-        log.warning("pypdfium2 nicht gefunden, PyMuPDF-Fallback wird verwendet")
-        return _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
+    # TODO(pdf-extraction-removed):
+    # Früher: PDF-Vektoren wurden über pypdfium2/PyMuPDF extrahiert.
+    # Jetzt:   Wir generieren Segmente ausschließlich aus einem gerenderten Rasterbild.
+    del use_pdfium
 
-    doc = pdfium.PdfDocument(pdf_path)
-    try:
-        if page_index < 0 or page_index >= len(doc):
-            raise ValueError(
-                f"Seite {page_index} existiert nicht (gültig: 0..{len(doc) - 1})."
-            )
-        page = doc[page_index]
-        try:
-            width, height = page.get_size()
-        finally:
-            close_page = getattr(page, "close", None)
-            if callable(close_page):
-                close_page()
-    finally:
-        doc.close()
-
-    width = float(width)
-    height = float(height)
-    diag = math.hypot(width, height) or 1.0
-
-    curve_tol_rel = cfg.get("curve_tol_rel", 0.001)
-    curve_tol = max(float(curve_tol_rel) * diag, 1e-6)
-
-    probe_stats = None
-    try:
-        probe_stats = probe_page(pdf_path, page_index)
-    except Exception:  # pragma: no cover - diagnostic helper
-        pass
-    else:
-        counts = (probe_stats.get("counts") or {}).copy()
-        notes = list(probe_stats.get("notes") or [])
-        forms = int(probe_stats.get("forms", 0) or 0)
-        log.debug(
-            "[pdf] Seite %d: Probe counts=%s, forms=%d, notes=%s",
-            page_index,
-            counts,
-            forms,
-            notes,
-        )
-
-    parse_start = perf_counter()
-    try:
-        from .pdfium_extrac_lowlevel import (
-            extract_segments_pdfium_lowlevel as _extract_segments_pdfium_lowlevel,
-        )
-
-        pdfium_segment_tuples = _extract_segments_pdfium_lowlevel(
-            str(pdf_path), page_index
-        )
-    except Exception as exc:
-        print(f"PDF-Probe vor Extraktion fehlgeschlagen (lowlevel): {exc}")
-        pdfium_segment_tuples = []
-    duration = perf_counter() - parse_start
-
-    print(
-        f"Seite {page_index}: pypdfium2-Segmente extrahiert={len(pdfium_segment_tuples)}"
-    )
-    segment_dicts_for_debug = [
-        {
-            "x1": float(x0),
-            "y1": float(y0),
-            "x2": float(x1),
-            "y2": float(y1),
-        }
-        for x0, y0, x1, y1 in pdfium_segment_tuples
-    ]
-
-    if segment_dicts_for_debug:
-        print("INFO: using PDFium segments (skip PyMuPDF fallback)")
-        segments = [
-            Segment(float(x0), float(y0), float(x1), float(y1))
-            for x0, y0, x1, y1 in pdfium_segment_tuples
-        ]
-    else:
-        needs_raster_fallback = False
-
-        if probe_stats is not None:
-            notes = probe_stats.get("notes") or []
-            for note in notes:
-                if str(note) == "likely_scanned_raster_page":
-                    log.error("Scan-Seite – kein Vektorinhalt")
-                    raise ValueError("Seite enthält nur Rasterbild, keine Vektoren")
-
-            counts = probe_stats.get("counts", {})
-            text_count = int(counts.get("text", 0) or 0)
-            path_count = int(counts.get("path", 0) or 0)
-            form_count = int(probe_stats.get("forms", 0) or 0)
-
-            if form_count > 0:
-                log.error("FORM-Walker defekt – %d FORM-XObjects gefunden", form_count)
-
-            if (
-                text_count >= max(4, counts.get("total", 0) // 2)
-                and path_count == 0
-                and form_count == 0
-            ):
-                needs_raster_fallback = True
-
-        if needs_raster_fallback:
-            log.warning(
-                "PDF enthält überwiegend Textobjekt-Outlines – Raster-Fallback wird verwendet",
-            )
-            return _load_pdf_segments_raster(pdf_path, page_index, cfg, width, height)
-
-        print("WARN: PDFium returned 0 segments, trying PyMuPDF fallback …")
-        segments, (width, height) = _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
-        print(f"PyMuPDF fallback produced {len(segments)} segments")
-        segment_dicts_for_debug = [
-            {
-                "x1": float(seg.x1),
-                "y1": float(seg.y1),
-                "x2": float(seg.x2),
-                "y2": float(seg.y2),
-            }
-            for seg in segments
-        ]
-
-    debug_print_summary("after CTM compose", segment_dicts_for_debug)
-    stats = analyze_segments_basic(segment_dicts_for_debug, angle_tol_deg=2.0)
-    debug_print_segments("PDFium raw", stats, segment_dicts_for_debug)
-
-    if len(segments) == 0:
-        raise RuntimeError("PDF enthält keine vektoriellen Segmente -> Abbruch")
-
+    segments, size = _load_pdf_segments_raster(pdf_path, page_index, cfg)
+    if isinstance(cfg, dict):
+        cfg.setdefault("_pdf_segment_source", "raster")
     log.debug(
-        "[pdf] Seite %d: Größe=(%.2f×%.2f), Diagonale=%.2f, Segmente=%d in %.3fs",
+        "[pdf] Rasterextraktion: Seite %d -> %d Segmente (Größe %.1f×%.1f)",
         page_index,
-        width,
-        height,
-        diag,
         len(segments),
-        duration,
+        size[0],
+        size[1],
     )
-
-    return segments, (width, height)
-
-
-def _load_pdf_segments_pymupdf(
-    pdf_path: str, page_index: int, cfg: dict
-) -> Tuple[List[Segment], Tuple[float, float]]:
-    doc = fitz.open(pdf_path)
-    try:
-        page = doc.load_page(page_index)
-        width = float(page.rect.width)
-        height = float(page.rect.height)
-        diag = math.hypot(width, height) or 1.0
-        parse_start = perf_counter()
-        log.debug(
-            "[pdf] Seite %d: Größe=(%.2f×%.2f), Diagonale=%.2f",
-            page_index,
-            width,
-            height,
-            diag,
-        )
-
-        curve_tol_rel = cfg.get("curve_tol_rel", 0.001)
-        straight_max_dev_rel = cfg.get("straight_max_dev_rel", 0.002)
-        angle_spread_max = cfg.get("straight_max_angle_spread_deg", 4.0)
-
-        curve_tol = max(curve_tol_rel * diag, 1e-6)
-        max_dev = straight_max_dev_rel * diag
-
-        segments: List[Segment] = []
-        drawings = page.get_drawings()
-        log.debug("[pdf] Seite %d: %d drawings geladen", page_index, len(drawings))
-
-        total_subpaths = 0
-        total_items = 0
-        for draw_idx, drawing in enumerate(drawings, start=1):
-            segs_before = len(segments)
-            path = drawing.get("path")
-            if path:
-                total_subpaths += len(path)
-                for subpath in path:
-                    _process_commands(
-                        subpath, segments, curve_tol, max_dev, angle_spread_max
-                    )
-            items = drawing.get("items")
-            if items:
-                total_items += len(items)
-                pseudo_commands: List[Tuple] = []
-                for item in items:
-                    if not item:
-                        continue
-                    op = str(item[0]).lower()
-                    if op in {"m", "l"} and len(item) >= 2:
-                        x, y = item[1]
-                        pseudo_commands.append((op, float(x), float(y)))
-                    elif op == "c" and len(item) >= 4:
-                        p1, p2, p3 = item[1], item[2], item[3]
-                        pseudo_commands.append(
-                            (
-                                "c",
-                                float(p1[0]),
-                                float(p1[1]),
-                                float(p2[0]),
-                                float(p2[1]),
-                                float(p3[0]),
-                                float(p3[1]),
-                            )
-                        )
-                    elif op == "q" and len(item) >= 3:
-                        ctrl, end = item[1], item[2]
-                        pseudo_commands.append(
-                            ("q", float(ctrl[0]), float(ctrl[1]), float(end[0]), float(end[1]))
-                        )
-                    elif op in {"v", "y"} and len(item) >= 3:
-                        c1, c2 = item[1], item[2]
-                        pseudo_commands.append(
-                            (
-                                op,
-                                float(c1[0]),
-                                float(c1[1]),
-                                float(c2[0]),
-                                float(c2[1]),
-                            )
-                        )
-                    elif op == "re" and len(item) >= 2:
-                        rx, ry, rw, rh = item[1]
-                        pseudo_commands.append(
-                            ("re", float(rx), float(ry), float(rw), float(rh))
-                        )
-                    elif op == "h":
-                        pseudo_commands.append(("h",))
-                if pseudo_commands:
-                    _process_commands(
-                        pseudo_commands, segments, curve_tol, max_dev, angle_spread_max
-                    )
-
-            produced = len(segments) - segs_before
-            if produced:
-                log.debug(
-                    "[pdf] Seite %d: drawing #%d erzeugte %d Segmente (path=%d, items=%d)",
-                    page_index,
-                    draw_idx,
-                    produced,
-                    len(path) if path else 0,
-                    len(items) if items else 0,
-                )
-
-        duration = perf_counter() - parse_start
-        log.debug(
-            "[pdf] Seite %d: %d Segmente aus %d drawings (%d Subpfade, %d Items) in %.3fs",
-            page_index,
-            len(segments),
-            len(drawings),
-            total_subpaths,
-            total_items,
-            duration,
-        )
-
-        result = segments, (width, height)
-    finally:
-        doc.close()
-
-    return result
+    return segments, size
 
 
 def _load_pdf_segments_raster(
     pdf_path: str,
     page_index: int,
     cfg: dict,
-    page_width: float,
-    page_height: float,
 ) -> Tuple[List[Segment], Tuple[float, float]]:
     raster_cfg = cfg.get("pdf_raster_fallback", {})
     zoom = float(raster_cfg.get("zoom", 4.0))
     edge_percentile = float(raster_cfg.get("edge_percentile", 97.0))
     edge_min_strength = float(raster_cfg.get("edge_min_strength", 10.0))
-    max_segments = int(raster_cfg.get("max_segments", 200_000))
+    max_segments = int(raster_cfg.get("max_segments", 1_500))
+    min_length_pt = float(raster_cfg.get("min_length_pt", 6.0))
     if zoom <= 0:
         zoom = 4.0
 
-    doc = fitz.open(pdf_path)
+    doc = pdfium.PdfDocument(pdf_path)
     try:
-        page = doc.load_page(page_index)
-        matrix = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY, alpha=False)
+        page = doc.get_page(page_index)
+        try:
+            page_width = float(page.get_width())
+            page_height = float(page.get_height())
+            if page_width <= 0 or page_height <= 0:
+                raise ValueError("PDF-Seite hat ungültige Abmessungen")
+
+            bitmap = page.render(scale=zoom, rotation=0, grayscale=True)
+            try:
+                img = bitmap.to_numpy()
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
     finally:
         doc.close()
 
-    width_px = pix.width
-    height_px = pix.height
+    height_px, width_px = img.shape
     if width_px <= 0 or height_px <= 0:
         return [], (page_width, page_height)
 
-    buf = np.frombuffer(pix.samples, dtype=np.uint8)
-    img = buf.reshape(height_px, width_px).astype(np.float32)
+    img = img.astype(np.float32, copy=False)
     gy, gx = np.gradient(img)
     mag = np.hypot(gx, gy)
 
@@ -1012,28 +771,56 @@ def _load_pdf_segments_raster(
 
     edges = edges.astype(bool, copy=False)
     rows, cols = edges.shape
+
     for r in range(rows):
         row_mask = edges[r]
-        for c in range(cols):
+        c = 0
+        while c < cols:
             if not row_mask[c]:
+                c += 1
                 continue
-            if c + 1 < cols and row_mask[c + 1]:
-                x1, y1 = _pixel_center(c, r)
-                x2, y2 = _pixel_center(c + 1, r)
-                if x1 != x2 or y1 != y2:
-                    segments.append(Segment(x1, y1, x2, y2))
-            if r + 1 < rows and edges[r + 1, c]:
-                x1, y1 = _pixel_center(c, r)
-                x2, y2 = _pixel_center(c, r + 1)
-                if x1 != x2 or y1 != y2:
-                    segments.append(Segment(x1, y1, x2, y2))
+            start = c
+            while c + 1 < cols and row_mask[c + 1]:
+                c += 1
+            x1, y1 = _pixel_center(start, r)
+            x2, y2 = _pixel_center(c, r)
+            if x1 != x2 or y1 != y2:
+                segments.append(Segment(x1, y1, x2, y2))
+            c += 1
+
+    for c in range(cols):
+        col_mask = edges[:, c]
+        r = 0
+        while r < rows:
+            if not col_mask[r]:
+                r += 1
+                continue
+            start = r
+            while r + 1 < rows and col_mask[r + 1]:
+                r += 1
+            x1, y1 = _pixel_center(c, start)
+            x2, y2 = _pixel_center(c, r)
+            if x1 != x2 or y1 != y2:
+                segments.append(Segment(x1, y1, x2, y2))
+            r += 1
+
+    if min_length_pt > 0.0:
+        min_sq = float(min_length_pt) ** 2
+        segments = [
+            seg
+            for seg in segments
+            if (seg.x2 - seg.x1) ** 2 + (seg.y2 - seg.y1) ** 2 >= min_sq
+        ]
 
     if max_segments > 0 and len(segments) > max_segments:
-        step = max(1, len(segments) // max_segments)
-        segments = segments[::step]
+        segments = heapq.nlargest(
+            max_segments,
+            segments,
+            key=lambda seg: (seg.x2 - seg.x1) ** 2 + (seg.y2 - seg.y1) ** 2,
+        )
 
-    log.warning(
-        "Raster-Fallback generierte %d Segmente (Zoom %.1f, Schwelle %.1f)",
+    log.debug(
+        "[pdf] Raster-Fallback generierte %d Segmente (Zoom %.1f, Schwelle %.1f)",
         len(segments),
         zoom,
         thresh,
@@ -1169,46 +956,6 @@ def _viewbox_matrix(node: ET.Element) -> Matrix:
     matrix = _matrix_multiply(matrix, _matrix_scale(scale, scale))
     matrix = _matrix_multiply(matrix, _matrix_translate(-min_x, -min_y))
     return matrix
-
-
-def _pdf_segments_pymupdf(pdf_path: str, page_index: int) -> List[dict]:
-    cfg = {
-        "curve_tol_rel": 0.001,
-        "straight_max_dev_rel": 0.002,
-        "straight_max_angle_spread_deg": 4.0,
-    }
-    segments, _ = _load_pdf_segments_pymupdf(pdf_path, page_index, cfg)
-    return [
-        {
-            "x1": float(seg.x1),
-            "y1": float(seg.y1),
-            "x2": float(seg.x2),
-            "y2": float(seg.y2),
-        }
-        for seg in segments
-    ]
-
-
-def pdf_to_segments(pdf_path: str, page: int, use_pdfium: bool = True) -> List[dict]:
-    if use_pdfium:
-        from .pdfium_extrac_lowlevel import (
-            extract_segments_pdfium_lowlevel as _extract_segments_pdfium_lowlevel,
-        )
-
-        tuples = _extract_segments_pdfium_lowlevel(pdf_path, page_index=page)
-        segs = [
-            {
-                "x1": float(x0),
-                "y1": float(y0),
-                "x2": float(x1),
-                "y2": float(y1),
-            }
-            for x0, y0, x1, y1 in tuples
-        ]
-        return sanitize_segments(segs)
-
-    segs = _pdf_segments_pymupdf(pdf_path, page)
-    return sanitize_segments(segs)
 
 
 def sanitize_segments(segments) -> List[dict]:

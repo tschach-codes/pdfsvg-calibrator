@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import io
 
 import numpy as np
-import fitz  # PyMuPDF
+import pypdfium2 as pdfium
 import cairosvg
 from PIL import Image
 
@@ -27,18 +27,26 @@ class RasterAlignmentResult:
 def _render_pdf_gray(pdf_path: str, page_index: int, max_dim: int = 2048) -> np.ndarray:
     """Render PDF page to grayscale array with side length limited to ``max_dim``."""
 
-    doc = fitz.open(pdf_path)
+    doc = pdfium.PdfDocument(pdf_path)
     try:
-        page = doc[page_index]
-        rect = page.rect
-        longer_pt = max(rect.width, rect.height, 1e-9)
-        zoom = max_dim / longer_pt
-        matrix = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=matrix, colorspace=fitz.csGRAY)
-        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        return image.astype(np.float32) / 255.0
+        page = doc.get_page(page_index)
+        try:
+            width_pt = float(page.get_width())
+            height_pt = float(page.get_height())
+            longer_pt = max(width_pt, height_pt, 1e-9)
+            scale = max_dim / longer_pt
+            bitmap = page.render(scale=scale, rotation=0, grayscale=True)
+            try:
+                array = bitmap.to_numpy()
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
     finally:
         doc.close()
+
+    image = np.asarray(array, dtype=np.float32)
+    return image / 255.0
 
 
 def _render_svg_gray(
