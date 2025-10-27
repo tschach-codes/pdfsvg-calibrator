@@ -2,19 +2,18 @@ from __future__ import annotations
 
 """Raster-based coarse alignment helpers built on existing orientation logic."""
 
-import io
 import math
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
-import cairosvg
 import numpy as np
 import pypdfium2 as pdfium
 from PIL import Image
 
 from .orientation import phase_correlation
+from .rendering import render_pdf_page_to_bitmap, render_svg_to_bitmap
 
 
 @dataclass
@@ -24,6 +23,22 @@ class RenderedPage:
     image: np.ndarray
     width_pt: float
     height_pt: float
+
+
+def _get_pdf_page_dimensions(pdf_page_bytes: bytes, page_index: int = 0) -> Tuple[float, float]:
+    """Return width/height of a PDF page in points."""
+
+    doc = pdfium.PdfDocument(memoryview(pdf_page_bytes))
+    try:
+        page = doc.get_page(page_index)
+        try:
+            width_pt = float(page.get_width())
+            height_pt = float(page.get_height())
+        finally:
+            page.close()
+    finally:
+        doc.close()
+    return width_pt, height_pt
 
 
 def _parse_length(value: str | None) -> float | None:
@@ -77,71 +92,6 @@ def _parse_svg_metadata(svg_bytes: bytes) -> Dict[str, float]:
         meta["height"] = meta["viewbox_height"]
 
     return meta
-
-
-def render_pdf_page_to_bitmap(
-    pdf_page_bytes: bytes,
-    *,
-    page_index: int = 0,
-    raster_size: int = 512,
-) -> RenderedPage:
-    """Render a PDF page to a normalized grayscale bitmap limited by ``raster_size``."""
-
-    if raster_size <= 0:
-        raster_size = 512
-
-    doc = pdfium.PdfDocument(memoryview(pdf_page_bytes))
-    try:
-        page = doc.get_page(page_index)
-        try:
-            width_pt = float(page.get_width())
-            height_pt = float(page.get_height())
-            max_side = max(width_pt, height_pt, 1e-6)
-            scale = raster_size / max_side if raster_size else 1.0
-            scale = max(scale, 1e-3)
-            bitmap = page.render(scale=scale, rotation=0, grayscale=True)
-            try:
-                array = bitmap.to_numpy()
-            finally:
-                bitmap.close()
-        finally:
-            page.close()
-    finally:
-        doc.close()
-
-    if array.ndim == 3:
-        array = array[..., 0]
-    image = np.asarray(array, dtype=np.float32)
-    if image.max(initial=0.0) > 0:
-        image /= 255.0
-    return RenderedPage(image=image, width_pt=width_pt, height_pt=height_pt)
-
-
-def render_svg_to_bitmap(svg_bytes: bytes, target_size: Tuple[int, int]) -> np.ndarray:
-    """Render an SVG snippet to a grayscale bitmap with white background."""
-
-    width_px, height_px = target_size
-    width_px = max(int(width_px), 1)
-    height_px = max(int(height_px), 1)
-
-    png_bytes = cairosvg.svg2png(
-        bytestring=svg_bytes,
-        output_width=width_px,
-        output_height=height_px,
-        background_color="white",
-    )
-    with Image.open(io.BytesIO(png_bytes)) as image:
-        if image.mode in ("RGBA", "LA"):
-            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-            background.paste(image, mask=image.split()[-1])
-            image = background.convert("L")
-        else:
-            image = image.convert("L")
-        arr = np.asarray(image, dtype=np.float32)
-
-    if arr.max(initial=0.0) > 0:
-        arr /= 255.0
-    return arr
 
 
 def _resize_like(image: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
@@ -215,11 +165,13 @@ def coarse_raster_align(
         orientation_cfg = {}
 
     raster_size = int(orientation_cfg.get("raster_size", 512))
-    rendered_pdf = render_pdf_page_to_bitmap(pdf_page_bytes, raster_size=raster_size)
+    pdf_image = render_pdf_page_to_bitmap(pdf_page_bytes, raster_size=raster_size)
+    pdf_width_pt, pdf_height_pt = _get_pdf_page_dimensions(pdf_page_bytes)
+    rendered_pdf = RenderedPage(image=pdf_image, width_pt=pdf_width_pt, height_pt=pdf_height_pt)
     pdf_raster = rendered_pdf.image
     pdf_shape = pdf_raster.shape
 
-    svg_raster_base = render_svg_to_bitmap(svg_bytes, (pdf_shape[1], pdf_shape[0]))
+    svg_raster_base = render_svg_to_bitmap(svg_bytes, raster_size=raster_size)
     svg_meta = _parse_svg_metadata(svg_bytes)
 
     pdf_w_pt = rendered_pdf.width_pt or 1.0
