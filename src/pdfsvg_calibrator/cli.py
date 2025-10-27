@@ -17,6 +17,12 @@ import yaml
 
 from pprint import pformat
 
+from pdfsvg_calibrator.pagebox_align import (
+    compute_pagebox_alignment,
+    confidence_label,
+    explain_alignment_reason,
+)
+
 from .config import load_config
 from .calibrate import calibrate
 from .io_svg_pdf import (
@@ -988,6 +994,40 @@ def run(
                 with logger.status("SVG analysieren"):
                     svg_segs, svg_size = load_svg_segments(str(svg_path), cfg)
                 logger.debug(f"SVG-Segmente: {len(svg_segs)} (Größe {svg_size})")
+
+                try:
+                    pagebox_align = compute_pagebox_alignment(
+                        pdf_path=str(pdf),
+                        page_index=page,
+                        svg_path=str(svg_path),
+                    )
+                except Exception as exc:
+                    pagebox_align = None
+                    logger.warn(f"PageBox-Alignment: Fehler bei Berechnung: {exc}")
+
+                if pagebox_align is not None:
+                    logger.info("PageBox/ViewBox-Heuristik:")
+                    logger.info(
+                        f"  pdf_size={pagebox_align.pdf_size} "
+                        f"svg_size={pagebox_align.svg_size}"
+                    )
+                    logger.info(
+                        f"  rotation_deg={pagebox_align.rotation_deg:.1f} "
+                        f"flip_x={pagebox_align.flip_x} "
+                        f"flip_y={pagebox_align.flip_y}"
+                    )
+                    logger.info(
+                        f"  scale_x={pagebox_align.scale_x:.6f} "
+                        f"scale_y={pagebox_align.scale_y:.6f}"
+                    )
+                    logger.info(
+                        f"  confidence={confidence_label(pagebox_align)} "
+                        f"reason='{explain_alignment_reason(pagebox_align)}'"
+                    )
+                else:
+                    logger.warn(
+                        "PageBox/ViewBox-Heuristik nicht verfügbar (keine viewBox gefunden)"
+                    )
 
                 if not svg_segs:
                     raise ValueError("SVG enthält keine Vektoren")
