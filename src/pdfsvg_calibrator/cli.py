@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import importlib.util
 import logging
+import shutil
 import math
+import os
 import tempfile
 import sys
 import textwrap
@@ -361,6 +363,100 @@ def _parse_allow_flips(value: str) -> List[str]:
     return result
 
 
+def _adapt_config_for_raster(cfg: MutableMapping[str, object]) -> None:
+    """Limit expensive refinement loops when PDF segments come from raster edges."""
+
+    refine_cfg = cfg.setdefault("refine", {})
+    if isinstance(refine_cfg, MutableMapping):
+        try:
+            max_iters = int(refine_cfg.get("max_iters", 60))
+        except (TypeError, ValueError):
+            max_iters = 60
+        refine_cfg["max_iters"] = min(max_iters, 2)
+
+        try:
+            max_samples = int(refine_cfg.get("max_samples", 1500))
+        except (TypeError, ValueError):
+            max_samples = 1500
+        refine_cfg["max_samples"] = min(max_samples, 80)
+
+    ransac_cfg = cfg.setdefault("ransac", {})
+    if isinstance(ransac_cfg, MutableMapping):
+        try:
+            iters = int(ransac_cfg.get("iters", 60))
+        except (TypeError, ValueError):
+            iters = 60
+        ransac_cfg["iters"] = min(iters, 3)
+
+    coarse_cfg = cfg.setdefault("coarse", {})
+    if isinstance(coarse_cfg, MutableMapping):
+        coarse_cfg.setdefault("enabled", False)
+        try:
+            bins = int(coarse_cfg.get("bins", 1024))
+        except (TypeError, ValueError):
+            bins = 1024
+        coarse_cfg["bins"] = min(bins, 256)
+
+        try:
+            topk_rel = float(coarse_cfg.get("topk_rel_by_length", 0.1))
+        except (TypeError, ValueError):
+            topk_rel = 0.1
+        coarse_cfg["topk_rel_by_length"] = min(topk_rel, 0.05)
+
+        heatmap_cfg = coarse_cfg.setdefault("heatmap", {})
+        if isinstance(heatmap_cfg, MutableMapping):
+            try:
+                raster = int(heatmap_cfg.get("raster", 1024))
+            except (TypeError, ValueError):
+                raster = 1024
+            heatmap_cfg["raster"] = min(raster, 256)
+        try:
+            bins = int(coarse_cfg.get("bins", 1024))
+        except (TypeError, ValueError):
+            bins = 1024
+        coarse_cfg["bins"] = min(bins, 256)
+
+        try:
+            topk_rel = float(coarse_cfg.get("topk_rel_by_length", 0.1))
+        except (TypeError, ValueError):
+            topk_rel = 0.1
+        coarse_cfg["topk_rel_by_length"] = min(topk_rel, 0.05)
+
+        heatmap_cfg = coarse_cfg.setdefault("heatmap", {})
+        if isinstance(heatmap_cfg, MutableMapping):
+            try:
+                raster = int(heatmap_cfg.get("raster", 1024))
+            except (TypeError, ValueError):
+                raster = 1024
+            heatmap_cfg["raster"] = min(raster, 256)
+
+    sampling_cfg = cfg.setdefault("sampling", {})
+    if isinstance(sampling_cfg, MutableMapping):
+        try:
+            max_points = int(sampling_cfg.get("max_points", 1500))
+        except (TypeError, ValueError):
+            max_points = 1500
+        sampling_cfg["max_points"] = min(max_points, 200)
+
+        try:
+            step_rel = float(sampling_cfg.get("step_rel", 0.03))
+        except (TypeError, ValueError):
+            step_rel = 0.03
+        sampling_cfg["step_rel"] = max(step_rel, 0.08)
+
+    neighbors_cfg = cfg.setdefault("neighbors", {})
+    if isinstance(neighbors_cfg, MutableMapping):
+        neighbors_cfg["use"] = False
+
+    verify_cfg = cfg.setdefault("verify", {})
+    if isinstance(verify_cfg, MutableMapping):
+        try:
+            pick_k = int(verify_cfg.get("pick_k", 5))
+        except (TypeError, ValueError):
+            pick_k = 5
+        verify_cfg["pick_k"] = min(pick_k, 1)
+
+
 def _load_config_with_defaults(path: Path, rng_seed: Optional[int]) -> Dict[str, Any]:
     raw_cfg: Dict[str, Any] = {}
     loaded = load_config(str(path))
@@ -594,10 +690,37 @@ def _write_coarse_segments_temp(segments: Sequence[Segment]) -> Path:
     return Path(tmp.name)
 
 
+def _write_placeholder_overlays(
+    pdf_path: Path, svg_path: Path, outdir: Path, page_index: int
+) -> Mapping[str, Path]:
+    outdir.mkdir(parents=True, exist_ok=True)
+    base = os.path.splitext(os.path.basename(pdf_path))
+    base_name = base[0]
+    overlay_svg = outdir / f"{base_name}_p{page_index:03d}_overlay_lines.svg"
+    overlay_pdf = outdir / f"{base_name}_p{page_index:03d}_overlay_lines.pdf"
+    report_csv = outdir / f"{base_name}_p{page_index:03d}_check.csv"
+
+    overlay_svg.write_text(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><!-- coarse-only placeholder --></svg>\n",
+        encoding="utf-8",
+    )
+    try:
+        shutil.copyfile(pdf_path, overlay_pdf)
+    except Exception:
+        overlay_pdf.write_text("coarse-only placeholder", encoding="utf-8")
+    report_csv.write_text("line,status,notes\n", encoding="utf-8")
+    return {"SVG": overlay_svg, "PDF": overlay_pdf, "CSV": report_csv}
+
+
 def _report_coarse_only(
     logger: Logger,
     model: Model,
     coarse_info: Mapping[str, Any],
+    *,
+    pdf_path: Path,
+    svg_path: Path,
+    outdir: Path,
+    page_index: int,
 ) -> None:
     rot_norm = int(model.rot_deg) % 360
     flip_desc = f"(x={model.flip_x:+.0f}, y={model.flip_y:+.0f})"
@@ -634,6 +757,11 @@ def _report_coarse_only(
         logger.info(f"Transformierte SVG-Segmente gespeichert: {temp_path}")
     else:
         logger.warn("Keine transformierten Segmente für Ausgabe erhalten.")
+
+    placeholder_outputs = _write_placeholder_overlays(pdf_path, svg_path, outdir, page_index)
+    logger.info("Outputs:")
+    for label, path in placeholder_outputs.items():
+        logger.info(f"  - {label}: {path}")
 
 
 def _summarize(
@@ -746,7 +874,7 @@ def run(
     no_pdfium: bool = typer.Option(
         False,
         "--no-pdfium",
-        help="PDF-Parsing ohne pypdfium2 erzwingen (PyMuPDF-Fallback verwenden)",
+        help="Legacy-Flag ohne Wirkung (Vektorextraktion entfernt)",
     ),
     config: Path = typer.Option(
         DEFAULT_CONFIG_PATH,
@@ -990,6 +1118,10 @@ def run(
                         ):
                             raise ValueError("SVG enthält keine Vektoren") from exc
                         raise
+                if isinstance(cfg, MutableMapping) and cfg.get("_pdf_segment_source") == "raster":
+                    _adapt_config_for_raster(cfg)
+                    if not coarse_only:
+                        coarse_only = True
                 logger.debug(
                     f"PDF-Segmente: {len(pdf_segs)} (Seite {page}, Größe {pdf_size})"
                 )
@@ -1139,7 +1271,15 @@ def run(
                     )
 
                 if coarse_only:
-                    _report_coarse_only(logger, model, coarse_outputs)
+                    _report_coarse_only(
+                        logger,
+                        model,
+                        coarse_outputs,
+                        pdf_path=pdf,
+                        svg_path=svg_path,
+                        outdir=outdir,
+                        page_index=page,
+                    )
                 else:
                     alignment = _alignment_diagnostics(model, svg_size, cfg)
 

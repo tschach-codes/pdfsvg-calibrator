@@ -236,4 +236,4 @@ def test_cli_ransac_failure(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     combined = result.stdout + result.stderr
-    assert "PDF enthält keine vektoriellen Segmente" in combined
+    assert "Keine PDF-Segmente" in combined
