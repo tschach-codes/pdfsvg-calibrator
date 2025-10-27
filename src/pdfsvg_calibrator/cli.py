@@ -22,6 +22,7 @@ from pdfsvg_calibrator.pagebox_align import (
     confidence_label,
     explain_alignment_reason,
 )
+from .raster_align import estimate_raster_alignment
 
 from .config import load_config
 from .calibrate import calibrate
@@ -44,11 +45,19 @@ if _RICH_AVAILABLE:
     from rich.panel import Panel
     from rich.table import Table
     from rich.theme import Theme
+    import rich  # type: ignore[import-not-found]
 else:  # pragma: no cover - executed only when Rich is missing
     Console = None  # type: ignore[assignment]
     Panel = None  # type: ignore[assignment]
     Table = None  # type: ignore[assignment]
     Theme = None  # type: ignore[assignment]
+
+    class _RichStub:
+        @staticmethod
+        def print(*objects: object, **kwargs: object) -> None:
+            print(*objects, **kwargs)
+
+    rich = _RichStub()  # type: ignore[assignment]
 
 
 log = logging.getLogger(__name__)
@@ -1028,6 +1037,35 @@ def run(
                     logger.warn(
                         "PageBox/ViewBox-Heuristik nicht verfügbar (keine viewBox gefunden)"
                     )
+
+                # ---- Rasterbasierter Fallback (PDF vs SVG als Bitmap) ----
+                try:
+                    rast_align = estimate_raster_alignment(
+                        pdf_path=str(pdf),
+                        page_index=page,
+                        svg_path=str(svg_path),
+                    )
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    rast_align = None
+                    rich.print(
+                        f"[yellow]Raster-Fallback: Fehler bei Berechnung: {exc}[/yellow]"
+                    )
+
+                if rast_align is not None:
+                    rich.print("[bold magenta]Raster-Korrelation (PDF↔SVG-Bitmap):[/bold magenta]")
+                    rich.print(
+                        f"  rotation_deg={rast_align.rotation_deg:.1f} "
+                        f"flip_y={rast_align.flip_y} "
+                        f"scale≈{rast_align.scale:.4f}"
+                    )
+                    rich.print(
+                        f"  shift_xy(px)={rast_align.shift_xy} "
+                        f"score={rast_align.score:.4f} "
+                        f"confidence={rast_align.confidence}"
+                    )
+                else:
+                    rich.print("[yellow]Raster-Fallback nicht verfügbar[/yellow]")
+                # ---- Ende Raster ----
 
                 if not svg_segs:
                     raise ValueError("SVG enthält keine Vektoren")
