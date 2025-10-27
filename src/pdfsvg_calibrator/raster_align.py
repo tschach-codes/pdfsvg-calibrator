@@ -1,40 +1,104 @@
 from __future__ import annotations
 
-"""Raster-based alignment fallback between PDF pages and SVG renderings."""
+"""Raster-based coarse alignment helpers built on existing orientation logic."""
 
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
 import io
+import math
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Mapping, Sequence, Tuple
+from xml.etree import ElementTree as ET
 
+import cairosvg
 import numpy as np
 import pypdfium2 as pdfium
-import cairosvg
 from PIL import Image
+
+from .orientation import phase_correlation
 
 
 @dataclass
-class RasterAlignmentResult:
-    """Result of raster-based alignment estimation."""
+class RenderedPage:
+    """Container holding a rendered PDF page raster and its dimensions."""
 
-    rotation_deg: float
-    flip_y: bool
-    scale: float
-    shift_xy: Tuple[float, float]
-    score: float
-    confidence: str
+    image: np.ndarray
+    width_pt: float
+    height_pt: float
 
 
-def _render_pdf_gray(pdf_path: str, page_index: int, max_dim: int = 2048) -> np.ndarray:
-    """Render PDF page to grayscale array with side length limited to ``max_dim``."""
+def _parse_length(value: str | None) -> float | None:
+    """Parse an SVG length attribute (ignoring units if present)."""
 
-    doc = pdfium.PdfDocument(pdf_path)
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    match = re.match(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_svg_metadata(svg_bytes: bytes) -> Dict[str, float]:
+    """Extract basic size metadata from an SVG snippet."""
+
+    meta: Dict[str, float] = {}
+    try:
+        root = ET.fromstring(svg_bytes)
+    except ET.ParseError:
+        return meta
+
+    view_box = root.get("viewBox")
+    if view_box:
+        parts = re.split(r"[,\s]+", view_box.strip())
+        if len(parts) == 4:
+            try:
+                meta["viewbox_min_x"] = float(parts[0])
+                meta["viewbox_min_y"] = float(parts[1])
+                meta["viewbox_width"] = float(parts[2])
+                meta["viewbox_height"] = float(parts[3])
+            except ValueError:
+                pass
+
+    width = _parse_length(root.get("width"))
+    height = _parse_length(root.get("height"))
+    if width is not None:
+        meta.setdefault("width", width)
+    if height is not None:
+        meta.setdefault("height", height)
+
+    if "viewbox_width" in meta and "width" not in meta:
+        meta["width"] = meta["viewbox_width"]
+    if "viewbox_height" in meta and "height" not in meta:
+        meta["height"] = meta["viewbox_height"]
+
+    return meta
+
+
+def render_pdf_page_to_bitmap(
+    pdf_page_bytes: bytes,
+    *,
+    page_index: int = 0,
+    raster_size: int = 512,
+) -> RenderedPage:
+    """Render a PDF page to a normalized grayscale bitmap limited by ``raster_size``."""
+
+    if raster_size <= 0:
+        raster_size = 512
+
+    doc = pdfium.PdfDocument(memoryview(pdf_page_bytes))
     try:
         page = doc.get_page(page_index)
         try:
             width_pt = float(page.get_width())
             height_pt = float(page.get_height())
-            longer_pt = max(width_pt, height_pt, 1e-9)
-            scale = max_dim / longer_pt
+            max_side = max(width_pt, height_pt, 1e-6)
+            scale = raster_size / max_side if raster_size else 1.0
+            scale = max(scale, 1e-3)
             bitmap = page.render(scale=scale, rotation=0, grayscale=True)
             try:
                 array = bitmap.to_numpy()
@@ -45,128 +109,186 @@ def _render_pdf_gray(pdf_path: str, page_index: int, max_dim: int = 2048) -> np.
     finally:
         doc.close()
 
+    if array.ndim == 3:
+        array = array[..., 0]
     image = np.asarray(array, dtype=np.float32)
-    return image / 255.0
+    if image.max(initial=0.0) > 0:
+        image /= 255.0
+    return RenderedPage(image=image, width_pt=width_pt, height_pt=height_pt)
 
 
-def _render_svg_gray(
-    svg_path: str,
-    rotation_deg: float,
-    flip_y: bool,
-    scale: float,
-    target_wh: Tuple[int, int],
-) -> np.ndarray:
-    """Rasterise the SVG and apply transformations to match the PDF raster."""
+def render_svg_to_bitmap(svg_bytes: bytes, target_size: Tuple[int, int]) -> np.ndarray:
+    """Render an SVG snippet to a grayscale bitmap with white background."""
 
-    target_w, target_h = target_wh
-    out_w = max(int(scale * target_w), 1)
-    out_h = max(int(scale * target_h), 1)
+    width_px, height_px = target_size
+    width_px = max(int(width_px), 1)
+    height_px = max(int(height_px), 1)
 
     png_bytes = cairosvg.svg2png(
-        url=svg_path,
-        output_width=out_w,
-        output_height=out_h,
+        bytestring=svg_bytes,
+        output_width=width_px,
+        output_height=height_px,
         background_color="white",
     )
-    image = Image.open(io.BytesIO(png_bytes)).convert("L")
-    array = np.array(image, dtype=np.float32) / 255.0
+    with Image.open(io.BytesIO(png_bytes)) as image:
+        if image.mode in ("RGBA", "LA"):
+            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+            background.paste(image, mask=image.split()[-1])
+            image = background.convert("L")
+        else:
+            image = image.convert("L")
+        arr = np.asarray(image, dtype=np.float32)
 
-    if flip_y:
-        array = np.flipud(array)
-
-    rotation = int(rotation_deg) % 360
-    if rotation == 90:
-        array = np.rot90(array, k=1)
-    elif rotation == 180:
-        array = np.rot90(array, k=2)
-    elif rotation == 270:
-        array = np.rot90(array, k=3)
-
-    pil_image = Image.fromarray((array * 255).astype(np.uint8), mode="L")
-    pil_image = pil_image.resize((target_w, target_h), Image.BILINEAR)
-    return np.array(pil_image, dtype=np.float32) / 255.0
+    if arr.max(initial=0.0) > 0:
+        arr /= 255.0
+    return arr
 
 
-def _phase_correlation(a: np.ndarray, b: np.ndarray) -> Tuple[Tuple[float, float], float]:
-    """Compute phase correlation shift and correlation score between two images."""
-
-    a_fft = np.fft.fft2(a - a.mean())
-    b_fft = np.fft.fft2(b - b.mean())
-    cross_power = a_fft * np.conj(b_fft)
-    cross_power /= np.abs(cross_power) + 1e-9
-    response = np.fft.ifft2(cross_power)
-    response = np.abs(response)
-
-    max_pos = np.unravel_index(np.argmax(response), response.shape)
-    peak_value = response[max_pos]
-
-    height, width = a.shape
-    peak_y, peak_x = max_pos
-    if peak_y > height // 2:
-        peak_y -= height
-    if peak_x > width // 2:
-        peak_x -= width
-
-    return (float(peak_y), float(peak_x)), float(peak_value)
+def _resize_like(image: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+    if image.shape == target_shape:
+        return image.astype(np.float32, copy=False)
+    target_w = int(target_shape[1])
+    target_h = int(target_shape[0])
+    with Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8)) as pil_img:
+        resized = pil_img.resize((target_w, target_h), Image.BILINEAR)
+        arr = np.asarray(resized, dtype=np.float32)
+    if arr.max(initial=0.0) > 0:
+        arr /= 255.0
+    return arr
 
 
-def estimate_raster_alignment(
-    pdf_path: str,
-    page_index: int,
-    svg_path: str,
-    scales: Optional[List[float]] = None,
-    rotations: Optional[List[float]] = None,
-    flips_y: Optional[List[bool]] = None,
-    max_dim: int = 2048,
-) -> Optional[RasterAlignmentResult]:
-    """Estimate alignment parameters by raster correlation over candidate transforms."""
+def _transform_candidate(
+    base: np.ndarray,
+    rotation_deg: float,
+    flip_horizontal: bool,
+    target_shape: Tuple[int, int],
+) -> np.ndarray:
+    arr = base
+    if flip_horizontal:
+        arr = np.fliplr(arr)
 
-    if scales is None:
-        scales = [0.5, 0.66, 0.75, 1.0, 1.5, 2.0]
-    if rotations is None:
-        rotations = [0.0, 90.0, 180.0, 270.0]
-    if flips_y is None:
-        flips_y = [False, True]
+    rot_norm = rotation_deg % 360.0
+    rot_rounded = round(rot_norm / 90.0) * 90.0
+    if abs(rot_norm - rot_rounded) <= 1e-3:
+        k = int((rot_rounded % 360) / 90) % 4
+        if k:
+            arr = np.rot90(arr, k=k)
+        arr = arr.astype(np.float32, copy=False)
+    else:
+        with Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8)) as pil_img:
+            rotated = pil_img.rotate(-rotation_deg, resample=Image.BILINEAR, expand=False)
+            arr = np.asarray(rotated, dtype=np.float32)
+            if arr.max(initial=0.0) > 0:
+                arr /= 255.0
 
-    pdf_img = _render_pdf_gray(pdf_path, page_index, max_dim=max_dim)
-    height, width = pdf_img.shape
-    target_wh = (width, height)
+    return _resize_like(arr, target_shape)
 
-    best_candidate = None
 
-    for rotation_deg in rotations:
-        for flip_y in flips_y:
-            for scale in scales:
-                try:
-                    svg_img = _render_svg_gray(
-                        svg_path,
-                        rotation_deg=rotation_deg,
-                        flip_y=flip_y,
-                        scale=scale,
-                        target_wh=target_wh,
-                    )
-                except Exception:
-                    continue
+def _candidate_score(svg_raster: np.ndarray, pdf_raster: np.ndarray) -> Tuple[float, float, float]:
+    if svg_raster.size == 0 or pdf_raster.size == 0:
+        return 0.0, 0.0, 0.0
+    du, dv, response = phase_correlation(svg_raster, pdf_raster)
+    if not math.isfinite(response):
+        response = 0.0
+    return float(du), float(dv), float(response)
 
-                (shift_y, shift_x), score = _phase_correlation(pdf_img, svg_img)
-                candidate = {
-                    "rotation_deg": rotation_deg,
-                    "flip_y": flip_y,
-                    "scale": scale,
-                    "shift_xy": (shift_x, shift_y),
-                    "score": score,
-                }
-                if best_candidate is None or candidate["score"] > best_candidate["score"]:
-                    best_candidate = candidate
 
-    if best_candidate is None:
-        return None
+def coarse_raster_align(
+    pdf_page_bytes: bytes,
+    svg_bytes: bytes,
+    config: Mapping[str, object],
+) -> Dict[str, object]:
+    """
+    Execute the coarse raster orientation pipeline using rendered PDF/SVG rasters:
+      - renders PDF page 0 via :mod:`pypdfium2` into a low-resolution bitmap,
+      - renders the SVG into the same raster canvas via :mod:`cairosvg`,
+      - tests rotation and flip hypotheses from ``config['rot_degrees']`` and orientation cfg,
+      - uses FFT-based phase correlation to estimate tx/ty seeds,
+      - derives scale seeds from PDF page size vs. SVG viewBox dimensions.
+    """
 
-    return RasterAlignmentResult(
-        rotation_deg=float(best_candidate["rotation_deg"]),
-        flip_y=bool(best_candidate["flip_y"]),
-        scale=float(best_candidate["scale"]),
-        shift_xy=(float(best_candidate["shift_xy"][0]), float(best_candidate["shift_xy"][1])),
-        score=float(best_candidate["score"]),
-        confidence="medium",
-    )
+    orientation_cfg: Mapping[str, object]
+    orientation_raw = config.get("orientation") if isinstance(config, Mapping) else None
+    if isinstance(orientation_raw, Mapping):
+        orientation_cfg = orientation_raw
+    else:
+        orientation_cfg = {}
+
+    raster_size = int(orientation_cfg.get("raster_size", 512))
+    rendered_pdf = render_pdf_page_to_bitmap(pdf_page_bytes, raster_size=raster_size)
+    pdf_raster = rendered_pdf.image
+    pdf_shape = pdf_raster.shape
+
+    svg_raster_base = render_svg_to_bitmap(svg_bytes, (pdf_shape[1], pdf_shape[0]))
+    svg_meta = _parse_svg_metadata(svg_bytes)
+
+    pdf_w_pt = rendered_pdf.width_pt or 1.0
+    pdf_h_pt = rendered_pdf.height_pt or 1.0
+    svg_w = svg_meta.get("viewbox_width") or svg_meta.get("width") or pdf_w_pt
+    svg_h = svg_meta.get("viewbox_height") or svg_meta.get("height") or pdf_h_pt
+    sx_seed = float(pdf_w_pt / svg_w) if svg_w else 1.0
+    sy_seed = float(pdf_h_pt / svg_h) if svg_h else 1.0
+
+    rot_candidates_raw = config.get("rot_degrees") if isinstance(config, Mapping) else None
+    if not rot_candidates_raw:
+        rot_candidates = [0.0, 180.0]
+    else:
+        rot_candidates = [float(r) for r in rot_candidates_raw]  # type: ignore[not-an-iterable]
+
+    flip_candidates_raw = orientation_cfg.get("flip_horizontal_candidates")
+    if isinstance(flip_candidates_raw, Sequence):
+        flip_candidates = [bool(x) for x in flip_candidates_raw]
+    else:
+        flip_candidates = [False, True]
+
+    target_shape = pdf_raster.shape
+    candidates: List[Dict[str, object]] = []
+    best: Dict[str, object] | None = None
+
+    for rot in rot_candidates:
+        for flip in flip_candidates:
+            svg_candidate = _transform_candidate(svg_raster_base, rot, flip, target_shape)
+            tx_px, ty_px, score = _candidate_score(svg_candidate, pdf_raster)
+            print(
+                f"[coarse_raster_align] rot={rot:.1f} flip={'H' if flip else 'none'} tx={tx_px:.2f} ty={ty_px:.2f} score={score:.6f}"
+            )
+            candidate_info = {
+                "rotation_deg": float(rot),
+                "flip_horizontal": bool(flip),
+                "tx_px": float(tx_px),
+                "ty_px": float(ty_px),
+                "score": float(score),
+            }
+            candidates.append(candidate_info)
+            if best is None or candidate_info["score"] > best["score"]:  # type: ignore[index]
+                best = candidate_info
+
+    if best is None:
+        best = {
+            "rotation_deg": 0.0,
+            "flip_horizontal": False,
+            "tx_px": 0.0,
+            "ty_px": 0.0,
+            "score": 0.0,
+        }
+
+    debug_info = {
+        "pdf_shape": (int(pdf_shape[0]), int(pdf_shape[1])),
+        "svg_shape": (int(svg_raster_base.shape[0]), int(svg_raster_base.shape[1])),
+        "pdf_size_pt": (float(pdf_w_pt), float(pdf_h_pt)),
+        "svg_meta": svg_meta,
+        "raster_size": raster_size,
+        "candidates": candidates,
+    }
+
+    result = {
+        "rotation_deg": float(best["rotation_deg"]),
+        "flip_horizontal": bool(best["flip_horizontal"]),
+        "tx_px": float(best["tx_px"]),
+        "ty_px": float(best["ty_px"]),
+        "sx_seed": float(sx_seed),
+        "sy_seed": float(sy_seed),
+        "score": float(best["score"]),
+        "debug": debug_info,
+    }
+    return result
