@@ -9,10 +9,17 @@ from typing import Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
 import numpy as np
 
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None
+
 from .core.grid_safety import ensure_ndarray2d, zeros2d
 
 from .types import Segment
 from .utils.timer import timer
+
+from .rendering import pad_to_same_canvas
 
 
 try:  # pragma: no cover - optional dependency
@@ -483,3 +490,158 @@ def pick_flip_rot_and_shift(
     )
     return best
 
+
+
+def _normalize_rotations(values: Sequence[float] | None) -> List[int]:
+    rotations: List[int] = []
+    if values:
+        for value in values:
+            if not isinstance(value, (int, float)):
+                continue
+            angle = int(round(float(value))) % 360
+            if angle not in (0, 90, 180, 270):
+                continue
+            if angle not in rotations:
+                rotations.append(angle)
+    if not rotations:
+        rotations = [0, 180]
+    return rotations
+
+
+def _apply_flip_rotate_raster(image: np.ndarray, rotation_deg: int, flip_horizontal: bool) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.uint8)
+    arr = np.ascontiguousarray(arr)
+    used_cv2 = cv2 is not None
+    if flip_horizontal:
+        if used_cv2:
+            arr = cv2.flip(arr, 1)
+        else:
+            arr = np.fliplr(arr)
+    rot = rotation_deg % 360
+    if rot == 90:
+        if used_cv2:
+            arr = cv2.rotate(arr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        else:
+            arr = np.rot90(arr, k=1)
+    elif rot == 180:
+        if used_cv2:
+            arr = cv2.rotate(arr, cv2.ROTATE_180)
+        else:
+            arr = np.rot90(arr, k=2)
+    elif rot == 270:
+        if used_cv2:
+            arr = cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+        else:
+            arr = np.rot90(arr, k=3)
+    elif rot != 0:
+        raise ValueError(f"Rotation {rotation_deg}° is not supported in coarse raster mode")
+    return arr
+
+
+def coarse_orientation_from_rasters(
+    pdf_gray: np.ndarray,
+    svg_gray: np.ndarray,
+    config,
+    *,
+    svg_pixels_per_unit: float | None = None,
+) -> dict:
+    pdf = ensure_ndarray2d("pdf_gray", pdf_gray)
+    svg = ensure_ndarray2d("svg_gray", svg_gray)
+
+    rot_candidates_raw = getattr(config, "rot_degrees", None)
+    if rot_candidates_raw is None and isinstance(config, Mapping):
+        rot_candidates_raw = config.get("rot_degrees")
+    rotations = _normalize_rotations(rot_candidates_raw if isinstance(rot_candidates_raw, Sequence) else None)
+
+    flip_candidates = [False, True]
+
+    best_candidate: dict | None = None
+    candidates: List[dict] = []
+
+    for flip in flip_candidates:
+        for rot in rotations:
+            oriented = _apply_flip_rotate_raster(svg, rot, flip)
+            padded_svg, padded_pdf = pad_to_same_canvas(oriented, pdf)
+            tx, ty, score = phase_correlation(padded_svg, padded_pdf)
+            candidate = {
+                "rotation_deg": rot,
+                "flip_horizontal": flip,
+                "tx_px": float(tx),
+                "ty_px": float(ty),
+                "score": float(score),
+                "svg_shape": (int(oriented.shape[0]), int(oriented.shape[1])),
+            }
+            candidates.append(candidate)
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
+
+    if best_candidate is None:
+        best_candidate = {
+            "rotation_deg": 0,
+            "flip_horizontal": False,
+            "tx_px": 0.0,
+            "ty_px": 0.0,
+            "score": 0.0,
+            "svg_shape": (int(svg.shape[0]), int(svg.shape[1])),
+        }
+
+    rotation = int(best_candidate["rotation_deg"])
+    flip = bool(best_candidate["flip_horizontal"])
+    oriented_shape = tuple(best_candidate.get("svg_shape", (int(svg.shape[0]), int(svg.shape[1]))))
+    pdf_width = max(pdf.shape[1], 1)
+    scale_hint = oriented_shape[1] / float(pdf_width)
+
+    coarse = {
+        "rotation_deg": rotation,
+        "flip_horizontal": flip,
+        "tx_px": int(round(float(best_candidate.get("tx_px", 0.0)))),
+        "ty_px": int(round(float(best_candidate.get("ty_px", 0.0)))),
+        "score": float(best_candidate.get("score", 0.0)),
+        "scale_hint": float(scale_hint),
+        "pdf_shape": (int(pdf.shape[0]), int(pdf.shape[1])),
+        "svg_shape": (int(svg.shape[0]), int(svg.shape[1])),
+        "candidates": candidates,
+    }
+    if svg_pixels_per_unit is not None:
+        coarse["pixels_per_svg_unit"] = float(svg_pixels_per_unit)
+    return coarse
+
+
+def apply_orientation_to_raster(
+    svg_gray: np.ndarray,
+    coarse: Mapping[str, object],
+    *,
+    canvas_shape: Tuple[int, int],
+    apply_scale: bool = False,
+) -> np.ndarray:
+    if apply_scale:
+        raise ValueError("Scaling is disabled in coarse raster application")
+
+    rotation = int(round(float(coarse.get("rotation_deg", 0))))
+    flip = bool(coarse.get("flip_horizontal", False))
+    oriented = _apply_flip_rotate_raster(svg_gray, rotation, flip)
+
+    canvas_h, canvas_w = canvas_shape
+    canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+
+    tx = int(round(float(coarse.get("tx_px", 0))))
+    ty = int(round(float(coarse.get("ty_px", 0))))
+
+    src_x0 = max(0, -tx)
+    src_y0 = max(0, -ty)
+    dst_x0 = max(0, tx)
+    dst_y0 = max(0, ty)
+
+    available_w = oriented.shape[1] - src_x0
+    available_h = oriented.shape[0] - src_y0
+    if available_w <= 0 or available_h <= 0:
+        return canvas
+
+    dst_x1 = min(canvas_w, dst_x0 + available_w)
+    dst_y1 = min(canvas_h, dst_y0 + available_h)
+    src_x1 = src_x0 + (dst_x1 - dst_x0)
+    src_y1 = src_y0 + (dst_y1 - dst_y0)
+
+    if dst_x0 < dst_x1 and dst_y0 < dst_y1:
+        canvas[dst_y0:dst_y1, dst_x0:dst_x1] = oriented[src_y0:src_y1, src_x0:src_x1]
+    return canvas

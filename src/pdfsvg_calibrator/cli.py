@@ -909,6 +909,47 @@ def preprocess(
         resolve_path=True,
         help="Pfad zur YAML-Konfiguration",
     ),
+    save_debug_rasters: bool = typer.Option(
+        False,
+        "--save-debug-rasters",
+        help="Debug-Raster (DPI Debug) exportieren",
+    ),
+    dpi_coarse_opt: Optional[int] = typer.Option(
+        None,
+        "--dpi-coarse",
+        min=1,
+        help="DPI für die Grobrenderings überschreiben",
+    ),
+    dpi_coarse_fallback_opt: Optional[int] = typer.Option(
+        None,
+        "--dpi-coarse-fallback",
+        min=1,
+        help="Fallback-DPI für die Grobphase",
+    ),
+    dpi_debug_opt: Optional[int] = typer.Option(
+        None,
+        "--dpi-debug",
+        min=1,
+        help="DPI für Debug-Exporte",
+    ),
+    svg_ppu_coarse_opt: Optional[float] = typer.Option(
+        None,
+        "--svg-ppu-coarse",
+        min=0.0001,
+        help="Pixels-per-unit für SVG (Grobphase)",
+    ),
+    svg_ppu_fallback_opt: Optional[float] = typer.Option(
+        None,
+        "--svg-ppu-fallback",
+        min=0.0001,
+        help="Fallback-Pixels-per-unit für SVG",
+    ),
+    svg_ppu_debug_opt: Optional[float] = typer.Option(
+        None,
+        "--svg-ppu-debug",
+        min=0.0001,
+        help="Pixels-per-unit für SVG Debug-Raster",
+    ),
 ) -> None:
     logger = Logger(verbose=False)
     try:
@@ -923,7 +964,37 @@ def preprocess(
         else:
             raise ValueError("Config root must be a Mapping")
 
-        result = calibrate_pdf_svg_preprocess(pdf_bytes, svg_bytes, config_dict)
+        raster_cfg = config_dict.get("raster")
+        if not isinstance(raster_cfg, MutableMapping):
+            raster_cfg = {}
+        else:
+            raster_cfg = dict(raster_cfg)
+        if dpi_coarse_opt is not None:
+            raster_cfg["dpi_coarse"] = int(dpi_coarse_opt)
+        if dpi_coarse_fallback_opt is not None:
+            raster_cfg["dpi_coarse_fallback"] = int(dpi_coarse_fallback_opt)
+        if dpi_debug_opt is not None:
+            raster_cfg["dpi_debug"] = int(dpi_debug_opt)
+        if svg_ppu_coarse_opt is not None:
+            raster_cfg["svg_ppu_coarse"] = float(svg_ppu_coarse_opt)
+        if svg_ppu_fallback_opt is not None:
+            raster_cfg["svg_ppu_fallback"] = float(svg_ppu_fallback_opt)
+        if svg_ppu_debug_opt is not None:
+            raster_cfg["svg_ppu_debug"] = float(svg_ppu_debug_opt)
+        config_dict["raster"] = raster_cfg
+
+        debug_dir: Optional[Path] = None
+        if save_debug_rasters:
+            debug_dir = Path("debug_rasters") / pdf.stem
+
+        result = calibrate_pdf_svg_preprocess(
+            pdf_bytes,
+            svg_bytes,
+            config_dict,
+            save_debug_rasters=save_debug_rasters,
+            debug_outdir=str(debug_dir) if debug_dir else None,
+            debug_prefix=f"pre_{pdf.stem}",
+        )
         if not isinstance(result, Mapping):
             raise ValueError("Preprocess-Ergebnis hat unerwartetes Format")
 
@@ -931,23 +1002,41 @@ def preprocess(
         metric = result.get("metric_scale")
         coarse_map = coarse if isinstance(coarse, Mapping) else {}
         metric_map = metric if isinstance(metric, Mapping) else {}
+        scale_summary = result.get("scale_summary")
+        scale_map = scale_summary if isinstance(scale_summary, Mapping) else {}
 
-        typer.echo("Coarse alignment:")
-        typer.echo(f"  rotation_deg: {coarse_map.get('rotation_deg')}")
-        typer.echo(f"  flip_horizontal: {coarse_map.get('flip_horizontal')}")
-        typer.echo(f"  tx_px: {coarse_map.get('tx_px')}")
-        typer.echo(f"  ty_px: {coarse_map.get('ty_px')}")
-        typer.echo(f"  sx_seed: {coarse_map.get('sx_seed')}")
-        typer.echo(f"  sy_seed: {coarse_map.get('sy_seed')}")
-        typer.echo(f"  score: {coarse_map.get('score')}")
+        def _fmt(value: Any) -> str:
+            if isinstance(value, float):
+                return f"{value:.6f}"
+            return str(value)
 
-        pixels_per_meter = metric_map.get("pixels_per_meter")
-        typer.echo("Metric scale:")
+        typer.echo("=== Coarse alignment ===")
+        typer.echo(f"rotation_deg: {_fmt(coarse_map.get('rotation_deg'))}")
+        typer.echo(f"flip_horizontal: {_fmt(coarse_map.get('flip_horizontal'))}")
+        typer.echo(f"tx_px: {_fmt(coarse_map.get('tx_px'))}")
+        typer.echo(f"ty_px: {_fmt(coarse_map.get('ty_px'))}")
+        typer.echo(f"scale_hint: {_fmt(coarse_map.get('scale_hint'))}")
+        typer.echo(f"score: {_fmt(coarse_map.get('score'))}")
+        if coarse_map.get("used_fallback"):
+            typer.echo("used_fallback: True")
+
+        typer.echo("=== Metric scale ===")
+        typer.echo(f"pixels_per_meter: {_fmt(metric_map.get('pixels_per_meter'))}")
+        typer.echo(f"ok: {_fmt(metric_map.get('ok'))}")
+
+        typer.echo("=== Scale comparison ===")
+        typer.echo(f"scale_hint: {_fmt(scale_map.get('scale_hint'))}")
+        typer.echo(f"scale_vbox: {_fmt(scale_map.get('scale_vbox'))}")
+        typer.echo(f"scale_dim: {_fmt(scale_map.get('scale_dim'))}")
         typer.echo(
-            "  pixels_per_meter: "
-            + ("None" if pixels_per_meter is None else str(pixels_per_meter))
+            f"diff_hint_vs_vbox_pct: {_fmt(scale_map.get('diff_hint_vs_vbox_pct'))}"
         )
-        typer.echo(f"  ok: {metric_map.get('ok')}")
+        typer.echo(f"diff_hint_vs_dim_pct: {_fmt(scale_map.get('diff_hint_vs_dim_pct'))}")
+        typer.echo(f"diff_vbox_vs_dim_pct: {_fmt(scale_map.get('diff_vbox_vs_dim_pct'))}")
+
+        timing_summary = result.get("timing_summary")
+        if isinstance(timing_summary, str) and timing_summary:
+            typer.echo(timing_summary)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         _handle_known_exception(logger, exc, prefix="Fehler")
         raise typer.Exit(code=2) from exc
