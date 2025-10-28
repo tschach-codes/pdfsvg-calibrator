@@ -12,7 +12,18 @@ import textwrap
 import traceback
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import typer
 import yaml
@@ -39,6 +50,7 @@ from .metrics import MetricsTracker, Timer, use_tracker
 from .match_verify import match_lines, select_lines
 from .overlays import write_pdf_overlay, write_report_csv, write_svg_overlay
 from .types import Match, Model, Segment
+from .svg_autogen import ensure_svg_for_pdf
 from .utils.timer import timer
 from .debug.pdf_probe import probe_page
 
@@ -899,20 +911,59 @@ def preprocess(
     pdf: Path = typer.Argument(
         ..., exists=True, readable=True, resolve_path=True, help="Pfad zur PDF-Datei"
     ),
-    svg: Path = typer.Option(
-        ..., "--svg", exists=True, readable=True, resolve_path=True, help="Pfad zur SVG-Datei"
+    svg: Optional[Path] = typer.Option(
+        None,
+        "--svg",
+        exists=True,
+        readable=True,
+        resolve_path=True,
+        help="Optional: vorhandene SVG verwenden; andernfalls automatisch aus der PDF erzeugen.",
     ),
-    page: int = typer.Option(0, "--page", min=0, help="0-basierter Seitenindex"),
+    svg_from: Literal["auto", "inkscape", "pdftocairo", "pdf2svg", "mutool", "pymupdf"] = typer.Option(
+        "auto",
+        "--svg-from",
+        show_default=True,
+        help="Backend für die SVG-Erzeugung aus der PDF",
+    ),
+    keep_text: bool = typer.Option(
+        True,
+        "--keep-text/--no-keep-text",
+        show_default=True,
+        help="Textobjekte beim SVG-Export beibehalten",
+    ),
+    keep_layers: bool = typer.Option(
+        True,
+        "--keep-layers/--no-keep-layers",
+        show_default=True,
+        help="Layer-/Gruppenstruktur beim SVG-Export beibehalten",
+    ),
+    page: int = typer.Option(0, "--page", min=0, show_default=True, help="0-basierter Seitenindex"),
     config: Path = typer.Option(
         DEFAULT_CONFIG_PATH,
         "--config",
         resolve_path=True,
+        show_default=True,
         help="Pfad zur YAML-Konfiguration",
+    ),
+    outdir: Path = typer.Option(
+        Path("out"),
+        "--outdir",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        show_default=True,
+        help="Ausgabeverzeichnis für generierte Dateien",
     ),
     save_debug_rasters: bool = typer.Option(
         False,
         "--save-debug-rasters",
         help="Debug-Raster (DPI Debug) exportieren",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        is_flag=True,
+        help="Ausführliche Ausgaben aktivieren",
     ),
     dpi_coarse_opt: Optional[int] = typer.Option(
         None,
@@ -951,11 +1002,8 @@ def preprocess(
         help="Pixels-per-unit für SVG Debug-Raster",
     ),
 ) -> None:
-    logger = Logger(verbose=False)
+    logger = Logger(verbose=verbose)
     try:
-        pdf_bytes = _load_pdf_page_bytes(pdf, page)
-        svg_bytes = svg.read_bytes()
-
         config_data = load_config(str(config))
         if config_data is None:
             config_dict: Dict[str, Any] = {}
@@ -963,6 +1011,17 @@ def preprocess(
             config_dict = dict(config_data)
         else:
             raise ValueError("Config root must be a Mapping")
+
+        svg_export_cfg = config_dict.get("svg_export")
+        if not isinstance(svg_export_cfg, MutableMapping):
+            svg_export_cfg = {}
+        else:
+            svg_export_cfg = dict(svg_export_cfg)
+        svg_export_cfg["method"] = str(svg_from)
+        svg_export_cfg["keep_text"] = bool(keep_text)
+        svg_export_cfg["keep_layers"] = bool(keep_layers)
+        svg_export_cfg["page"] = int(page)
+        config_dict["svg_export"] = svg_export_cfg
 
         raster_cfg = config_dict.get("raster")
         if not isinstance(raster_cfg, MutableMapping):
@@ -983,9 +1042,14 @@ def preprocess(
             raster_cfg["svg_ppu_debug"] = float(svg_ppu_debug_opt)
         config_dict["raster"] = raster_cfg
 
+        svg_path = ensure_svg_for_pdf(pdf, svg, outdir, config_dict)
+        svg_bytes = svg_path.read_bytes()
+        pdf_bytes = _load_pdf_page_bytes(pdf, page)
+
         debug_dir: Optional[Path] = None
         if save_debug_rasters:
-            debug_dir = Path("debug_rasters") / pdf.stem
+            debug_dir = outdir / "debug_rasters" / pdf.stem
+            debug_dir.mkdir(parents=True, exist_ok=True)
 
         result = calibrate_pdf_svg_preprocess(
             pdf_bytes,
