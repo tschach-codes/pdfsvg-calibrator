@@ -49,7 +49,7 @@ def _build_single_page_command(
     ]
 
 
-def _run_converter(cmd: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
+def _run_converter(cmd: list[str], verbose: bool = False) -> None:
     if verbose:
         print("[pdfsvg] Full command:", cmd)
     try:
@@ -78,7 +78,7 @@ def _run_converter(cmd: list[str], verbose: bool = False) -> subprocess.Complete
             "Make sure at least one of them is installed and in PATH."
         )
 
-    return proc
+    return
 
 
 def _run_pdftosvg(
