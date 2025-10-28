@@ -1,0 +1,14 @@
+svg_export:
+  method: auto           # auto|inkscape|pdftocairo|pdf2svg|mutool|pymupdf
+  keep_text: true        # keep <text> if backend supports (no outlining)
+  keep_layers: true      # prefer layer/OCG preservation when backend supports it
+  prefer_poppler: true   # for inkscape (use poppler importer if possible)
+  page: 0                # 0-based
+  out_suffix: "_p{page}.svg"
+  timeout_sec: 120
+  # Binary names (if on PATH). Leave empty to auto-detect.
+  bin:
+    inkscape: "inkscape"
+    pdftocairo: "pdftocairo"
+    pdf2svg: "pdf2svg"
+    mutool: "mutool"
