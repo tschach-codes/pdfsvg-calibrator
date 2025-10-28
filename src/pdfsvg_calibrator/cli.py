@@ -221,8 +221,14 @@ def _normalize_opts_arguments(argv: List[str]) -> None:
     argv[:] = normalized
 
 
-if len(sys.argv) > 1 and sys.argv[1] == "run":  # pragma: no cover - CLI convenience
-    del sys.argv[1]
+# Backwards compatibility: allow calling ``python -m pdfsvg_calibrator.cli <pdf>``
+# by implicitly inserting the ``run`` command while keeping explicit subcommand
+# invocation (``python -m pdfsvg_calibrator.cli run <pdf>``) functional.
+if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+    first = sys.argv[1]
+    known_commands = {"run", "preprocess"}
+    if first not in known_commands:
+        sys.argv.insert(1, "run")
 
 _normalize_opts_arguments(sys.argv)
 
