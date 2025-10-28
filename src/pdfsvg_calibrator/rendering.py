@@ -23,6 +23,8 @@ def render_pdf_page_gray(pdf_bytes: bytes, dpi: int) -> np.ndarray:
     if dpi <= 0:
         raise ValueError("dpi must be positive")
 
+    # ``scale`` maps PDF points (1/72") into device pixels so that PDF and SVG
+    # rasters share an absolute unit reference without any later resampling.
     pdf = pypdfium2.PdfDocument(io.BytesIO(pdf_bytes))
     try:
         page = pdf[0]
@@ -77,6 +79,9 @@ def render_svg_viewbox_gray(svg_bytes: bytes, ppu: float) -> np.ndarray:
         raise ValueError("ppu must be positive")
 
     vx, vy, vw, vh = get_svg_viewbox(svg_bytes)
+    # The SVG user-space → pixel conversion mirrors ``ppu`` (pixels per user
+    # unit) so that the resulting raster is directly comparable to the PDF
+    # raster produced above.
     out_w = max(1, int(math.ceil(vw * ppu)))
     out_h = max(1, int(math.ceil(vh * ppu)))
     png_bytes = cairosvg.svg2png(bytestring=svg_bytes, output_width=out_w, output_height=out_h)
