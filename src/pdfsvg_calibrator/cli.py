@@ -25,7 +25,7 @@ from pdfsvg_calibrator.pagebox_align import (
     confidence_label,
     explain_alignment_reason,
 )
-from .raster_align import estimate_raster_alignment
+from .raster_align import coarse_raster_align as estimate_raster_alignment
 
 from .config import load_config
 from .calibrate import calibrate
