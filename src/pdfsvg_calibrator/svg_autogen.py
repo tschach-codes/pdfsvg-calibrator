@@ -37,6 +37,7 @@ def _build_single_page_command(
             exe_path,
             str(pdf_path),
             str(out_svg),
+            "--non-interactive",
             "--pages",
             str(page_number_1based),
         ]
