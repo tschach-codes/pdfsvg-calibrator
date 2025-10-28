@@ -17,7 +17,6 @@ from typing import (
     Dict,
     Iterable,
     List,
-    Literal,
     Mapping,
     MutableMapping,
     Optional,
@@ -188,6 +187,10 @@ HARDCODED_DEFAULTS: Dict[str, Any] = {
     },
     "sampling": {"step_rel": 0.03, "max_points": 1500},
 }
+
+
+def _read_bytes(path: str | Path) -> bytes:
+    return Path(path).read_bytes()
 
 
 def _normalize_opts_arguments(argv: List[str]) -> None:
@@ -920,36 +923,25 @@ def preprocess(
     svg: Optional[Path] = typer.Option(
         None,
         "--svg",
-        exists=True,
-        readable=True,
+        exists=False,
+        readable=False,
         resolve_path=True,
-        help="Optional: vorhandene SVG verwenden; andernfalls automatisch aus der PDF erzeugen.",
+        help="Optional: vorhandene SVG. Wenn nicht angegeben, wird automatisch erzeugt.",
     ),
-    svg_from: Literal["auto", "inkscape", "pdftocairo", "pdf2svg", "mutool", "pymupdf"] = typer.Option(
-        "auto",
-        "--svg-from",
+    page: int = typer.Option(
+        0,
+        "--page",
+        min=0,
         show_default=True,
-        help="Backend für die SVG-Erzeugung aus der PDF",
+        help="0-basierter Seitenindex aus dem PDF.",
     ),
-    keep_text: bool = typer.Option(
-        True,
-        "--keep-text/--no-keep-text",
-        show_default=True,
-        help="Textobjekte beim SVG-Export beibehalten",
-    ),
-    keep_layers: bool = typer.Option(
-        True,
-        "--keep-layers/--no-keep-layers",
-        show_default=True,
-        help="Layer-/Gruppenstruktur beim SVG-Export beibehalten",
-    ),
-    page: int = typer.Option(0, "--page", min=0, show_default=True, help="0-basierter Seitenindex"),
     config: Path = typer.Option(
         DEFAULT_CONFIG_PATH,
         "--config",
+        exists=True,
         resolve_path=True,
         show_default=True,
-        help="Pfad zur YAML-Konfiguration",
+        help="Pfad zur YAML-Konfiguration.",
     ),
     outdir: Path = typer.Option(
         Path("out"),
@@ -958,76 +950,64 @@ def preprocess(
         dir_okay=True,
         resolve_path=True,
         show_default=True,
-        help="Ausgabeverzeichnis für generierte Dateien",
+        help="Zielordner für erzeugte SVG und Debug-Raster.",
     ),
     save_debug_rasters: bool = typer.Option(
         False,
         "--save-debug-rasters",
-        help="Debug-Raster (DPI Debug) exportieren",
+        help="Debug-Rasterbilder speichern (DPI-debug).",
     ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
         is_flag=True,
-        help="Ausführliche Ausgaben aktivieren",
+        help="Mehr Logging (DimScale debug etc.).",
     ),
     dpi_coarse_opt: Optional[int] = typer.Option(
         None,
         "--dpi-coarse",
         min=1,
-        help="DPI für die Grobrenderings überschreiben",
+        help="Override: DPI für Grobphase (z.B. 150).",
     ),
     dpi_coarse_fallback_opt: Optional[int] = typer.Option(
         None,
         "--dpi-coarse-fallback",
         min=1,
-        help="Fallback-DPI für die Grobphase",
+        help="Override: DPI-Fallback (z.B. 300).",
     ),
     dpi_debug_opt: Optional[int] = typer.Option(
         None,
         "--dpi-debug",
         min=1,
-        help="DPI für Debug-Exporte",
+        help="Override: DPI für Debug-Exports (z.B. 300).",
     ),
     svg_ppu_coarse_opt: Optional[float] = typer.Option(
         None,
         "--svg-ppu-coarse",
         min=0.0001,
-        help="Pixels-per-unit für SVG (Grobphase)",
+        help="Override: Pixels-per-unit für SVG Grobphase (z.B. 1.0).",
     ),
     svg_ppu_fallback_opt: Optional[float] = typer.Option(
         None,
         "--svg-ppu-fallback",
         min=0.0001,
-        help="Fallback-Pixels-per-unit für SVG",
+        help="Override: Pixels-per-unit Fallback (z.B. 2.0).",
     ),
     svg_ppu_debug_opt: Optional[float] = typer.Option(
         None,
         "--svg-ppu-debug",
         min=0.0001,
-        help="Pixels-per-unit für SVG Debug-Raster",
+        help="Override: Pixels-per-unit für Debug-Raster (z.B. 2.0).",
     ),
 ) -> None:
     logger = Logger(verbose=verbose)
     try:
-        config_data = load_config(str(config))
-        if config_data is None:
-            config_dict: Dict[str, Any] = {}
-        elif isinstance(config_data, MutableMapping):
-            config_dict = dict(config_data)
-        else:
+        with open(config, "r", encoding="utf-8") as f:
+            loaded_cfg = yaml.safe_load(f) or {}
+        if not isinstance(loaded_cfg, MutableMapping):
             raise ValueError("Config root must be a Mapping")
 
-        svg_export_cfg = config_dict.get("svg_export")
-        if not isinstance(svg_export_cfg, MutableMapping):
-            svg_export_cfg = {}
-        else:
-            svg_export_cfg = dict(svg_export_cfg)
-        svg_export_cfg["method"] = str(svg_from)
-        svg_export_cfg["keep_text"] = bool(keep_text)
-        svg_export_cfg["keep_layers"] = bool(keep_layers)
-        svg_export_cfg["page"] = int(page)
-        config_dict["svg_export"] = svg_export_cfg
+        config_dict: Dict[str, Any] = dict(loaded_cfg)
 
         raster_cfg = config_dict.get("raster")
         if not isinstance(raster_cfg, MutableMapping):
@@ -1048,9 +1028,17 @@ def preprocess(
             raster_cfg["svg_ppu_debug"] = float(svg_ppu_debug_opt)
         config_dict["raster"] = raster_cfg
 
-        svg_path = ensure_svg_for_pdf(pdf, svg, outdir, config_dict)
-        svg_bytes = svg_path.read_bytes()
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        svg_path = ensure_svg_for_pdf(
+            pdf_path=pdf,
+            svg_path_opt=svg,
+            outdir=outdir,
+            page=page,
+        )
+
         pdf_bytes = _load_pdf_page_bytes(pdf, page)
+        svg_bytes = _read_bytes(svg_path)
 
         debug_dir: Optional[Path] = None
         if save_debug_rasters:
@@ -1058,12 +1046,12 @@ def preprocess(
             debug_dir.mkdir(parents=True, exist_ok=True)
 
         result = calibrate_pdf_svg_preprocess(
-            pdf_bytes,
-            svg_bytes,
-            config_dict,
+            pdf_bytes=pdf_bytes,
+            svg_bytes=svg_bytes,
+            config=config_dict,
             save_debug_rasters=save_debug_rasters,
             debug_outdir=str(debug_dir) if debug_dir else None,
-            debug_prefix=f"pre_{pdf.stem}",
+            debug_prefix=f"pre_{pdf.stem}_p{page}",
         )
         if not isinstance(result, Mapping):
             raise ValueError("Preprocess-Ergebnis hat unerwartetes Format")
@@ -1074,39 +1062,56 @@ def preprocess(
         metric_map = metric if isinstance(metric, Mapping) else {}
         scale_summary = result.get("scale_summary")
         scale_map = scale_summary if isinstance(scale_summary, Mapping) else {}
+        timings = result.get("timings")
+        timings_map = timings if isinstance(timings, Mapping) else {}
 
         def _fmt(value: Any) -> str:
             if isinstance(value, float):
                 return f"{value:.6f}"
             return str(value)
 
+        typer.echo("")
         typer.echo("=== Coarse alignment ===")
-        typer.echo(f"rotation_deg: {_fmt(coarse_map.get('rotation_deg'))}")
-        typer.echo(f"flip_horizontal: {_fmt(coarse_map.get('flip_horizontal'))}")
-        typer.echo(f"tx_px: {_fmt(coarse_map.get('tx_px'))}")
-        typer.echo(f"ty_px: {_fmt(coarse_map.get('ty_px'))}")
-        typer.echo(f"scale_hint: {_fmt(coarse_map.get('scale_hint'))}")
-        typer.echo(f"score: {_fmt(coarse_map.get('score'))}")
-        if coarse_map.get("used_fallback"):
-            typer.echo("used_fallback: True")
-
-        typer.echo("=== Metric scale ===")
-        typer.echo(f"pixels_per_meter: {_fmt(metric_map.get('pixels_per_meter'))}")
-        typer.echo(f"ok: {_fmt(metric_map.get('ok'))}")
-
-        typer.echo("=== Scale comparison ===")
-        typer.echo(f"scale_hint: {_fmt(scale_map.get('scale_hint'))}")
-        typer.echo(f"scale_vbox: {_fmt(scale_map.get('scale_vbox'))}")
-        typer.echo(f"scale_dim: {_fmt(scale_map.get('scale_dim'))}")
+        typer.echo(f" rotation_deg     : {_fmt(coarse_map.get('rotation_deg'))}")
+        typer.echo(f" flip_horizontal  : {_fmt(coarse_map.get('flip_horizontal'))}")
         typer.echo(
-            f"diff_hint_vs_vbox_pct: {_fmt(scale_map.get('diff_hint_vs_vbox_pct'))}"
+            f" tx_px / ty_px    : {_fmt(coarse_map.get('tx_px'))}, {_fmt(coarse_map.get('ty_px'))}"
         )
-        typer.echo(f"diff_hint_vs_dim_pct: {_fmt(scale_map.get('diff_hint_vs_dim_pct'))}")
-        typer.echo(f"diff_vbox_vs_dim_pct: {_fmt(scale_map.get('diff_vbox_vs_dim_pct'))}")
+        typer.echo(f" scale_hint       : {_fmt(coarse_map.get('scale_hint'))}")
+        typer.echo(f" score            : {_fmt(coarse_map.get('score'))}")
+        if coarse_map.get("used_fallback"):
+            typer.echo(" used_fallback    : True")
 
+        typer.echo("")
+        typer.echo("=== Metric scale (DimScale) ===")
+        typer.echo(f" ok               : {_fmt(metric_map.get('ok'))}")
+        typer.echo(f" pixels_per_meter : {_fmt(metric_map.get('pixels_per_meter'))}")
+        if verbose and "debug" in metric_map:
+            typer.echo(f" debug            : {_fmt(metric_map.get('debug'))}")
+
+        typer.echo("")
+        typer.echo("=== Scale cross-check ===")
+        typer.echo(
+            f" dim_vs_viewbox_diff_pct : {_fmt(scale_map.get('diff_vbox_vs_dim_pct'))}"
+        )
+        typer.echo(
+            f" dim_vs_hint_diff_pct    : {_fmt(scale_map.get('diff_hint_vs_dim_pct'))}"
+        )
+        typer.echo(
+            f" hint_vs_viewbox_diff_pct: {_fmt(scale_map.get('diff_hint_vs_vbox_pct'))}"
+        )
+        typer.echo(f" warn                    : {_fmt(scale_map.get('warn'))}")
+
+        typer.echo("")
+        typer.echo("=== Timings ===")
         timing_summary = result.get("timing_summary")
         if isinstance(timing_summary, str) and timing_summary:
             typer.echo(timing_summary)
+        elif timings_map:
+            formatted = ", ".join(f"{k}={_fmt(v)}" for k, v in timings_map.items())
+            typer.echo(formatted)
+        else:
+            typer.echo("(keine Timings verfügbar)")
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         _handle_known_exception(logger, exc, prefix="Fehler")
         raise typer.Exit(code=2) from exc
