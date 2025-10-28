@@ -22,6 +22,32 @@ def _which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
+def _is_pdftosvg_style(exe_path: str) -> bool:
+    """Return True if the executable appears to be the pdftosvg CLI."""
+    return os.path.basename(exe_path).lower().startswith("pdftosvg")
+
+
+def _build_single_page_command(
+    exe_path: str, pdf_path: Path, out_svg: Path, page_index: int
+) -> list[str]:
+    """Build the converter command for a single page."""
+    page_number_1based = page_index + 1
+    if _is_pdftosvg_style(exe_path):
+        return [
+            exe_path,
+            str(pdf_path),
+            str(out_svg),
+            "--pages",
+            str(page_number_1based),
+        ]
+    return [
+        exe_path,
+        str(pdf_path),
+        str(out_svg),
+        str(page_number_1based),
+    ]
+
+
 def _run_converter(cmd: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
     if verbose:
         print("[pdfsvg] Full command:", cmd)
@@ -57,11 +83,10 @@ def _run_pdftosvg(
 ) -> None:
     """
     Run pdftosvg (pdftosvg.net style).
-    Assumption: page index is 0-based for this tool.
     Command shape:
-        pdftosvg input.pdf output.svg pageIndex0Based
+        pdftosvg input.pdf output.svg --pages pageIndex1Based
     """
-    cmd = [pdftosvg_exe, str(pdf_path), str(out_svg), str(page_index)]
+    cmd = _build_single_page_command(pdftosvg_exe, pdf_path, out_svg, page_index)
     _run_converter(cmd, verbose=verbose)
 
 
@@ -79,7 +104,7 @@ def _run_pdf2svg(
     Command shape:
         pdf2svg input.pdf output.svg pageIndex1Based
     """
-    cmd = [pdf2svg_exe, str(pdf_path), str(out_svg), str(page_index + 1)]
+    cmd = _build_single_page_command(pdf2svg_exe, pdf_path, out_svg, page_index)
     _run_converter(cmd, verbose=verbose)
 
 
@@ -134,10 +159,10 @@ def export_pdf_page_to_svg(
         )
 
     primary_exe = cmd_base[0]
-    exe_name = Path(primary_exe).name.lower()
+    primary_is_pdftosvg = _is_pdftosvg_style(primary_exe)
 
-    pdftosvg_exe = primary_exe if "pdftosvg" in exe_name else None
-    pdf2svg_exe = primary_exe if "pdf2svg" in exe_name else None
+    pdftosvg_exe = primary_exe if primary_is_pdftosvg else None
+    pdf2svg_exe = primary_exe if not primary_is_pdftosvg else None
 
     if pdftosvg_exe is None:
         pdftosvg_exe = _which("pdftosvg") or _which("pdftosvg.exe")
