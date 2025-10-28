@@ -1,8 +1,20 @@
 from __future__ import annotations
-import subprocess
+
+import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
+
+
+def _find_pdf_to_svg_executable() -> list[str]:
+    """Return the first available PDF->SVG executable in PATH."""
+    candidates = ["pdftosvg", "pdftosvg.exe", "pdf2svg", "pdf2svg.exe"]
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return [path]
+    return []
 
 
 def _which(name: str) -> Optional[str]:
@@ -10,7 +22,39 @@ def _which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
-def _run_pdftosvg(pdftosvg_exe: str, pdf_path: Path, out_svg: Path, page_index: int) -> None:
+def _run_converter(cmd: list[str], verbose: bool = False) -> subprocess.CompletedProcess:
+    if verbose:
+        print("[pdfsvg] Full command:", cmd)
+    try:
+        return subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if verbose:
+            print("[pdfsvg] Converter failed with return code", exc.returncode)
+            if exc.stdout:
+                print("[pdfsvg] STDOUT:", exc.stdout)
+            if exc.stderr:
+                print("[pdfsvg] STDERR:", exc.stderr)
+        raise
+    except OSError as exc:
+        if verbose:
+            print("[pdfsvg] Failed to execute converter:", exc)
+        raise
+
+
+def _run_pdftosvg(
+    pdftosvg_exe: str,
+    pdf_path: Path,
+    out_svg: Path,
+    page_index: int,
+    *,
+    verbose: bool = False,
+) -> None:
     """
     Run pdftosvg (pdftosvg.net style).
     Assumption: page index is 0-based for this tool.
@@ -18,10 +62,17 @@ def _run_pdftosvg(pdftosvg_exe: str, pdf_path: Path, out_svg: Path, page_index: 
         pdftosvg input.pdf output.svg pageIndex0Based
     """
     cmd = [pdftosvg_exe, str(pdf_path), str(out_svg), str(page_index)]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _run_converter(cmd, verbose=verbose)
 
 
-def _run_pdf2svg(pdf2svg_exe: str, pdf_path: Path, out_svg: Path, page_index: int) -> None:
+def _run_pdf2svg(
+    pdf2svg_exe: str,
+    pdf_path: Path,
+    out_svg: Path,
+    page_index: int,
+    *,
+    verbose: bool = False,
+) -> None:
     """
     Run pdf2svg.
     pdf2svg is 1-based for the page argument.
@@ -29,7 +80,7 @@ def _run_pdf2svg(pdf2svg_exe: str, pdf_path: Path, out_svg: Path, page_index: in
         pdf2svg input.pdf output.svg pageIndex1Based
     """
     cmd = [pdf2svg_exe, str(pdf_path), str(out_svg), str(page_index + 1)]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _run_converter(cmd, verbose=verbose)
 
 
 def _svg_contains_text(svg_path: Path) -> bool:
@@ -48,6 +99,8 @@ def export_pdf_page_to_svg(
     pdf_path: str | Path,
     out_svg: str | Path,
     page: int = 0,
+    *,
+    verbose: bool = False,
 ) -> Path:
     """
     Convert one PDF page to an SVG with semantic fidelity (paths + text).
@@ -66,34 +119,79 @@ def export_pdf_page_to_svg(
     out_svg = Path(out_svg)
     out_svg.parent.mkdir(parents=True, exist_ok=True)
 
-    pdftosvg_exe = _which("pdftosvg")
-    pdf2svg_exe  = _which("pdf2svg")
+    cmd_base = _find_pdf_to_svg_executable()
+    if verbose:
+        print("[pdfsvg] PATH seen by Python:", os.environ.get("PATH", ""))
+        print(
+            "[pdfsvg] Converter executable from lookup:",
+            cmd_base[0] if cmd_base else None,
+        )
+
+    if not cmd_base:
+        raise RuntimeError(
+            "Could not convert PDF to SVG via pdftosvg or pdf2svg. "
+            "Make sure at least one of them is installed and in PATH."
+        )
+
+    primary_exe = cmd_base[0]
+    exe_name = Path(primary_exe).name.lower()
+
+    pdftosvg_exe = primary_exe if "pdftosvg" in exe_name else None
+    pdf2svg_exe = primary_exe if "pdf2svg" in exe_name else None
+
+    if pdftosvg_exe is None:
+        pdftosvg_exe = _which("pdftosvg") or _which("pdftosvg.exe")
+    if pdf2svg_exe is None:
+        pdf2svg_exe = _which("pdf2svg") or _which("pdf2svg.exe")
 
     # 1. Try pdftosvg first, if available
     pdftosvg_ok = False
+    last_exception: Optional[Exception] = None
     if pdftosvg_exe is not None:
         try:
-            _run_pdftosvg(pdftosvg_exe, pdf_path, out_svg, page_index=page)
+            _run_pdftosvg(
+                pdftosvg_exe,
+                pdf_path,
+                out_svg,
+                page_index=page,
+                verbose=verbose,
+            )
             if out_svg.exists() and out_svg.stat().st_size > 0:
                 pdftosvg_ok = True
-        except Exception:
+        except Exception as exc:
             pdftosvg_ok = False
+            last_exception = exc
+            if verbose:
+                print("[pdfsvg] pdftosvg failed:", exc)
 
     # If pdftosvg ran AND SVG has <text>, accept it immediately.
     if pdftosvg_ok and _svg_contains_text(out_svg):
         return out_svg
 
     # Otherwise fallback: try pdf2svg (this may overwrite/replace the file)
-    if pdf2svg_exe is not None:
+    if pdf2svg_exe is not None and (pdf2svg_exe != pdftosvg_exe or not pdftosvg_ok):
         try:
-            _run_pdf2svg(pdf2svg_exe, pdf_path, out_svg, page_index=page)
+            _run_pdf2svg(
+                pdf2svg_exe,
+                pdf_path,
+                out_svg,
+                page_index=page,
+                verbose=verbose,
+            )
             if out_svg.exists() and out_svg.stat().st_size > 0:
                 # even if there's still no <text>, we accept this as last resort
                 return out_svg
-        except Exception:
-            pass
+        except Exception as exc:
+            last_exception = exc
+            if verbose:
+                print("[pdfsvg] pdf2svg failed:", exc)
 
     # If we get here, we failed both routes in a meaningful way
+    if verbose and last_exception is not None:
+        print("[pdfsvg] Final conversion failure:", last_exception)
+        if isinstance(last_exception, subprocess.CalledProcessError):
+            if last_exception.stderr:
+                print("[pdfsvg] STDERR:", last_exception.stderr)
     raise RuntimeError(
         "Could not convert PDF to SVG via pdftosvg or pdf2svg. "
         "Make sure at least one of them is installed and in PATH."
@@ -105,6 +203,8 @@ def ensure_svg_for_pdf(
     svg_path_opt: Optional[str | Path],
     outdir: str | Path,
     page: int = 0,
+    *,
+    verbose: bool = False,
 ) -> Path:
     """
     Main entry point for the pipeline.
@@ -126,5 +226,5 @@ def ensure_svg_for_pdf(
 
     # Auto-generate
     auto_svg = outdir / f"{pdf_path.stem}_p{page}.svg"
-    export_pdf_page_to_svg(pdf_path, auto_svg, page=page)
+    export_pdf_page_to_svg(pdf_path, auto_svg, page=page, verbose=verbose)
     return auto_svg

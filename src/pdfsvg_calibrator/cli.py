@@ -1035,6 +1035,7 @@ def preprocess(
             svg_path_opt=svg,
             outdir=outdir,
             page=page,
+            verbose=verbose,
         )
 
         pdf_bytes = _load_pdf_page_bytes(pdf, page)
