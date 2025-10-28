@@ -52,25 +52,32 @@ def _run_converter(cmd: list[str], verbose: bool = False) -> subprocess.Complete
     if verbose:
         print("[pdfsvg] Full command:", cmd)
     try:
-        return subprocess.run(
+        proc = subprocess.run(
             cmd,
-            check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            check=False,
         )
-    except subprocess.CalledProcessError as exc:
-        if verbose:
-            print("[pdfsvg] Converter failed with return code", exc.returncode)
-            if exc.stdout:
-                print("[pdfsvg] STDOUT:", exc.stdout)
-            if exc.stderr:
-                print("[pdfsvg] STDERR:", exc.stderr)
-        raise
     except OSError as exc:
         if verbose:
             print("[pdfsvg] Failed to execute converter:", exc)
         raise
+
+    stdout = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+    stderr = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+
+    if verbose:
+        print("[pdfsvg] return code:", proc.returncode)
+        print("[pdfsvg] STDOUT:", stdout)
+        print("[pdfsvg] STDERR:", stderr)
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Could not convert PDF to SVG via pdftosvg or pdf2svg. "
+            "Make sure at least one of them is installed and in PATH."
+        )
+
+    return proc
 
 
 def _run_pdftosvg(
