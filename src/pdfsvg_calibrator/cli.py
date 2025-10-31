@@ -1050,6 +1050,10 @@ def preprocess(
             verbose=verbose,
         )
 
+        if verbose:
+            typer.echo(f"[pdfsvg] CLI got svg_path: {svg_path}")
+        assert isinstance(svg_path, Path), f"Expected Path, got {type(svg_path)}"
+
         pdf_bytes = _load_pdf_page_bytes(pdf, page)
         svg_bytes = _read_bytes(svg_path)
 
