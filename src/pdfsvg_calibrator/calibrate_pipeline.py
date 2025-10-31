@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Tuple
 import pypdfium2
 
-from .debugviz import save_debug_rasters
+from . import debug_utils as dbg
 from .dimension_scale_integration import refine_metric_scale
 from .orientation import apply_orientation_to_raster, coarse_orientation_from_rasters
 from .rendering import get_svg_viewbox, render_pdf_page_gray, render_svg_viewbox_gray
@@ -57,7 +57,7 @@ def calibrate_pdf_svg_preprocess(
     svg_bytes: bytes,
     config: Mapping[str, Any] | None,
     *,
-    save_debug_rasters: bool = False,
+    save_debug: bool = False,
     debug_outdir: str | os.PathLike[str] | None = None,
     debug_prefix: str = "dbg",
 ) -> Dict[str, Any]:
@@ -131,7 +131,7 @@ def calibrate_pdf_svg_preprocess(
         )
 
     with tm.section("debug_export", include_in_compute=False):
-        if save_debug_rasters and debug_outdir is not None:
+        if save_debug and debug_outdir is not None:
             debug_path = Path(debug_outdir)
             debug_path.mkdir(parents=True, exist_ok=True)
             pdf_dbg = render_pdf_page_gray(pdf_bytes, dpi_debug)
@@ -142,7 +142,13 @@ def calibrate_pdf_svg_preprocess(
                 canvas_shape=(int(pdf_dbg.shape[0]), int(pdf_dbg.shape[1])),
                 apply_scale=False,
             )
-            save_debug_rasters(pdf_dbg, svg_dbg, svg_dbg_oriented, str(debug_path), prefix=debug_prefix)
+            dbg.save_debug_rasters(
+                pdf_dbg,
+                svg_dbg,
+                svg_dbg_oriented,
+                str(debug_path),
+                prefix=debug_prefix,
+            )
 
     with tm.section("dimscale_refine"):
         metric = refine_metric_scale(svg_bytes, coarse, cfg)
