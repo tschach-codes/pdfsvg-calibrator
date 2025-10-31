@@ -358,8 +358,18 @@ def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
             segs.append((x1,y1,x2,y2))
 
     # Pass 2: <path> elems, longest straight chunk
-    for el in root.iter():
-        tag = etree.QName(el.tag).localname.lower()
+    for el in root.iter("*"):
+        # Some nodes (comments, PIs) have non-string tags in lxml (e.g. <cyfunction Comment ...>).
+        tag_obj = el.tag
+        if isinstance(tag_obj, bytes):
+            try:
+                tag_obj = tag_obj.decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+        if not isinstance(tag_obj, str):
+            # skip comments / processing instructions / special nodes
+            continue
+        tag = etree.QName(tag_obj).localname.lower()
         if tag == "path":
             d_attr = el.get("d")
             if not d_attr:
