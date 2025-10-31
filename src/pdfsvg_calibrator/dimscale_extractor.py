@@ -7,6 +7,22 @@ import numpy as np
 from PIL import Image, ImageDraw
 from lxml import etree
 
+
+def _safe_local_tag(el) -> Optional[str]:
+    """
+    Return lowercase localname for real element nodes.
+    Skip comments / processing instructions / special nodes.
+    """
+    tag_obj = getattr(el, "tag", None)
+    if isinstance(tag_obj, bytes):
+        try:
+            tag_obj = tag_obj.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    if not isinstance(tag_obj, str):
+        return None
+    return etree.QName(tag_obj).localname.lower()
+
 # OCR optional
 try:
     import pytesseract  # requires tesseract installed on system
@@ -333,20 +349,10 @@ def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
     segs: List[Tuple[float,float,float,float]] = []
 
     # Pass 1: direct <line> elems
-    for el in root.iter():
-        # Some nodes (comments, PIs) have non-string tags in lxml, e.g. <cyfunction Comment ...>
-        tag_obj = el.tag
-        # If bytes, decode to str; if not str after that, skip the node
-        if isinstance(tag_obj, bytes):
-            try:
-                tag_obj = tag_obj.decode("utf-8", errors="ignore")
-            except Exception:
-                pass
-        if not isinstance(tag_obj, str):
-            # skip comments / processing instructions / special nodes
+    for el in root.iter("*"):
+        tag = _safe_local_tag(el)
+        if tag is None:
             continue
-
-        tag = etree.QName(tag_obj).localname.lower()
         if tag == "line":
             try:
                 x1 = float(el.get("x1", "0"))
@@ -359,17 +365,9 @@ def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
 
     # Pass 2: <path> elems, longest straight chunk
     for el in root.iter("*"):
-        # Some nodes (comments, PIs) have non-string tags in lxml (e.g. <cyfunction Comment ...>).
-        tag_obj = el.tag
-        if isinstance(tag_obj, bytes):
-            try:
-                tag_obj = tag_obj.decode("utf-8", errors="ignore")
-            except Exception:
-                pass
-        if not isinstance(tag_obj, str):
-            # skip comments / processing instructions / special nodes
+        tag = _safe_local_tag(el)
+        if tag is None:
             continue
-        tag = etree.QName(tag_obj).localname.lower()
         if tag == "path":
             d_attr = el.get("d")
             if not d_attr:
@@ -399,8 +397,10 @@ def _svg_get_text_elems(root) -> List[Dict[str,Any]]:
     }
     """
     texts: List[Dict[str,Any]] = []
-    for el in root.iter():
-        tag = etree.QName(el.tag).localname.lower()
+    for el in root.iter("*"):
+        tag = _safe_local_tag(el)
+        if tag is None:
+            continue
         if tag == "text":
             raw_txt = "".join(el.itertext()).strip()
             if not raw_txt:
@@ -454,8 +454,11 @@ def _collect_paths_in_bbox(root, bbox: Tuple[float,float,float,float]) -> List[e
     minx,miny,maxx,maxy = bbox
     hits = []
 
-    for el in root.iter():
-        if etree.QName(el.tag).localname.lower() == "path":
+    for el in root.iter("*"):
+        tag = _safe_local_tag(el)
+        if tag is None:
+            continue
+        if tag == "path":
             d_attr = el.get("d")
             if not d_attr:
                 continue
