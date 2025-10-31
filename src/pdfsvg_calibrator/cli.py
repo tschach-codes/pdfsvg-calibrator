@@ -1066,7 +1066,7 @@ def preprocess(
             pdf_bytes=pdf_bytes,
             svg_bytes=svg_bytes,
             config=config_dict,
-            save_debug_rasters=save_debug_rasters,
+            save_debug=save_debug_rasters,
             debug_outdir=str(debug_dir) if debug_dir else None,
             debug_prefix=f"pre_{pdf.stem}_p{page}",
         )
