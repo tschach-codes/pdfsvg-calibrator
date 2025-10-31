@@ -912,9 +912,7 @@ def _handle_known_exception(logger: Logger, exc: Exception, *, prefix: str | Non
     if prefix:
         message = f"{prefix}: {message}"
     logger.error(message)
-    # NEW: print the full stack trace for unknown errors
-    if prefix and prefix.lower().startswith("unerwart"):
-        traceback.print_exc()
+    traceback.print_exc()
 
 
 app = typer.Typer(help="PDF→SVG calibration & verification")
