@@ -106,6 +106,7 @@ def _run_pdftosvg(
         pdftosvg input.pdf output.svg --pages pageIndex1Based
     """
     cmd = _build_single_page_command(pdftosvg_exe, pdf_path, out_svg, page_index)
+    # _run_converter raises on failure; success is implied by lack of exception.
     _run_converter(cmd, verbose=verbose)
 
 
@@ -124,6 +125,7 @@ def _run_pdf2svg(
         pdf2svg input.pdf output.svg pageIndex1Based
     """
     cmd = _build_single_page_command(pdf2svg_exe, pdf_path, out_svg, page_index)
+    # _run_converter raises on failure; success is implied by lack of exception.
     _run_converter(cmd, verbose=verbose)
 
 
