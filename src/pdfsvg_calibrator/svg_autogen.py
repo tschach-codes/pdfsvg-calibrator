@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree as ET
 
 
 def _find_pdf_to_svg_executable() -> list[str]:
@@ -116,16 +117,27 @@ def _run_pdf2svg(
     _run_converter(cmd, verbose=verbose)
 
 
-def _svg_contains_text(svg_path: Path) -> bool:
+def _svg_contains_text(svg_path: Path, verbose: bool = False) -> bool:
     """
-    Quick semantic validation: is there any <text ...> in the SVG?
-    We don't fully parse XML here, we just do a cheap substring check.
-    If substring is present, we consider it 'has text semantics'.
+    True if the SVG contains text-like elements.
+    Namespace-agnostic, streaming (iterparse) to handle very large files quickly.
     """
-    data = svg_path.read_bytes()
-    # do a binary lowercase check for robustness:
-    lower = data.lower()
-    return b"<text" in lower
+    texty = {"text", "tspan", "flowRoot", "flowPara"}
+
+    try:
+        for _event, elem in ET.iterparse(str(svg_path), events=("start",)):
+            tag = elem.tag
+            if "}" in tag:
+                tag = tag.rsplit("}", 1)[-1]
+            if tag in texty:
+                return True
+        if verbose:
+            print(f"[pdfsvg] No text-like elements found in {svg_path.name}")
+        return False
+    except ET.ParseError as exc:
+        if verbose:
+            print(f"[pdfsvg] SVG parse error in {svg_path.name}: {exc}")
+        return False
 
 
 def export_pdf_page_to_svg(
@@ -198,7 +210,7 @@ def export_pdf_page_to_svg(
                 print("[pdfsvg] pdftosvg failed:", exc)
 
     # If pdftosvg ran AND SVG has <text>, accept it immediately.
-    if pdftosvg_ok and _svg_contains_text(out_svg):
+    if pdftosvg_ok and _svg_contains_text(out_svg, verbose=verbose):
         return out_svg
 
     # Otherwise fallback: try pdf2svg (this may overwrite/replace the file)
