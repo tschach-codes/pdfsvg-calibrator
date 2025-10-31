@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import copy
+import os
 from typing import Final
+
+from lxml import etree
 
 try:  # pragma: no cover - optional dependency
     import cv2
@@ -20,6 +24,7 @@ __all__ = [
     "edges",
     "make_split_red_left_pdf_green_right_svg",
     "save_debug_rasters",
+    "write_dim_debug_svg",
 ]
 
 
@@ -91,3 +96,117 @@ def save_debug_rasters(
             cv2.imwrite(filename, cv2.cvtColor(split, cv2.COLOR_RGB2BGR))
     except Exception as e:  # pragma: no cover - debug helper
         print("[pdfsvg] split-debug failed:", e)
+
+
+def write_dim_debug_svg(
+    src_svg_path: str,
+    outdir: str,
+    prefix: str,
+    segments_svg,
+    texts_svg,
+    pairs,
+    *,
+    raster_png: bool = True,
+):
+    """
+    Create an overlay SVG showing:
+      - all segments (thin gray),
+      - text boxes (thin white outlines),
+      - candidate links (yellow),
+      - INLIER segments/texts (thick green),
+      - label each inlier with parsed value+unit.
+    Coordinates are in SVG units (same as the source SVG).
+    """
+
+    parser = etree.XMLParser(remove_blank_text=False)
+    tree = etree.parse(src_svg_path, parser)
+    root = tree.getroot()
+
+    # pick viewBox / width / height to anchor overlay group
+    g_overlay = etree.Element(
+        "g", id="dim-debug-overlay", style="mix-blend-mode:normal"
+    )
+
+    # draw segments (all)
+    for (x1, y1, x2, y2) in segments_svg:
+        line = etree.Element(
+            "line", x1=str(x1), y1=str(y1), x2=str(x2), y2=str(y2)
+        )
+        line.set("stroke", "#bbbbbb")
+        line.set("stroke-width", "0.6")
+        line.set("vector-effect", "non-scaling-stroke")
+        g_overlay.append(line)
+
+    # draw texts (boxes)
+    for t in texts_svg:
+        (x, y, w, h) = t.get("bbox", (0, 0, 0, 0))
+        rect = etree.Element(
+            "rect", x=str(x), y=str(y), width=str(w), height=str(h)
+        )
+        rect.set("fill", "none")
+        rect.set("stroke", "#ffffff")
+        rect.set("stroke-width", "0.5")
+        rect.set("vector-effect", "non-scaling-stroke")
+        g_overlay.append(rect)
+
+    # mark pairs and inliers
+    for p in pairs:
+        i = p["seg"]
+        j = p["txt"]
+        inl = bool(p.get("inlier", False))
+        (x1, y1, x2, y2) = segments_svg[i]
+        cx, cy = texts_svg[j].get("center", (None, None))
+        if cx is not None and cy is not None:
+            link = etree.Element(
+                "line",
+                x1=str((x1 + x2) / 2.0),
+                y1=str((y1 + y2) / 2.0),
+                x2=str(cx),
+                y2=str(cy),
+            )
+            link.set("stroke", "#ffd500")  # yellow
+            link.set("stroke-width", "0.5")
+            link.set("stroke-dasharray", "2,2")
+            link.set("vector-effect", "non-scaling-stroke")
+            g_overlay.append(link)
+        if inl:
+            seg = etree.Element(
+                "line", x1=str(x1), y1=str(y1), x2=str(x2), y2=str(y2)
+            )
+            seg.set("stroke", "#00ff88")
+            seg.set("stroke-width", "1.2")
+            seg.set("vector-effect", "non-scaling-stroke")
+            g_overlay.append(seg)
+            # label
+            val = p.get("value")
+            unit = p.get("unit", "m")
+            lx = (x1 + x2) / 2.0
+            ly = (y1 + y2) / 2.0
+            txt = etree.Element("text", x=str(lx), y=str(ly))
+            if val is not None:
+                try:
+                    txt.text = f"{float(val):g} {unit}"
+                except (TypeError, ValueError):
+                    txt.text = f"{val} {unit}" if unit else f"{val}"
+            else:
+                txt.text = unit
+            txt.set("fill", "#00ff88")
+            txt.set("font-size", "6")
+            txt.set("text-anchor", "middle")
+            g_overlay.append(txt)
+
+    root.append(copy.deepcopy(g_overlay))
+
+    os.makedirs(outdir, exist_ok=True)
+    out_svg = os.path.join(outdir, f"{prefix}_dim_debug.svg")
+    tree.write(out_svg, pretty_print=False, xml_declaration=True, encoding="utf-8")
+
+    # optional raster
+    if raster_png:
+        try:
+            import cairosvg
+
+            out_png = os.path.join(outdir, f"{prefix}_dim_debug.png")
+            cairosvg.svg2png(url=out_svg, write_to=out_png, dpi=144)
+        except Exception as e:  # pragma: no cover - optional
+            print("[pdfsvg] dim-debug raster failed:", e)
