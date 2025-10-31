@@ -906,10 +906,15 @@ def _log_timing_summary(tracker: MetricsTracker, stats: Mapping[str, float]) -> 
 
 
 def _handle_known_exception(logger: Logger, exc: Exception, *, prefix: str | None = None) -> None:
+    import traceback
+
     message = str(exc) if str(exc) else exc.__class__.__name__
     if prefix:
         message = f"{prefix}: {message}"
     logger.error(message)
+    # NEW: print the full stack trace for unknown errors
+    if prefix and prefix.lower().startswith("unerwart"):
+        traceback.print_exc()
 
 
 app = typer.Typer(help="PDF→SVG calibration & verification")
