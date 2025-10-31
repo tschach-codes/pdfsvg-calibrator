@@ -130,6 +130,8 @@ def calibrate_pdf_svg_preprocess(
             apply_scale=False,
         )
 
+    debug_path: Path | str | None = None
+
     with tm.section("debug_export", include_in_compute=False):
         if save_debug and debug_outdir is not None:
             debug_path = Path(debug_outdir)
@@ -149,6 +151,10 @@ def calibrate_pdf_svg_preprocess(
                 str(debug_path),
                 prefix=debug_prefix,
             )
+
+    if save_debug:
+        # ensure debug_path is str/Path correctly
+        assert isinstance(debug_path, (str, Path))
 
     with tm.section("dimscale_refine"):
         metric = refine_metric_scale(svg_bytes, coarse, cfg)
