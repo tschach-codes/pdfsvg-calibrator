@@ -101,3 +101,7 @@ cost_weights:
   midpoint: 0.3
   direction: 0.2
   neighbors: 0.1
+dimscale:
+  enabled: true
+  default_unit: m
+  min_inlier_cluster: 3
