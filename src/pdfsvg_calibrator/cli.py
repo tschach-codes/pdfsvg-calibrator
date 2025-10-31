@@ -1632,6 +1632,7 @@ def run(
                                     model,
                                     matches,
                                     alignment,
+                                    verbose=verbose,
                                 )
                             )
                         with logger.status("PDF-Overlay"):

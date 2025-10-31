@@ -148,6 +148,8 @@ def write_svg_overlay(
     model: Model,
     matches: Sequence[Match],
     alignment: Optional[Mapping[str, Any]] = None,
+    *,
+    verbose: bool = False,
 ) -> str:
     tree = etree.parse(svg_path)
     root = tree.getroot()
@@ -173,6 +175,11 @@ def write_svg_overlay(
             tag_g,
             id="CHECK_METADATA",
         )
+        comment_text = " | ".join(line.strip() for line in metadata_lines if line).strip()
+        meta_comment = etree.Comment(comment_text if comment_text else "")
+        meta_group.append(meta_comment)
+        if verbose:
+            print("[pdfsvg] added XML comment")
         base_x = 18.0
         base_y = 18.0
         padding_x = 12.0
