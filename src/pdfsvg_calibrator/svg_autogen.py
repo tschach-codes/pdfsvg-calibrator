@@ -28,6 +28,16 @@ def _is_pdftosvg_style(exe_path: str) -> bool:
     return os.path.basename(exe_path).lower().startswith("pdftosvg")
 
 
+def _pdftosvg_actual_output_path(
+    requested_out_svg: Path, page_number_1based: int
+) -> Path:
+    """Return the output path that pdftosvg.NET actually writes."""
+
+    return requested_out_svg.with_name(
+        f"{requested_out_svg.stem}-{page_number_1based}.svg"
+    )
+
+
 def _build_single_page_command(
     exe_path: str, pdf_path: Path, out_svg: Path, page_index: int
 ) -> list[str]:
@@ -188,12 +198,14 @@ def export_pdf_page_to_svg(
 
     last_exception: Optional[Exception] = None
 
-    def _output_ready() -> bool:
-        return out_svg.exists() and out_svg.stat().st_size > 0
+    def _output_ready(svg_path: Path) -> bool:
+        return svg_path.exists() and svg_path.stat().st_size > 0
 
-    def _evaluate_success(converter_name: str, text_detected: bool) -> bool:
+    def _evaluate_success(
+        converter_name: str, svg_display: str, text_detected: bool
+    ) -> bool:
         if verbose:
-            print(f"[pdfsvg] converter: {converter_name}")
+            print(f"[pdfsvg] converter: {converter_name} -> {svg_display}")
             print(f"[pdfsvg] text-detected: {text_detected}")
         if not require_text:
             if verbose:
@@ -208,7 +220,7 @@ def export_pdf_page_to_svg(
             print("[pdfsvg] accept: raised")
         return False
 
-    def _attempt_converter(run_func, converter_name: str) -> bool:
+    def _attempt_converter(run_func, converter_name: str, svg_path: Path) -> Optional[Path]:
         nonlocal last_exception
         try:
             run_func()
@@ -216,21 +228,25 @@ def export_pdf_page_to_svg(
             last_exception = exc
             if verbose:
                 print(f"[pdfsvg] {converter_name} failed:", exc)
-            return False
+            return None
 
-        if not _output_ready():
+        if not _output_ready(svg_path):
             if verbose:
                 print(f"[pdfsvg] {converter_name} produced no output")
-            return False
+            return None
 
         check_text = require_text or verbose
         text_detected = (
-            _svg_contains_text(out_svg, verbose=verbose) if check_text else False
+            _svg_contains_text(svg_path, verbose=verbose) if check_text else False
         )
-        return _evaluate_success(converter_name, text_detected)
+        if _evaluate_success(converter_name, svg_path.name, text_detected):
+            return svg_path
+        return None
 
     if pdftosvg_exe is not None:
-        if _attempt_converter(
+        page_number_1based = page + 1
+        actual_svg = _pdftosvg_actual_output_path(out_svg, page_number_1based)
+        produced_svg = _attempt_converter(
             lambda: _run_pdftosvg(
                 pdftosvg_exe,
                 pdf_path,
@@ -239,11 +255,13 @@ def export_pdf_page_to_svg(
                 verbose=verbose,
             ),
             "pdftosvg",
-        ):
-            return out_svg
+            actual_svg,
+        )
+        if produced_svg is not None:
+            return produced_svg
 
     if pdf2svg_exe is not None and (pdf2svg_exe != pdftosvg_exe or pdftosvg_exe is None):
-        if _attempt_converter(
+        produced_svg = _attempt_converter(
             lambda: _run_pdf2svg(
                 pdf2svg_exe,
                 pdf_path,
@@ -252,8 +270,10 @@ def export_pdf_page_to_svg(
                 verbose=verbose,
             ),
             "pdf2svg",
-        ):
-            return out_svg
+            out_svg,
+        )
+        if produced_svg is not None:
+            return produced_svg
 
     if verbose and last_exception is not None:
         print("[pdfsvg] Final conversion failure:", last_exception)
@@ -295,11 +315,11 @@ def ensure_svg_for_pdf(
 
     # Auto-generate
     auto_svg = outdir / f"{pdf_path.stem}_p{page}.svg"
-    export_pdf_page_to_svg(
+    produced_svg = export_pdf_page_to_svg(
         pdf_path,
         auto_svg,
         page=page,
         require_text=require_text,
         verbose=verbose,
     )
-    return auto_svg
+    return produced_svg
