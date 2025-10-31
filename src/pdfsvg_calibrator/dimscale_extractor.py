@@ -334,7 +334,19 @@ def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
 
     # Pass 1: direct <line> elems
     for el in root.iter():
-        tag = etree.QName(el.tag).localname.lower()
+        # Some nodes (comments, PIs) have non-string tags in lxml, e.g. <cyfunction Comment ...>
+        tag_obj = el.tag
+        # If bytes, decode to str; if not str after that, skip the node
+        if isinstance(tag_obj, bytes):
+            try:
+                tag_obj = tag_obj.decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+        if not isinstance(tag_obj, str):
+            # skip comments / processing instructions / special nodes
+            continue
+
+        tag = etree.QName(tag_obj).localname.lower()
         if tag == "line":
             try:
                 x1 = float(el.get("x1", "0"))
