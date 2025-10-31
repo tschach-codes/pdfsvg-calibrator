@@ -963,6 +963,12 @@ def preprocess(
         is_flag=True,
         help="Mehr Logging (DimScale debug etc.).",
     ),
+    require_text: bool = typer.Option(
+        False,
+        "--require-text",
+        is_flag=True,
+        help="SVG-Konverter nur akzeptieren, wenn Text erkannt wird.",
+    ),
     dpi_coarse_opt: Optional[int] = typer.Option(
         None,
         "--dpi-coarse",
@@ -1035,6 +1041,7 @@ def preprocess(
             svg_path_opt=svg,
             outdir=outdir,
             page=page,
+            require_text=require_text,
             verbose=verbose,
         )
 
