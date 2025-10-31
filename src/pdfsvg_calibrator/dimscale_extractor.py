@@ -9,6 +9,35 @@ from lxml import etree
 import re
 
 
+NUM_RE = re.compile(
+    r"(?<!\\d)"
+    r"(\\d{1,4}(?:[.,]\\d{1,3})?)"     # Zahl mit Komma oder Punkt
+    r"(?:\\s*(m|cm))?"                # optionale Einheit
+    r"\\b(?![²m])",                   # kein m² oder mm
+    re.IGNORECASE
+)
+
+
+def _parse_length_token(s: str, default_unit: str = "m"):
+    """
+    Parse numeric text like '2.50', '2,50', '250', '2.50 m', '250 cm'
+    Returns Wert in Metern (float) oder None.
+    """
+    s = s.replace("\u202f", " ").replace("\xa0", " ")
+    m = NUM_RE.search(s)
+    if not m:
+        return None
+    val_str = m.group(1).replace(",", ".")
+    try:
+        val = float(val_str)
+    except ValueError:
+        return None
+    unit = (m.group(2) or default_unit).lower()
+    if unit == "cm":
+        val /= 100.0
+    return val  # in Meter
+
+
 def _safe_local_tag(el) -> Optional[str]:
     """
     Return lowercase localname for real element nodes.
@@ -463,7 +492,16 @@ def _svg_get_text_elems(root) -> List[Dict[str,Any]]:
             entry = _make_text_entry(raw_txt, bbox_xywh)
             entry["_debug_index"] = len(texts)
             texts.append(entry)
-    return texts
+    filtered: List[Dict[str, Any]] = []
+    for entry in texts:
+        raw_txt = entry.get("text", "")
+        parsed_val = _parse_length_token(raw_txt)
+        if parsed_val is None:
+            continue
+        entry["value"] = parsed_val
+        entry["unit"] = "m"
+        filtered.append(entry)
+    return filtered
 
 
 # NOTE:
