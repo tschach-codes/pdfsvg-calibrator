@@ -6,6 +6,7 @@ import tempfile
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from .dimscale_extractor import estimate_dimline_scale
+from .debug_utils import write_dim_debug_svg
 
 
 def _extract_scale_candidates(*values: Optional[float]) -> Optional[float]:
@@ -128,6 +129,9 @@ def _serialize_dimscale_debug(result: Any) -> Dict[str, Any]:
         "candidates_used": getattr(result, "candidates_used", None),
         "inlier_cluster_size": getattr(result, "inlier_cluster_size", None),
     }
+    debug_data = getattr(result, "debug", None)
+    if isinstance(debug_data, Mapping):
+        data["debug"] = debug_data
     return data
 
 
@@ -155,12 +159,15 @@ def refine_metric_scale(
     """
 
     coarse_alignment = dict(coarse_alignment or {})
-    config = dict(config or {})
-    dimscale_raw = config.get("dimscale")
+    cfg = dict(config or {})
+    dimscale_raw = cfg.get("dimscale")
     dimscale_cfg = dimscale_raw if isinstance(dimscale_raw, Mapping) else {}
 
     enable_ocr = bool(dimscale_cfg.get("enable_ocr_paths", dimscale_cfg.get("enable_ocr", False)))
     unit_name = dimscale_cfg.get("unit") if isinstance(dimscale_cfg, Mapping) else None
+    default_unit = dimscale_cfg.get("default_unit") if isinstance(dimscale_cfg, Mapping) else None
+    if (not unit_name) and isinstance(default_unit, str):
+        unit_name = default_unit
     unit_factor_cfg = dimscale_cfg.get("unit_in_meters") if isinstance(dimscale_cfg, Mapping) else None
 
     tmp_svg = tempfile.NamedTemporaryFile(suffix=".svg", delete=False)
@@ -182,6 +189,40 @@ def refine_metric_scale(
             os.unlink(tmp_svg_path)
         except OSError:
             pass
+
+    debug_cfg = cfg.get("debug") if isinstance(cfg, Mapping) else {}
+    inputs_cfg = cfg.get("inputs") if isinstance(cfg, Mapping) else {}
+    overlay_enabled = True
+    if isinstance(debug_cfg, Mapping):
+        overlay_enabled = bool(debug_cfg.get("dimscale_overlay", True))
+    else:
+        debug_cfg = {}
+    if overlay_enabled:
+        try:
+            svg_input_path = None
+            if isinstance(inputs_cfg, Mapping):
+                svg_input_path = inputs_cfg.get("svg_path")
+            outdir_path = debug_cfg.get("outdir") if isinstance(debug_cfg, Mapping) else None
+            prefix_cfg = debug_cfg.get("prefix") if isinstance(debug_cfg, Mapping) else None
+            debug_prefix = prefix_cfg if isinstance(prefix_cfg, str) and prefix_cfg else "dimscale"
+            debug_data = getattr(dimscale_result, "debug", {}) if dimscale_result is not None else {}
+            dimscale_debug = {}
+            if isinstance(debug_data, Mapping):
+                dimscale_section = debug_data.get("dimscale")
+                if isinstance(dimscale_section, Mapping):
+                    dimscale_debug = dimscale_section
+            if svg_input_path and outdir_path:
+                write_dim_debug_svg(
+                    str(svg_input_path),
+                    str(outdir_path),
+                    debug_prefix,
+                    dimscale_debug.get("segments_svg", []),
+                    dimscale_debug.get("texts_svg", []),
+                    dimscale_debug.get("pairs", []),
+                    raster_png=True,
+                )
+        except Exception as e:  # pragma: no cover - debug helper
+            print("[pdfsvg] write_dim_debug_svg failed:", e)
 
     svg_units_per_unit = _extract_scale_candidates(
         getattr(dimscale_result, "scale_x_svg_per_unit", None),

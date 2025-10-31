@@ -57,11 +57,28 @@ def calibrate_pdf_svg_preprocess(
     svg_bytes: bytes,
     config: Mapping[str, Any] | None,
     *,
+    svg_path: str | os.PathLike[str] | None = None,
     save_debug: bool = False,
     debug_outdir: str | os.PathLike[str] | None = None,
     debug_prefix: str = "dbg",
 ) -> Dict[str, Any]:
     cfg = _clone_config(config)
+    inputs_cfg = cfg.get("inputs") if isinstance(cfg, Mapping) else {}
+    if not isinstance(inputs_cfg, Mapping):
+        inputs_cfg = {}
+    cfg["inputs"] = dict(inputs_cfg)
+    if svg_path is not None:
+        cfg["inputs"]["svg_path"] = str(svg_path)
+
+    debug_cfg = cfg.get("debug") if isinstance(cfg, Mapping) else {}
+    if not isinstance(debug_cfg, Mapping):
+        debug_cfg = {}
+    debug_cfg = dict(debug_cfg)
+    if debug_outdir is not None:
+        debug_cfg.setdefault("outdir", str(debug_outdir))
+    if debug_prefix:
+        debug_cfg.setdefault("prefix", debug_prefix)
+    cfg["debug"] = debug_cfg
     raster_cfg = cfg.get("raster", {}) if isinstance(cfg, Mapping) else {}
     if not isinstance(raster_cfg, Mapping):
         raster_cfg = {}

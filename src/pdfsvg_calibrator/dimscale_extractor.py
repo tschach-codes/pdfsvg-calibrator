@@ -1,11 +1,12 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any
 import math
 import io
 import numpy as np
 from PIL import Image, ImageDraw
 from lxml import etree
+import re
 
 
 def _safe_local_tag(el) -> Optional[str]:
@@ -47,6 +48,7 @@ class DimCandidate:
     text_bbox: Tuple[float,float,float,float]  # (minx,miny,maxx,maxy) of label region
     dist_normal: float        # signed distance along normal from line midpoint
     # ratio_x/ratio_y not filled yet, will be computed later
+    pair_index: Optional[int] = None
 
 
 @dataclass
@@ -66,6 +68,8 @@ class DimScaleResult:
     # debug crops (PIL Images) for visual QA
     preview_horizontal: Optional[Image.Image]
     preview_vertical: Optional[Image.Image]
+
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 
 ###############################################################################
@@ -385,6 +389,31 @@ def _svg_get_segments(root) -> List[Tuple[float,float,float,float]]:
     return segs
 
 
+def _make_text_entry(
+    raw_text: str,
+    bbox_xywh: Tuple[float, float, float, float],
+    *,
+    value: Optional[float] = None,
+    unit: Optional[str] = None,
+) -> Dict[str, Any]:
+    x, y, w, h = bbox_xywh
+    if value is None or unit is None:
+        parsed_val, parsed_unit = _extract_value_and_unit(raw_text)
+        if value is None:
+            value = parsed_val
+        if unit is None:
+            unit = parsed_unit
+    center = (x + w * 0.5, y + h * 0.5)
+    entry: Dict[str, Any] = {
+        "text": raw_text,
+        "unit": unit,
+        "value": value,
+        "bbox": bbox_xywh,
+        "center": center,
+    }
+    return entry
+
+
 def _svg_get_text_elems(root) -> List[Dict[str,Any]]:
     """
     Collect <text> elements with rough bounding boxes.
@@ -430,10 +459,10 @@ def _svg_get_text_elems(root) -> List[Dict[str,Any]]:
             miny = y - fs_val
             maxy = y + fs_val*0.2
 
-            texts.append({
-                "text": raw_txt,
-                "bbox": (minx,miny,maxx,maxy),
-            })
+            bbox_xywh = _bbox_minmax_to_xywh((minx, miny, maxx, maxy))
+            entry = _make_text_entry(raw_txt, bbox_xywh)
+            entry["_debug_index"] = len(texts)
+            texts.append(entry)
     return texts
 
 
@@ -546,9 +575,19 @@ def _normal_vector(p1, p2):
     return (nx/nlen, ny/nlen)
 
 
-def _bbox_center(b):
-    x0,y0,x1,y1 = b
-    return ((x0+x1)*0.5, (y0+y1)*0.5)
+def _bbox_center(b: Tuple[float, float, float, float]):
+    x0, y0, w, h = b
+    return (x0 + w * 0.5, y0 + h * 0.5)
+
+
+def _bbox_xywh_to_minmax(b: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    x, y, w, h = b
+    return (x, y, x + w, y + h)
+
+
+def _bbox_minmax_to_xywh(b: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    x0, y0, x1, y1 = b
+    return (x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0))
 
 
 def _dist_along_normal(p_mid, nvec, pt):
@@ -623,6 +662,19 @@ def _try_parse_number(s: str) -> Optional[float]:
             except ValueError:
                 continue
     return None
+
+
+_UNIT_RE = re.compile(r"(\d[\d\s\.,]*)\s*([a-zA-Zµμ]+)")
+
+
+def _extract_value_and_unit(s: str) -> Tuple[Optional[float], Optional[str]]:
+    value = _try_parse_number(s)
+    unit = None
+    if s:
+        match = _UNIT_RE.search(s)
+        if match:
+            unit = match.group(2)
+    return value, unit
 
 
 def _ocr_crop_from_svg(root, crop_bbox: Tuple[float,float,float,float], dpi=200) -> Optional[str]:
@@ -740,6 +792,8 @@ def _get_viewbox_from_root(root) -> Optional[Tuple[float,float,float,float]]:
 def _gather_dim_candidates(
     root,
     segments: List[Tuple[float,float,float,float]],
+    text_elems: List[Dict[str, Any]],
+    pairs_debug: List[Dict[str, Any]],
     min_len_rel_diag: float = 0.07,
     normal_dist_max: float = 50.0,
     require_hv_only: bool = True,
@@ -764,11 +818,9 @@ def _gather_dim_candidates(
     diag = math.hypot(vb_w, vb_h)
     min_len_abs = min_len_rel_diag * diag
 
-    text_elems = _svg_get_text_elems(root)
-
     cands: List[DimCandidate] = []
 
-    for (x1,y1,x2,y2) in segments:
+    for seg_idx, (x1,y1,x2,y2) in enumerate(segments):
         p1 = (x1,y1)
         p2 = (x2,y2)
         L, ori = _length_and_orientation(p1,p2)
@@ -784,9 +836,11 @@ def _gather_dim_candidates(
         best_local: Optional[DimCandidate] = None
 
         for t in text_elems:
-            raw_txt = t["text"]
-            bbox = t["bbox"]
-            center_txt = _bbox_center(bbox)
+            raw_txt = t.get("text", "")
+            bbox_xywh = t.get("bbox")
+            if not bbox_xywh:
+                continue
+            center_txt = t.get("center") or _bbox_center(bbox_xywh)
 
             # Check perpendicular distance to line is not crazy
             perp_dist = _closest_point_dist_to_line(p1,p2, center_txt)
@@ -799,7 +853,20 @@ def _gather_dim_candidates(
                 continue
 
             # We got a plausible measurement label.
-            val = _try_parse_number(raw_txt)
+            val = t.get("value")
+            bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
+            txt_idx = t.get("_debug_index")
+            if txt_idx is None:
+                txt_idx = text_elems.index(t)
+
+            pairs_debug.append({
+                "seg": seg_idx,
+                "txt": txt_idx,
+                "dist": dist_n,
+                "value": val,
+                "unit": t.get("unit"),
+            })
+            pair_idx = len(pairs_debug) - 1
 
             cand = DimCandidate(
                 p1=p1,
@@ -808,8 +875,9 @@ def _gather_dim_candidates(
                 orientation=ori,
                 numeric_value=val,
                 raw_text=raw_txt,
-                text_bbox=bbox,
+                text_bbox=bbox_minmax,
                 dist_normal=dist_n,
+                pair_index=pair_idx,
             )
             # prefer ones with a parsed numeric value
             if best_local is None:
@@ -837,6 +905,19 @@ def _gather_dim_candidates(
                 if raw_ocr:
                     val = _try_parse_number(raw_ocr)
                     if val is not None:
+                        bbox_xywh = _bbox_minmax_to_xywh(cropbox)
+                        ocr_entry = _make_text_entry(raw_ocr, bbox_xywh, value=val)
+                        ocr_entry["_debug_index"] = len(text_elems)
+                        text_elems.append(ocr_entry)
+                        txt_idx = ocr_entry["_debug_index"]
+                        pairs_debug.append({
+                            "seg": seg_idx,
+                            "txt": txt_idx,
+                            "dist": 0.0,
+                            "value": val,
+                            "unit": ocr_entry.get("unit"),
+                        })
+                        pair_idx = len(pairs_debug) - 1
                         best_local = DimCandidate(
                             p1=p1,
                             p2=p2,
@@ -846,6 +927,7 @@ def _gather_dim_candidates(
                             raw_text=raw_ocr,
                             text_bbox=cropbox,
                             dist_normal=0.0,
+                            pair_index=pair_idx,
                         )
 
         if best_local is not None:
@@ -1015,9 +1097,18 @@ def estimate_dimline_scale(
     Returns DimScaleResult with scales + debug crop images.
     """
 
+    debug_dict: Dict[str, Any] = {}
+    segments_svg: List[Tuple[float, float, float, float]] = []
+    text_elems: List[Dict[str, Any]] = []
+    pairs: List[Dict[str, Any]] = []
+
     try:
         root, _tree = _parse_svg(svg_path)
     except Exception as e:
+        dbg = debug_dict.setdefault("dimscale", {})
+        dbg["segments_svg"] = segments_svg
+        dbg["texts_svg"] = text_elems
+        dbg["pairs"] = pairs
         return DimScaleResult(
             ok=False,
             reason=f"SVG parse failed: {e}",
@@ -1029,24 +1120,30 @@ def estimate_dimline_scale(
             inlier_cluster_size=0,
             preview_horizontal=None,
             preview_vertical=None,
+            debug=debug_dict,
         )
 
     segments = _svg_get_segments(root)
+    segments_svg = list(segments)
+    text_elems = _svg_get_text_elems(root)
 
     # Gather candidates
     cands = _gather_dim_candidates(
         root,
         segments,
+        text_elems,
+        pairs,
         min_len_rel_diag=0.07,        # 7% der globalen Diagonale
         normal_dist_max=50.0,         # ±50 SVG units orthogonal
         require_hv_only=True,         # h/v only for now
         enable_ocr_paths=enable_ocr_paths,
     )
 
+    cluster_rel_tol = 0.01
     ok, reason, best_ratio_x, best_ratio_y, tot_cands, inliers = _cluster_scale_ratios(
         cands,
         min_total=3,
-        rel_tol=0.01,   # ±1%
+        rel_tol=cluster_rel_tol,   # ±1%
     )
 
     # prepare debug crops:
@@ -1062,6 +1159,50 @@ def estimate_dimline_scale(
             prev_v = _raster_debug_crop(root, dbg_bbox, dpi=200)
         if prev_h is not None and prev_v is not None:
             break
+
+    # mark inlier pairs for debug overlays
+    def _within_rel_tol(value: Optional[float], reference: Optional[float]) -> bool:
+        if value is None or reference is None:
+            return False
+        if abs(reference) < 1e-12:
+            return False
+        return abs(value - reference) <= abs(reference) * cluster_rel_tol
+
+    inlier_pair_indices: set[int] = set()
+    for cand in cands:
+        if cand.numeric_value is None or cand.numeric_value == 0 or cand.pair_index is None:
+            continue
+        dx = abs(cand.p2[0] - cand.p1[0])
+        dy = abs(cand.p2[1] - cand.p1[1])
+        ratio = None
+        if cand.orientation == "h":
+            ratio = dx / cand.numeric_value
+            if _within_rel_tol(ratio, best_ratio_x):
+                inlier_pair_indices.add(cand.pair_index)
+        elif cand.orientation == "v":
+            ratio = dy / cand.numeric_value
+            if _within_rel_tol(ratio, best_ratio_y):
+                inlier_pair_indices.add(cand.pair_index)
+
+    for idx in inlier_pair_indices:
+        if 0 <= idx < len(pairs):
+            pairs[idx]["inlier"] = True
+
+    texts_svg_debug = [
+        {
+            "text": t.get("text"),
+            "unit": t.get("unit"),
+            "value": t.get("value"),
+            "bbox": t.get("bbox"),
+            "center": t.get("center"),
+        }
+        for t in text_elems
+    ]
+
+    dbg = debug_dict.setdefault("dimscale", {})
+    dbg["segments_svg"] = segments_svg
+    dbg["texts_svg"] = texts_svg_debug
+    dbg["pairs"] = pairs
 
     # convert ratio to both svg_per_unit and unit_per_svg
     # best_ratio_x means [svg units] / [number units]
@@ -1088,4 +1229,5 @@ def estimate_dimline_scale(
         inlier_cluster_size=inliers,
         preview_horizontal=prev_h,
         preview_vertical=prev_v,
+        debug=debug_dict,
     )
