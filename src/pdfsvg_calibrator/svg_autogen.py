@@ -258,6 +258,10 @@ def export_pdf_page_to_svg(
             actual_svg,
         )
         if produced_svg is not None:
+            if verbose:
+                print(f"[pdfsvg] accept: success -> {produced_svg}")
+            assert isinstance(produced_svg, Path), f"Expected Path, got {type(produced_svg)}"
+            assert produced_svg.exists(), f"Produced SVG not found: {produced_svg}"
             return produced_svg
 
     if pdf2svg_exe is not None and (pdf2svg_exe != pdftosvg_exe or pdftosvg_exe is None):
@@ -273,6 +277,10 @@ def export_pdf_page_to_svg(
             out_svg,
         )
         if produced_svg is not None:
+            if verbose:
+                print(f"[pdfsvg] accept: success -> {produced_svg}")
+            assert isinstance(produced_svg, Path), f"Expected Path, got {type(produced_svg)}"
+            assert produced_svg.exists(), f"Produced SVG not found: {produced_svg}"
             return produced_svg
 
     if verbose and last_exception is not None:
@@ -322,4 +330,8 @@ def ensure_svg_for_pdf(
         require_text=require_text,
         verbose=verbose,
     )
+    if verbose:
+        print(f"[pdfsvg] ensure_svg_for_pdf -> {produced_svg}")
+    assert isinstance(produced_svg, Path), f"Expected Path from export_pdf_page_to_svg, got {type(produced_svg)}"
+    assert produced_svg.exists(), f"Produced SVG not found: {produced_svg}"
     return produced_svg
