@@ -1012,6 +1012,9 @@ def preprocess(
     ),
 ) -> None:
     logger = Logger(verbose=verbose)
+    from .xml_guard import install_lxml_tag_guard
+
+    _install = install_lxml_tag_guard(verbose=verbose)
     try:
         with open(config, "r", encoding="utf-8") as f:
             loaded_cfg = yaml.safe_load(f) or {}
