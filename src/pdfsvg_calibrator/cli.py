@@ -1122,6 +1122,42 @@ def preprocess(
         typer.echo(f" warn                    : {_fmt(scale_map.get('warn'))}")
 
         typer.echo("")
+        typer.echo("=== Scale summary ===")
+        dim_px_x = scale_map.get("dim_pixels_per_unit_x")
+        dim_px_y = scale_map.get("dim_pixels_per_unit_y")
+        dim_inliers_x = scale_map.get("dim_inliers_x")
+        dim_inliers_y = scale_map.get("dim_inliers_y")
+        typer.echo(
+            " S_dim_x(px/unit)     : "
+            + _fmt(dim_px_x)
+            + (f" (inliers={int(dim_inliers_x)})" if isinstance(dim_inliers_x, (int, float)) else "")
+        )
+        typer.echo(
+            " S_dim_y(px/unit)     : "
+            + _fmt(dim_px_y)
+            + (f" (inliers={int(dim_inliers_y)})" if isinstance(dim_inliers_y, (int, float)) else "")
+        )
+        g_px = scale_map.get("global_raster_px_per_pdf_pt")
+        g_ratio = scale_map.get("global_raster_ratio")
+        g_ncc = scale_map.get("global_raster_ncc")
+        g_scale = scale_map.get("global_raster_best_scale")
+        if any(x is not None for x in (g_px, g_ratio, g_ncc, g_scale)):
+            parts: List[str] = []
+            if g_px is not None:
+                parts.append(f"px/pdf-pt={_fmt(g_px)}")
+            if g_ratio is not None:
+                parts.append(f"ratio={_fmt(g_ratio)}")
+            if g_scale is not None:
+                parts.append(f"scale={_fmt(g_scale)}")
+            if g_ncc is not None:
+                parts.append(f"NCC={_fmt(g_ncc)}")
+            typer.echo(" G_raster         : " + " | ".join(parts) if parts else " G_raster         : n/a")
+        notices = scale_map.get("consistency_notices")
+        if isinstance(notices, list) and notices:
+            for note in notices:
+                typer.echo(f" note             : {note}")
+
+        typer.echo("")
         typer.echo("=== Timings ===")
         timing_summary = result.get("timing_summary")
         if isinstance(timing_summary, str) and timing_summary:
