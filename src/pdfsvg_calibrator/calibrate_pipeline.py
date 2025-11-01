@@ -89,17 +89,11 @@ def _extract_global_raster_config(config: Mapping[str, Any] | None) -> Dict[str,
             result["enabled"] = bool(value)
             break
 
-    for src in sources:
-        value = src.get("dpi")
-        if value is None:
-            continue
-        try:
-            candidate = int(value)
-        except (TypeError, ValueError):
-            continue
-        if candidate > 0:
-            result["dpi"] = candidate
-            break
+    # ``dpi`` is intentionally forced to the project default (150 DPI) for the
+    # global raster validation.  Even if configuration files specify a
+    # different value we normalise to the mandated setting so that the
+    # correlation always runs on a comparable raster resolution.
+    result["dpi"] = 150
 
     for src in sources:
         value = src.get("search_range")
@@ -369,8 +363,9 @@ def calibrate_pdf_svg_preprocess(
     if not isinstance(raster_cfg, Mapping):
         raster_cfg = {}
 
-    dpi_coarse = int(raster_cfg.get("dpi_coarse", 150))
-    dpi_fallback = int(raster_cfg.get("dpi_coarse_fallback", dpi_coarse))
+    dpi_global = int(global_raster_cfg.get("dpi", 150))
+    dpi_coarse = dpi_global
+    dpi_fallback = dpi_global
     dpi_debug = int(raster_cfg.get("dpi_debug", 300))
     svg_ppu_coarse = float(raster_cfg.get("svg_ppu_coarse", 1.0))
     svg_ppu_fallback = float(raster_cfg.get("svg_ppu_fallback", svg_ppu_coarse))
@@ -433,31 +428,6 @@ def calibrate_pdf_svg_preprocess(
             apply_scale=False,
         )
 
-    global_raster_result: Dict[str, Any] | None = None
-    if global_raster_cfg.get("enabled", True):
-        with tm.section("global_raster_scale"):
-            try:
-                global_raster_result = _estimate_global_raster_scale(
-                    pdf_gray,
-                    svg_oriented,
-                    global_raster_cfg,
-                )
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.debug("Global raster scale failed: %s", exc)
-                global_raster_result = {"error": str(exc)}
-        if isinstance(global_raster_result, dict):
-            global_raster_result.setdefault("ncc_score", None)
-            global_raster_result.setdefault("best_scale", None)
-            global_raster_result["enabled"] = True
-            global_raster_result["dpi"] = int(final_dpi)
-            global_raster_result["search_range"] = list(global_raster_cfg.get("search_range", (0.4, 3.0)))
-            global_raster_result["coarse_step"] = float(global_raster_cfg.get("coarse_step", 0.01))
-            global_raster_result["fine_window"] = float(global_raster_cfg.get("fine_window", 0.02))
-            global_raster_result["fine_step"] = float(global_raster_cfg.get("fine_step", 0.001))
-            global_raster_result["margin_crop_pct"] = float(global_raster_cfg.get("ncc_margin_crop_pct", 0.0))
-    else:
-        global_raster_result = None
-
     debug_path: Path | str | None = None
 
     with tm.section("debug_export", include_in_compute=False):
@@ -487,13 +457,88 @@ def calibrate_pdf_svg_preprocess(
     with tm.section("dimscale_refine"):
         metric = refine_metric_scale(svg_bytes, coarse, cfg)
 
+    global_raster_result: Dict[str, Any] | None = None
+    global_raster_ok = False
+    scale_hint_raw: float | None = None
+    scale_hint_value = coarse.get("scale_hint")
+    if isinstance(scale_hint_value, (int, float)) and math.isfinite(scale_hint_value):
+        scale_hint_raw = float(scale_hint_value)
+
+    if global_raster_cfg.get("enabled", True):
+        with tm.section("global_raster_scale"):
+            try:
+                global_raster_result = _estimate_global_raster_scale(
+                    pdf_gray,
+                    svg_oriented,
+                    global_raster_cfg,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.debug("Global raster scale failed: %s", exc)
+                global_raster_result = {"error": str(exc)}
+    else:
+        global_raster_result = {
+            "enabled": False,
+            "ok": False,
+            "dpi": int(global_raster_cfg.get("dpi", 150)),
+        }
+
+    if isinstance(global_raster_result, dict):
+        enabled_flag = bool(global_raster_cfg.get("enabled", True))
+        global_raster_result.setdefault("ncc_score", None)
+        global_raster_result.setdefault("best_scale", None)
+        global_raster_result.setdefault("ok", False)
+        global_raster_result["enabled"] = enabled_flag
+        global_raster_result.setdefault("dpi", int(global_raster_cfg.get("dpi", 150)))
+        global_raster_result["search_range"] = list(
+            global_raster_cfg.get("search_range", (0.4, 3.0))
+        )
+        global_raster_result["coarse_step"] = float(global_raster_cfg.get("coarse_step", 0.01))
+        global_raster_result["fine_window"] = float(global_raster_cfg.get("fine_window", 0.02))
+        global_raster_result["fine_step"] = float(global_raster_cfg.get("fine_step", 0.001))
+        global_raster_result["margin_crop_pct"] = float(
+            global_raster_cfg.get("ncc_margin_crop_pct", 0.0)
+        )
+
+        if enabled_flag:
+            best_scale_val = global_raster_result.get("best_scale")
+            ncc_val = global_raster_result.get("ncc_score")
+            valid_scale = isinstance(best_scale_val, (int, float)) and math.isfinite(best_scale_val)
+            valid_scale = valid_scale and float(best_scale_val) > 0.0
+            valid_score = isinstance(ncc_val, (int, float)) and math.isfinite(ncc_val)
+            global_raster_ok = bool(valid_scale and valid_score)
+            global_raster_result["ok"] = global_raster_ok
+
+            if not global_raster_ok:
+                coarse["global_raster_ok"] = False
+                logger.warning("Global Raster-Check lieferte keine gültige Skalierung")
+            else:
+                scale_factor = float(best_scale_val)  # type: ignore[arg-type]
+                coarse["global_raster_ok"] = True
+                coarse["global_raster_scale"] = scale_factor
+                if scale_hint_raw is not None:
+                    coarse.setdefault("scale_hint_raw", scale_hint_raw)
+                    coarse["scale_hint"] = scale_hint_raw * scale_factor
+                coarse.setdefault("pixels_per_svg_unit", float(pixels_per_svg_unit))
+                coarse["pixels_per_svg_unit_global"] = float(pixels_per_svg_unit) * scale_factor
+        else:
+            coarse["global_raster_ok"] = False
+
     if isinstance(metric, dict) and isinstance(global_raster_result, dict):
         debug_section = metric.setdefault("debug", {})
         if isinstance(debug_section, dict):
             debug_section["global_raster"] = dict(global_raster_result)
 
     with tm.section("verify_scales"):
-        scale_hint = float(coarse.get("scale_hint", 0.0)) if coarse.get("scale_hint") is not None else None
+        scale_hint = (
+            float(coarse.get("scale_hint", 0.0))
+            if coarse.get("scale_hint") is not None
+            else None
+        )
+        scale_hint_original = coarse.get("scale_hint_raw")
+        if isinstance(scale_hint_original, (int, float)) and math.isfinite(scale_hint_original):
+            scale_hint_raw_value: float | None = float(scale_hint_original)
+        else:
+            scale_hint_raw_value = scale_hint
         scale_vbox = pixels_per_svg_unit / pdf_px_per_point if pdf_px_per_point else None
         pixels_per_meter = metric.get("pixels_per_meter") if isinstance(metric, Mapping) else None
         scale_dim = None
@@ -544,12 +589,13 @@ def calibrate_pdf_svg_preprocess(
             if isinstance(best_scale_val, (int, float)) and math.isfinite(best_scale_val):
                 global_scale_raw = float(best_scale_val)
                 global_ratio = float(best_scale_val)
+                hint_for_global = scale_hint_raw_value
                 if (
-                    isinstance(scale_hint, (int, float))
-                    and math.isfinite(scale_hint)
-                    and float(scale_hint) > 0.0
+                    isinstance(hint_for_global, (int, float))
+                    and math.isfinite(hint_for_global)
+                    and float(hint_for_global) > 0.0
                 ):
-                    global_ratio *= float(scale_hint)
+                    global_ratio *= float(hint_for_global)
                 if pdf_px_per_point:
                     global_px_per_pdf_pt = global_ratio * pdf_px_per_point if global_ratio is not None else None
             ncc_val = global_raster_result.get("ncc_score")
