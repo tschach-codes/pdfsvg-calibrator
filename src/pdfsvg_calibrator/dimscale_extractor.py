@@ -1025,29 +1025,94 @@ def _gather_dim_candidates(
     return cands
 
 
-def _extract_dim_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+def _extract_dim_config(config: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Return normalized configuration for dimension-line aggregation."""
+
+    defaults = {
+        "min_inliers": 3,
+        "aggregation_rel_tol": 0.10,
+        "min_svg_len_px_abs": None,
+        "min_value_units": None,
+    }
+
     if not isinstance(config, Mapping):
-        return {}
-    dim_section = config.get("dim")
+        return dict(defaults)
+
+    dim_section = config.get("dim") if isinstance(config, Mapping) else None
+    sources: List[Mapping[str, Any]] = []
     if isinstance(dim_section, Mapping):
-        return dim_section
-    return {}
+        sources.append(dim_section)
+    sources.append(config)
+
+    result = dict(defaults)
+
+    def _pick_int(key: str, minimum: int | None = None) -> None:
+        for src in sources:
+            value = src.get(key)
+            if value is None:
+                continue
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                continue
+            if minimum is not None and candidate < minimum:
+                continue
+            result[key] = candidate
+            return
+
+    def _pick_float(key: str, minimum: float | None = None) -> None:
+        for src in sources:
+            value = src.get(key)
+            if value is None:
+                continue
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(candidate):
+                continue
+            if minimum is not None and candidate < minimum:
+                continue
+            result[key] = candidate
+            return
+
+    _pick_int("min_inliers", minimum=1)
+    _pick_float("aggregation_rel_tol", minimum=0.0)
+    _pick_float("min_svg_len_px_abs", minimum=0.0)
+    _pick_float("min_value_units", minimum=0.0)
+
+    return result
 
 
 def _aggregate_axis_scales(
     scales: List[Tuple[float, Optional[int]]],
     rel_tol: float,
     min_inliers: int,
-) -> Tuple[Optional[float], int, Optional[float], Optional[float], List[int]]:
+) -> Tuple[Optional[float], Dict[str, Any], List[int]]:
+    """Aggregate raw ratios for a single axis and return scale + debug info."""
+
+    info: Dict[str, Any] = {
+        "median": None,
+        "tol_rel": rel_tol,
+        "tol_abs": None,
+        "inlier_count": 0,
+        "candidate_count": len(scales),
+        "reason": "no_candidates" if not scales else "unknown",
+    }
+
     values = [s for s, _ in scales if math.isfinite(s)]
     if not values:
-        return (None, 0, None, None, [])
+        return (None, info, [])
 
     median = float(np.median(values))
     if not math.isfinite(median):
-        return (None, 0, None, None, [])
+        info["reason"] = "median_invalid"
+        return (None, info, [])
 
     tol = abs(median) * rel_tol
+    info["median"] = median
+    info["tol_abs"] = tol
+
     inlier_vals: List[float] = []
     inlier_pairs: List[int] = []
     for value, pair_idx in scales:
@@ -1059,14 +1124,18 @@ def _aggregate_axis_scales(
                 inlier_pairs.append(pair_idx)
 
     inlier_count = len(inlier_vals)
+    info["inlier_count"] = inlier_count
     if inlier_count < min_inliers:
-        return (None, inlier_count, median, tol, inlier_pairs)
+        info["reason"] = "insufficient_inliers"
+        return (None, info, inlier_pairs)
 
     aggregated = float(np.median(inlier_vals))
     if not math.isfinite(aggregated) or aggregated <= 0:
-        return (None, inlier_count, median, tol, inlier_pairs)
+        info["reason"] = "aggregate_invalid"
+        return (None, info, inlier_pairs)
 
-    return (aggregated, inlier_count, median, tol, inlier_pairs)
+    info["reason"] = "ok"
+    return (aggregated, info, inlier_pairs)
 
 
 def _raster_debug_crop(
@@ -1184,55 +1253,27 @@ def estimate_dimline_scale(
 
     dim_cfg = _extract_dim_config(config if isinstance(config, Mapping) else None)
 
-    rel_tol = 0.10
-    cfg_sources: List[Mapping[str, Any]] = []
-    if isinstance(dim_cfg, Mapping) and dim_cfg:
-        cfg_sources.append(dim_cfg)
-    if isinstance(config, Mapping):
-        cfg_sources.append(config)
-    for src in cfg_sources:
-        value = src.get("aggregation_rel_tol")
-        if value is None:
-            continue
-        try:
-            candidate = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(candidate) and candidate > 0:
-            rel_tol = candidate
-            break
+    rel_tol = float(dim_cfg.get("aggregation_rel_tol", 0.10))
+    if not math.isfinite(rel_tol) or rel_tol <= 0:
+        rel_tol = 0.10
 
-    min_inliers = 3
-    min_inliers_val = dim_cfg.get("min_inliers") if isinstance(dim_cfg, Mapping) else None
-    if min_inliers_val is not None:
-        try:
-            candidate = int(min_inliers_val)
-        except (TypeError, ValueError):
-            candidate = None
-        if candidate is not None and candidate > 0:
-            min_inliers = candidate
+    min_inliers = int(dim_cfg.get("min_inliers", 3))
+    if min_inliers <= 0:
+        min_inliers = 3
 
-    min_svg_len_px_abs: Optional[float] = None
-    if isinstance(dim_cfg, Mapping):
-        val = dim_cfg.get("min_svg_len_px_abs")
-        if val is not None:
-            try:
-                candidate = float(val)
-            except (TypeError, ValueError):
-                candidate = None
-            if candidate is not None and math.isfinite(candidate) and candidate > 0:
-                min_svg_len_px_abs = candidate
+    min_svg_len_raw = dim_cfg.get("min_svg_len_px_abs")
+    min_svg_len_px_abs: Optional[float]
+    if isinstance(min_svg_len_raw, (int, float)) and math.isfinite(min_svg_len_raw) and min_svg_len_raw > 0:
+        min_svg_len_px_abs = float(min_svg_len_raw)
+    else:
+        min_svg_len_px_abs = None
 
-    min_value_units: Optional[float] = None
-    if isinstance(dim_cfg, Mapping):
-        val = dim_cfg.get("min_value_units")
-        if val is not None:
-            try:
-                candidate = float(val)
-            except (TypeError, ValueError):
-                candidate = None
-            if candidate is not None and math.isfinite(candidate) and candidate > 0:
-                min_value_units = candidate
+    min_value_raw = dim_cfg.get("min_value_units")
+    min_value_units: Optional[float]
+    if isinstance(min_value_raw, (int, float)) and math.isfinite(min_value_raw) and min_value_raw > 0:
+        min_value_units = float(min_value_raw)
+    else:
+        min_value_units = None
 
     scales_h: List[Tuple[float, Optional[int]]] = []
     scales_v: List[Tuple[float, Optional[int]]] = []
@@ -1269,12 +1310,8 @@ def estimate_dimline_scale(
 
     tot_cands = len(scales_h) + len(scales_v)
 
-    scale_x_svg_per_unit, inliers_x, median_x, tol_x, inlier_pairs_x = _aggregate_axis_scales(
-        scales_h, rel_tol, min_inliers
-    )
-    scale_y_svg_per_unit, inliers_y, median_y, tol_y, inlier_pairs_y = _aggregate_axis_scales(
-        scales_v, rel_tol, min_inliers
-    )
+    scale_x_svg_per_unit, info_x, inlier_pairs_x = _aggregate_axis_scales(scales_h, rel_tol, min_inliers)
+    scale_y_svg_per_unit, info_y, inlier_pairs_y = _aggregate_axis_scales(scales_v, rel_tol, min_inliers)
 
     ok_x = scale_x_svg_per_unit is not None
     ok_y = scale_y_svg_per_unit is not None
@@ -1286,7 +1323,7 @@ def estimate_dimline_scale(
     else:
         reason = "insufficient inliers"
 
-    inliers = max(inliers_x, inliers_y)
+    inliers = max(int(info_x.get("inlier_count", 0)), int(info_y.get("inlier_count", 0)))
 
     # prepare debug crops:
     prev_h = None
@@ -1329,20 +1366,30 @@ def estimate_dimline_scale(
     dbg["texts_svg"] = texts_svg_debug
     dbg["pairs"] = pairs
     dbg["scale_aggregation"] = {
-        "rel_tol": rel_tol,
-        "min_inliers": min_inliers,
-        "inlier_x": inliers_x,
-        "inlier_y": inliers_y,
-        "candidates_x": len(scales_h),
-        "candidates_y": len(scales_v),
-        "median_x": median_x,
-        "median_y": median_y,
-        "tolerance_x": tol_x,
-        "tolerance_y": tol_y,
-        "scale_x": scale_x_svg_per_unit,
-        "scale_y": scale_y_svg_per_unit,
-        "min_svg_len_px_abs": min_svg_len_px_abs,
-        "min_value_units": min_value_units,
+        "config": {
+            "aggregation_rel_tol": rel_tol,
+            "min_inliers": min_inliers,
+            "min_svg_len_px_abs": min_svg_len_px_abs,
+            "min_value_units": min_value_units,
+        },
+        "x": {
+            "scale": scale_x_svg_per_unit,
+            "median": info_x.get("median"),
+            "tol_rel": info_x.get("tol_rel"),
+            "tol_abs": info_x.get("tol_abs"),
+            "inlier_count": info_x.get("inlier_count"),
+            "candidate_count": info_x.get("candidate_count"),
+            "reason": info_x.get("reason"),
+        },
+        "y": {
+            "scale": scale_y_svg_per_unit,
+            "median": info_y.get("median"),
+            "tol_rel": info_y.get("tol_rel"),
+            "tol_abs": info_y.get("tol_abs"),
+            "inlier_count": info_y.get("inlier_count"),
+            "candidate_count": info_y.get("candidate_count"),
+            "reason": info_y.get("reason"),
+        },
     }
 
     # convert ratio to both svg_per_unit and unit_per_svg
