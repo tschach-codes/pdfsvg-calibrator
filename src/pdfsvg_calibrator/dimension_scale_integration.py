@@ -183,6 +183,7 @@ def refine_metric_scale(
         dimscale_result = estimate_dimline_scale(
             svg_path=tmp_svg_path,
             enable_ocr_paths=enable_ocr,
+            config=dimscale_cfg,
         )
     finally:
         try:

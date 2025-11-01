@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Mapping
 import math
 import io
 import numpy as np
@@ -836,6 +836,7 @@ def _gather_dim_candidates(
     normal_dist_max: float = 50.0,
     require_hv_only: bool = True,
     enable_ocr_paths: bool = False,
+    config: Mapping[str, Any] | None = None,
 ) -> List[DimCandidate]:
     """
     1. compute doc diagonal in SVG coords from viewBox
@@ -852,124 +853,174 @@ def _gather_dim_candidates(
     vb = _get_viewbox_from_root(root)
     if vb is None:
         return []
-    vb_minx, vb_miny, vb_w, vb_h = vb
+    _vb_minx, _vb_miny, vb_w, vb_h = vb
     diag = math.hypot(vb_w, vb_h)
     min_len_abs = min_len_rel_diag * diag
 
+    cfg_map: Mapping[str, Any] | None = config if isinstance(config, Mapping) else None
+    dim_cfg: Mapping[str, Any] | None = None
+    if cfg_map is not None:
+        dim_section = cfg_map.get("dim") if isinstance(cfg_map.get("dim"), Mapping) else None
+        if isinstance(dim_section, Mapping):
+            dim_cfg = dim_section
+    if dim_cfg is None:
+        dim_cfg = {}
+
+    max_proj_dist_pct = 0.04
+    for source in (dim_cfg, cfg_map or {}):
+        if not isinstance(source, Mapping):
+            continue
+        value = source.get("max_proj_dist_pct")
+        if value is None:
+            continue
+        try:
+            candidate_pct = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate_pct) and candidate_pct > 0:
+            max_proj_dist_pct = candidate_pct
+            break
+
+    scale_ref = max(vb_w, vb_h)
+    if not math.isfinite(scale_ref) or scale_ref <= 0:
+        scale_ref = diag if math.isfinite(diag) and diag > 0 else 1.0
+    max_proj_dist_px = max_proj_dist_pct * scale_ref
+    if not math.isfinite(max_proj_dist_px) or max_proj_dist_px <= 0:
+        max_proj_dist_px = normal_dist_max
+    else:
+        max_proj_dist_px = max(0.0, max_proj_dist_px)
+        if normal_dist_max > 0:
+            max_proj_dist_px = min(max_proj_dist_px, normal_dist_max)
+    if max_proj_dist_px <= 0:
+        max_proj_dist_px = normal_dist_max if normal_dist_max > 0 else diag * 0.04
+
+    texts_svg_filtered: List[Dict[str, Any]] = []
+    for entry in text_elems:
+        val = entry.get("value")
+        center = entry.get("center")
+        if not isinstance(center, (tuple, list)) or len(center) != 2:
+            continue
+        if not isinstance(val, (int, float)) or not math.isfinite(val) or val <= 0:
+            continue
+        entry["value_m"] = float(val)
+        texts_svg_filtered.append(entry)
+
+    def _nearest_text_for_segment(
+        mid_pt: Tuple[float, float],
+        normal_vec: Tuple[float, float],
+        texts: List[Dict[str, Any]],
+    ) -> Optional[Tuple[Tuple[float, float], Dict[str, Any], float, Tuple[float, float], float]]:
+        nx, ny = normal_vec
+        if abs(nx) < 1e-9 and abs(ny) < 1e-9:
+            return None
+        mx, my = mid_pt
+        best: Optional[Tuple[Tuple[float, float], Dict[str, Any], float, Tuple[float, float], float]] = None
+        for text in texts:
+            center = text.get("center")
+            if not isinstance(center, (tuple, list)) or len(center) != 2:
+                continue
+            cx, cy = float(center[0]), float(center[1])
+            vx = cx - mx
+            vy = cy - my
+            proj = vx * nx + vy * ny
+            if proj <= 0 or proj > max_proj_dist_px:
+                continue
+            ortho = abs(vx * ny - vy * nx)
+            score = (ortho, proj)
+            if best is None or score < best[0]:
+                best = (score, text, proj, (nx, ny), ortho)
+        return best
+
     cands: List[DimCandidate] = []
 
-    for seg_idx, (x1,y1,x2,y2) in enumerate(segments):
-        p1 = (x1,y1)
-        p2 = (x2,y2)
-        L, ori = _length_and_orientation(p1,p2)
+    for seg_idx, (x1, y1, x2, y2) in enumerate(segments):
+        p1 = (x1, y1)
+        p2 = (x2, y2)
+        L, ori = _length_and_orientation(p1, p2)
         if L < min_len_abs:
             continue
-        if require_hv_only and (ori not in ("h","v")):
+        if require_hv_only and (ori not in ("h", "v")):
             continue
 
-        mid = _midpoint(p1,p2)
-        nvec = _normal_vector(p1,p2)
+        mid = _midpoint(p1, p2)
+        nvec = _normal_vector(p1, p2)
 
-        # search <text> candidates
-        best_local: Optional[DimCandidate] = None
-
-        for t in text_elems:
-            raw_txt = t.get("text", "")
-            bbox_xywh = t.get("bbox")
-            if not bbox_xywh:
-                continue
-            center_txt = t.get("center") or _bbox_center(bbox_xywh)
-
-            # Check perpendicular distance to line is not crazy
-            perp_dist = _closest_point_dist_to_line(p1,p2, center_txt)
-            if perp_dist > normal_dist_max:
-                continue
-
-            # Check projection along normal is within ±normal_dist_max
-            dist_n = _dist_along_normal(mid, nvec, center_txt)
-            if abs(dist_n) > normal_dist_max:
-                continue
-
-            # We got a plausible measurement label.
-            val = t.get("value")
-            bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
-            txt_idx = t.get("_debug_index")
-            if txt_idx is None:
-                txt_idx = text_elems.index(t)
-
-            pairs_debug.append({
-                "seg": seg_idx,
-                "txt": txt_idx,
-                "dist": dist_n,
-                "value": val,
-                "unit": t.get("unit"),
-            })
-            pair_idx = len(pairs_debug) - 1
-
-            cand = DimCandidate(
-                p1=p1,
-                p2=p2,
-                length=L,
-                orientation=ori,
-                numeric_value=val,
-                raw_text=raw_txt,
-                text_bbox=bbox_minmax,
-                dist_normal=dist_n,
-                pair_index=pair_idx,
-            )
-            # prefer ones with a parsed numeric value
-            if best_local is None:
-                best_local = cand
-            else:
-                # heuristic: choose the closer one in |dist_n|
-                if abs(cand.dist_normal) < abs(best_local.dist_normal):
-                    best_local = cand
-
-        # no <text> match -> optionally OCR path cluster in vicinity
-        if best_local is None and enable_ocr_paths:
-            # define a crop bbox that we'd OCR
-            # We'll look normal_dist_max above/below the line midpoint
+        best_match = _nearest_text_for_segment(mid, nvec, texts_svg_filtered)
+        if best_match is None and (abs(nvec[0]) > 1e-9 or abs(nvec[1]) > 1e-9):
+            flipped_normal = (-nvec[0], -nvec[1])
+            best_match = _nearest_text_for_segment(mid, flipped_normal, texts_svg_filtered)
+        if best_match is None and enable_ocr_paths:
             cx0 = mid[0] - normal_dist_max
             cy0 = mid[1] - normal_dist_max
             cx1 = mid[0] + normal_dist_max
             cy1 = mid[1] + normal_dist_max
-            cropbox = (cx0,cy0,cx1,cy1)
+            cropbox = (cx0, cy0, cx1, cy1)
 
-            # (1) collect <path> elements in that crop (not used in v1 except to decide "is there anything")
             paths_here = _collect_paths_in_bbox(root, cropbox)
             if paths_here:
-                # (2) OCR that region
                 raw_ocr = _ocr_crop_from_svg(root, cropbox, dpi=200)
                 if raw_ocr:
                     val = _try_parse_number(raw_ocr)
-                    if val is not None:
+                    if val is not None and val > 0:
                         bbox_xywh = _bbox_minmax_to_xywh(cropbox)
                         ocr_entry = _make_text_entry(raw_ocr, bbox_xywh, value=val)
                         ocr_entry["_debug_index"] = len(text_elems)
-                        text_elems.append(ocr_entry)
-                        txt_idx = ocr_entry["_debug_index"]
-                        pairs_debug.append({
-                            "seg": seg_idx,
-                            "txt": txt_idx,
-                            "dist": 0.0,
-                            "value": val,
-                            "unit": ocr_entry.get("unit"),
-                        })
-                        pair_idx = len(pairs_debug) - 1
-                        best_local = DimCandidate(
-                            p1=p1,
-                            p2=p2,
-                            length=L,
-                            orientation=ori,
-                            numeric_value=val,
-                            raw_text=raw_ocr,
-                            text_bbox=cropbox,
-                            dist_normal=0.0,
-                            pair_index=pair_idx,
-                        )
+                        ocr_entry_center = ocr_entry.get("center")
+                        if isinstance(ocr_entry_center, (tuple, list)) and len(ocr_entry_center) == 2:
+                            ocr_entry["value_m"] = float(val)
+                            text_elems.append(ocr_entry)
+                            texts_svg_filtered.append(ocr_entry)
+                            best_match = _nearest_text_for_segment(mid, nvec, texts_svg_filtered)
+                            if best_match is None and (abs(nvec[0]) > 1e-9 or abs(nvec[1]) > 1e-9):
+                                flipped_normal = (-nvec[0], -nvec[1])
+                                best_match = _nearest_text_for_segment(mid, flipped_normal, texts_svg_filtered)
 
-        if best_local is not None:
-            cands.append(best_local)
+        if best_match is None:
+            continue
+
+        _score, text_entry, proj, normal_used, ortho_err = best_match
+        val_m = text_entry.get("value_m")
+        if val_m is None or not math.isfinite(val_m) or val_m <= 0:
+            continue
+
+        bbox_xywh = text_entry.get("bbox")
+        if not bbox_xywh:
+            continue
+        bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
+        txt_idx = text_entry.get("_debug_index")
+        if txt_idx is None:
+            txt_idx = text_elems.index(text_entry)
+
+        dot = nvec[0] * normal_used[0] + nvec[1] * normal_used[1]
+        dist_normal = proj if dot >= 0 else -proj
+
+        pairs_debug.append(
+            {
+                "seg": seg_idx,
+                "txt": txt_idx,
+                "dist": dist_normal,
+                "value": val_m,
+                "unit": text_entry.get("unit"),
+                "proj_px": proj,
+                "ortho_err": ortho_err,
+                "normal": normal_used,
+                "mid": mid,
+            }
+        )
+        pair_idx = len(pairs_debug) - 1
+
+        cand = DimCandidate(
+            p1=p1,
+            p2=p2,
+            length=L,
+            orientation=ori,
+            numeric_value=float(val_m),
+            raw_text=text_entry.get("text", ""),
+            text_bbox=bbox_minmax,
+            dist_normal=dist_normal,
+            pair_index=pair_idx,
+        )
+        cands.append(cand)
 
     return cands
 
@@ -1122,6 +1173,7 @@ def _raster_debug_crop(
 def estimate_dimline_scale(
     svg_path: str,
     enable_ocr_paths: bool = False,
+    config: Mapping[str, Any] | None = None,
 ) -> DimScaleResult:
     """
     High-level entry:
@@ -1175,6 +1227,7 @@ def estimate_dimline_scale(
         normal_dist_max=50.0,         # ±50 SVG units orthogonal
         require_hv_only=True,         # h/v only for now
         enable_ocr_paths=enable_ocr_paths,
+        config=config,
     )
 
     cluster_rel_tol = 0.01
