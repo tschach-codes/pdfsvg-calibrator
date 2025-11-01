@@ -3,10 +3,83 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .dimscale_extractor import estimate_dimline_scale
 from .debug_utils import write_dim_debug_svg
+from .raster_align import estimate_raster_alignment
+
+
+def integrate_scales(svg_path: str, pdf_path: str, page: int, config: Mapping[str, Any] | None, dim_result: Any) -> Dict[str, Any]:
+    debug: Dict[str, Any] = {}
+    dim_debug = getattr(dim_result, "debug", None)
+    if isinstance(dim_debug, Mapping):
+        debug["dimscale"] = dim_debug.get("dimscale", {})
+    else:
+        debug["dimscale"] = {}
+
+    out = {
+        "S_dim_x": getattr(dim_result, "scale_x_svg_per_unit", None),
+        "S_dim_y": getattr(dim_result, "scale_y_svg_per_unit", None),
+        "ok_dim": bool(getattr(dim_result, "ok", False)),
+    }
+
+    gr_cfg = {}
+    if isinstance(config, Mapping):
+        gr_cfg = dict(config.get("global_raster", {}) if isinstance(config.get("global_raster"), Mapping) else {})
+
+    if gr_cfg.get("enabled", True):
+        dpi = int(gr_cfg.get("dpi", 150))
+        sr_raw = gr_cfg.get("search_range", (0.4, 3.0))
+        if isinstance(sr_raw, Sequence) and len(sr_raw) >= 2:
+            search_range = (float(sr_raw[0]), float(sr_raw[1]))
+        else:
+            search_range = (0.4, 3.0)
+        coarse = float(gr_cfg.get("coarse_step", 0.01))
+        fwin = float(gr_cfg.get("fine_window", 0.02))
+        fstep = float(gr_cfg.get("fine_step", 0.001))
+        margin = float(gr_cfg.get("ncc_margin_crop_pct", 3))
+
+        ok_raster, res = estimate_raster_alignment(
+            svg_path,
+            pdf_path,
+            page=page,
+            dpi=dpi,
+            search_range=search_range,
+            coarse_step=coarse,
+            fine_window=fwin,
+            fine_step=fstep,
+            ncc_margin_crop_pct=margin,
+        )
+
+        debug["global_raster"] = {
+            **res,
+            "dpi": dpi,
+            "search_range": list(search_range),
+            "coarse_step": coarse,
+            "fine_step": fstep,
+            "fine_window": fwin,
+            "margin_crop_pct": margin,
+        }
+        out["ok_global_raster"] = bool(ok_raster)
+        out["G_raster"] = res.get("scale") if ok_raster else None
+    else:
+        out["ok_global_raster"] = False
+        out["G_raster"] = None
+
+    Sx = out.get("S_dim_x")
+    Sy = out.get("S_dim_y")
+    G = out.get("G_raster")
+    notes: List[str] = []
+    if isinstance(Sx, (int, float)) and isinstance(Sy, (int, float)) and Sx and Sy:
+        anis = abs((float(Sx) / float(Sy)) - 1.0)
+        if anis > 0.02:
+            notes.append(f"anisotropy_dim={anis:.3%}")
+    if isinstance(G, (int, float)) and isinstance(Sx, (int, float)) and isinstance(Sy, (int, float)):
+        pass
+    out["notes"] = notes
+    out["debug"] = debug
+    return out
 
 
 def _extract_scale_candidates(*values: Optional[float]) -> Optional[float]:
@@ -225,6 +298,28 @@ def refine_metric_scale(
         except Exception as e:  # pragma: no cover - debug helper
             print("[pdfsvg] write_dim_debug_svg failed:", e)
 
+    integration_result: Optional[Dict[str, Any]] = None
+    svg_path_input = None
+    pdf_path_input = None
+    page_index = 0
+    if isinstance(inputs_cfg, Mapping):
+        svg_path_input = inputs_cfg.get("svg_path")
+        pdf_path_input = inputs_cfg.get("pdf_path")
+        page_cfg = inputs_cfg.get("page_index")
+        if isinstance(page_cfg, int):
+            page_index = page_cfg
+    if svg_path_input and pdf_path_input and dimscale_result is not None:
+        try:
+            integration_result = integrate_scales(
+                str(svg_path_input),
+                str(pdf_path_input),
+                page_index,
+                cfg,
+                dimscale_result,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            integration_result = {"error": str(exc)}
+
     svg_units_per_unit = _extract_scale_candidates(
         getattr(dimscale_result, "scale_x_svg_per_unit", None),
         getattr(dimscale_result, "scale_y_svg_per_unit", None),
@@ -253,9 +348,12 @@ def refine_metric_scale(
             "unit_name": unit_name,
         },
     }
+    if integration_result is not None:
+        debug_info["integration"] = integration_result
 
     return {
         "ok": ok,
         "pixels_per_meter": pixels_per_meter if ok else None,
         "debug": debug_info,
+        "integration": integration_result,
     }

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 """Raster-based coarse alignment helpers built on existing orientation logic."""
 
+import io
 import math
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 import numpy as np
@@ -13,7 +14,12 @@ import pypdfium2 as pdfium
 from PIL import Image
 
 from .orientation import phase_correlation
-from .rendering import render_pdf_page_to_bitmap, render_svg_to_bitmap
+from .rendering import (
+    get_svg_viewbox,
+    render_pdf_page_to_bitmap,
+    render_svg_to_bitmap,
+    render_svg_viewbox_gray,
+)
 
 
 @dataclass
@@ -92,6 +98,107 @@ def _parse_svg_metadata(svg_bytes: bytes) -> Dict[str, float]:
         meta["height"] = meta["viewbox_height"]
 
     return meta
+
+
+def _to_float_image(arr: np.ndarray) -> np.ndarray:
+    image = np.asarray(arr)
+    if image.dtype != np.float32:
+        image = image.astype(np.float32)
+    if image.size and image.max(initial=0.0) > 1.0:
+        image /= 255.0
+    return image
+
+
+def _crop_margin(image: np.ndarray, margin_pct: float) -> np.ndarray:
+    if image.ndim != 2:
+        raise ValueError("_crop_margin expects 2D arrays")
+    if margin_pct <= 0:
+        return image
+    height, width = image.shape
+    if height <= 2 or width <= 2:
+        return image
+    margin_y = int(round(height * margin_pct / 100.0))
+    margin_x = int(round(width * margin_pct / 100.0))
+    margin_y = min(margin_y, height // 2)
+    margin_x = min(margin_x, width // 2)
+    if margin_y == 0 and margin_x == 0:
+        return image
+    y0 = margin_y
+    y1 = height - margin_y
+    x0 = margin_x
+    x1 = width - margin_x
+    if y1 <= y0 or x1 <= x0:
+        return image
+    return image[y0:y1, x0:x1]
+
+
+def _center_crop_float(image: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    if image.ndim != 2:
+        raise ValueError("_center_crop_float expects 2D arrays")
+    h, w = image.shape
+    if target_h > h or target_w > w:
+        raise ValueError("target shape must be <= source shape")
+    start_y = (h - target_h) // 2
+    start_x = (w - target_w) // 2
+    return image[start_y : start_y + target_h, start_x : start_x + target_w]
+
+
+def _center_fit_uint8(image: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+    if image.ndim != 2:
+        raise ValueError("_center_fit_uint8 expects 2D arrays")
+    target_h, target_w = target_shape
+    arr = image
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+
+    if arr.shape[0] > target_h:
+        start = (arr.shape[0] - target_h) // 2
+        arr = arr[start : start + target_h, :]
+    elif arr.shape[0] < target_h:
+        pad_top = (target_h - arr.shape[0]) // 2
+        pad_bottom = target_h - arr.shape[0] - pad_top
+        arr = np.pad(arr, ((pad_top, pad_bottom), (0, 0)), mode="constant")
+
+    if arr.shape[1] > target_w:
+        start = (arr.shape[1] - target_w) // 2
+        arr = arr[:, start : start + target_w]
+    elif arr.shape[1] < target_w:
+        pad_left = (target_w - arr.shape[1]) // 2
+        pad_right = target_w - arr.shape[1] - pad_left
+        arr = np.pad(arr, ((0, 0), (pad_left, pad_right)), mode="constant")
+
+    return arr.astype(np.uint8, copy=False)
+
+
+def _rescale_canvas_uint8(image: np.ndarray, scale: float, target_shape: Tuple[int, int]) -> np.ndarray:
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+    if image.ndim != 2:
+        raise ValueError("_rescale_canvas_uint8 expects 2D arrays")
+
+    height, width = image.shape
+    new_h = max(1, int(round(height * scale)))
+    new_w = max(1, int(round(width * scale)))
+
+    if new_h == height and new_w == width:
+        resized = image.astype(np.uint8, copy=False)
+    else:
+        pil_img = Image.fromarray(image)
+        resized = np.asarray(pil_img.resize((new_w, new_h), Image.BILINEAR), dtype=np.uint8)
+
+    return _center_fit_uint8(resized, target_shape)
+
+
+def _normalized_cross_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    a_mean = float(a.mean())
+    b_mean = float(b.mean())
+    a_std = float(a.std())
+    b_std = float(b.std())
+    if a_std <= 1e-9 or b_std <= 1e-9:
+        return 0.0
+    return float(((a - a_mean) * (b - b_mean)).mean() / (a_std * b_std))
 
 
 def _resize_like(image: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
@@ -244,3 +351,191 @@ def coarse_raster_align(
         "debug": debug_info,
     }
     return result
+
+
+def estimate_raster_alignment(
+    svg_path: str,
+    pdf_path: str,
+    page: int = 0,
+    dpi: int = 150,
+    search_range: Tuple[float, float] = (0.4, 3.0),
+    coarse_step: float = 0.01,
+    fine_window: float = 0.02,
+    fine_step: float = 0.001,
+    ncc_margin_crop_pct: float = 3,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Estimate a global raster scale between an SVG and PDF page."""
+
+    result: Dict[str, Any] = {
+        "scale": None,
+        "ncc_score": None,
+        "coarse_best": None,
+        "coarse_score": None,
+        "fine_best": None,
+        "fine_score": None,
+        "search_range": [float(search_range[0]), float(search_range[1])],
+        "coarse_step": float(coarse_step),
+        "fine_window": float(fine_window),
+        "fine_step": float(fine_step),
+        "margin_crop_pct": float(ncc_margin_crop_pct),
+        "dpi": int(dpi),
+        "page": int(page),
+    }
+
+    try:
+        with open(pdf_path, "rb") as f_pdf:
+            pdf_bytes = f_pdf.read()
+    except OSError as exc:
+        result["error"] = f"pdf read failed: {exc}"
+        return False, result
+
+    try:
+        with open(svg_path, "rb") as f_svg:
+            svg_bytes = f_svg.read()
+    except OSError as exc:
+        result["error"] = f"svg read failed: {exc}"
+        return False, result
+
+    if dpi <= 0:
+        result["error"] = "dpi must be positive"
+        return False, result
+    if coarse_step <= 0:
+        coarse_step = 0.01
+    if fine_step <= 0:
+        fine_step = 0.001
+    if fine_window < 0:
+        fine_window = 0.0
+
+    try:
+        pdf_stream = io.BytesIO(pdf_bytes)
+        doc = pdfium.PdfDocument(pdf_stream)
+        try:
+            if page < 0 or page >= len(doc):
+                result["error"] = f"page index {page} out of range"
+                return False, result
+            pdf_page = doc[page]
+            try:
+                scale = dpi / 72.0
+                pil_pdf = pdf_page.render(scale=scale).to_pil().convert("L")
+            finally:
+                pdf_page.close()
+        finally:
+            doc.close()
+    except Exception as exc:  # pragma: no cover - defensive
+        result["error"] = f"pdf render failed: {exc}"
+        return False, result
+
+    pdf_gray = np.asarray(pil_pdf, dtype=np.uint8)
+    if pdf_gray.ndim != 2:
+        result["error"] = "pdf raster is not 2D"
+        return False, result
+
+    try:
+        _, _, vb_w, vb_h = get_svg_viewbox(svg_bytes)
+        max_side = max(float(vb_w), float(vb_h), 1e-6)
+    except Exception:
+        max_side = None
+
+    if max_side is not None and max_side > 0:
+        ppu_seed = max(
+            pdf_gray.shape[1] / max(float(vb_w), 1e-6),
+            pdf_gray.shape[0] / max(float(vb_h), 1e-6),
+        )
+    else:
+        ppu_seed = dpi / 72.0
+    ppu_seed = max(ppu_seed, 1e-3)
+
+    try:
+        svg_gray = render_svg_viewbox_gray(svg_bytes, ppu_seed)
+    except Exception as exc:  # pragma: no cover - render failure
+        result["error"] = f"svg render failed: {exc}"
+        return False, result
+
+    if svg_gray.ndim != 2:
+        result["error"] = "svg raster is not 2D"
+        return False, result
+
+    search_low, search_high = search_range
+    try:
+        search_low = float(search_low)
+        search_high = float(search_high)
+    except Exception:
+        search_low, search_high = (0.4, 3.0)
+    if search_low <= 0 or not math.isfinite(search_low):
+        search_low = 0.4
+    if search_high <= 0 or not math.isfinite(search_high):
+        search_high = max(search_low + 0.01, 3.0)
+    if search_low >= search_high:
+        search_low, search_high = (min(search_low, search_high), max(search_low, search_high) + 0.01)
+
+    target_shape = (int(pdf_gray.shape[0]), int(pdf_gray.shape[1]))
+    pdf_float = _to_float_image(pdf_gray)
+    pdf_crop = _crop_margin(pdf_float, float(ncc_margin_crop_pct))
+
+    best_scale: Optional[float] = None
+    best_score = float("-inf")
+    coarse_best: Optional[float] = None
+    coarse_best_score = float("-inf")
+    fine_best: Optional[float] = None
+    fine_best_score = float("-inf")
+
+    def score_for(scale_value: float) -> float:
+        try:
+            scaled_uint8 = _rescale_canvas_uint8(svg_gray, scale_value, target_shape)
+        except ValueError:
+            return float("nan")
+        scaled_float = _to_float_image(scaled_uint8)
+        scaled_crop = _crop_margin(scaled_float, float(ncc_margin_crop_pct))
+        pdf_aligned = pdf_crop
+        if scaled_crop.shape != pdf_crop.shape:
+            target_h = min(scaled_crop.shape[0], pdf_crop.shape[0])
+            target_w = min(scaled_crop.shape[1], pdf_crop.shape[1])
+            if target_h <= 0 or target_w <= 0:
+                return float("nan")
+            scaled_crop = _center_crop_float(scaled_crop, target_h, target_w)
+            pdf_aligned = _center_crop_float(pdf_crop, target_h, target_w)
+        return _normalized_cross_correlation(scaled_crop, pdf_aligned)
+
+    scale_value = search_low
+    while scale_value <= search_high + 1e-12:
+        score = score_for(scale_value)
+        if math.isfinite(score) and score > coarse_best_score:
+            coarse_best_score = score
+            coarse_best = scale_value
+        scale_value += coarse_step
+
+    if coarse_best is not None:
+        best_scale = coarse_best
+        best_score = coarse_best_score
+
+        fine_start = max(search_low, coarse_best - fine_window)
+        fine_end = min(search_high, coarse_best + fine_window)
+
+        scale_value = fine_start
+        while scale_value <= fine_end + 1e-12:
+            score = score_for(scale_value)
+            if math.isfinite(score) and score > fine_best_score:
+                fine_best_score = score
+                fine_best = scale_value
+            scale_value += fine_step
+
+        if fine_best is not None and fine_best_score >= best_score:
+            best_scale = fine_best
+            best_score = fine_best_score
+
+    result.update(
+        {
+            "coarse_best": coarse_best,
+            "coarse_score": coarse_best_score if math.isfinite(coarse_best_score) else None,
+            "fine_best": fine_best,
+            "fine_score": fine_best_score if math.isfinite(fine_best_score) else None,
+            "scale": best_scale,
+            "ncc_score": best_score if math.isfinite(best_score) else None,
+            "pdf_shape": (int(pdf_gray.shape[0]), int(pdf_gray.shape[1])),
+            "svg_shape": (int(svg_gray.shape[0]), int(svg_gray.shape[1])),
+            "svg_ppu_seed": float(ppu_seed),
+        }
+    )
+
+    ok_flag = best_scale is not None and math.isfinite(best_score)
+    return ok_flag, result

@@ -1084,60 +1084,6 @@ def _extract_dim_config(config: Mapping[str, Any] | None) -> Dict[str, Any]:
     return result
 
 
-def _aggregate_axis_scales(
-    scales: List[Tuple[float, Optional[int]]],
-    rel_tol: float,
-    min_inliers: int,
-) -> Tuple[Optional[float], Dict[str, Any], List[int]]:
-    """Aggregate raw ratios for a single axis and return scale + debug info."""
-
-    info: Dict[str, Any] = {
-        "median": None,
-        "tol_rel": rel_tol,
-        "tol_abs": None,
-        "inlier_count": 0,
-        "candidate_count": len(scales),
-        "reason": "no_candidates" if not scales else "unknown",
-    }
-
-    values = [s for s, _ in scales if math.isfinite(s)]
-    if not values:
-        return (None, info, [])
-
-    median = float(np.median(values))
-    if not math.isfinite(median):
-        info["reason"] = "median_invalid"
-        return (None, info, [])
-
-    tol = abs(median) * rel_tol
-    info["median"] = median
-    info["tol_abs"] = tol
-
-    inlier_vals: List[float] = []
-    inlier_pairs: List[int] = []
-    for value, pair_idx in scales:
-        if not math.isfinite(value):
-            continue
-        if abs(value - median) <= tol:
-            inlier_vals.append(value)
-            if isinstance(pair_idx, int):
-                inlier_pairs.append(pair_idx)
-
-    inlier_count = len(inlier_vals)
-    info["inlier_count"] = inlier_count
-    if inlier_count < min_inliers:
-        info["reason"] = "insufficient_inliers"
-        return (None, info, inlier_pairs)
-
-    aggregated = float(np.median(inlier_vals))
-    if not math.isfinite(aggregated) or aggregated <= 0:
-        info["reason"] = "aggregate_invalid"
-        return (None, info, inlier_pairs)
-
-    info["reason"] = "ok"
-    return (aggregated, info, inlier_pairs)
-
-
 def _raster_debug_crop(
     root,
     bbox: Tuple[float,float,float,float],
@@ -1275,8 +1221,7 @@ def estimate_dimline_scale(
     else:
         min_value_units = None
 
-    scales_h: List[Tuple[float, Optional[int]]] = []
-    scales_v: List[Tuple[float, Optional[int]]] = []
+    scale_candidates: List[Dict[str, Any]] = []
     for cand in cands:
         value = cand.numeric_value
         if value is None or not math.isfinite(value) or value <= 0:
@@ -1302,16 +1247,49 @@ def estimate_dimline_scale(
         if not math.isfinite(ratio) or ratio <= 0:
             continue
 
-        entry = (float(ratio), cand.pair_index)
-        if cand.orientation == "h":
-            scales_h.append(entry)
-        else:
-            scales_v.append(entry)
+        scale_candidates.append(
+            {
+                "svg_per_unit": float(ratio),
+                "orientation": cand.orientation,
+                "pair_index": cand.pair_index,
+            }
+        )
 
-    tot_cands = len(scales_h) + len(scales_v)
+    tot_cands = len(scale_candidates)
 
-    scale_x_svg_per_unit, info_x, inlier_pairs_x = _aggregate_axis_scales(scales_h, rel_tol, min_inliers)
-    scale_y_svg_per_unit, info_y, inlier_pairs_y = _aggregate_axis_scales(scales_v, rel_tol, min_inliers)
+    agg_rel_tol = rel_tol
+    min_inliers_required = max(1, min_inliers)
+
+    scales_h_vals = [e["svg_per_unit"] for e in scale_candidates if e.get("orientation") == "h"]
+    scales_v_vals = [e["svg_per_unit"] for e in scale_candidates if e.get("orientation") == "v"]
+
+    def _robust_med_inliers(values: List[float], rel_tol: float, min_inliers: int):
+        vals = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v) and v > 0]
+        if not vals:
+            return None, [], "no candidates"
+        med = float(np.median(vals))
+        if not (math.isfinite(med) and med > 0):
+            return None, [], "invalid median"
+        tol_abs = abs(med) * rel_tol
+        inliers = [v for v in vals if abs(v - med) <= tol_abs]
+        if len(inliers) < min_inliers:
+            return None, inliers, f"not enough inliers ({len(inliers)}<{min_inliers})"
+        return float(np.median(inliers)), inliers, "ok"
+
+    scale_x_svg_per_unit, inliers_x, reason_x = _robust_med_inliers(
+        scales_h_vals, agg_rel_tol, min_inliers_required
+    )
+    scale_y_svg_per_unit, inliers_y, reason_y = _robust_med_inliers(
+        scales_v_vals, agg_rel_tol, min_inliers_required
+    )
+
+    def invert_or_none(v):
+        if v is None or abs(v) < 1e-12:
+            return None
+        return 1.0 / v
+
+    scale_x_unit_per_svg = invert_or_none(scale_x_svg_per_unit)
+    scale_y_unit_per_svg = invert_or_none(scale_y_svg_per_unit)
 
     ok_x = scale_x_svg_per_unit is not None
     ok_y = scale_y_svg_per_unit is not None
@@ -1321,9 +1299,18 @@ def estimate_dimline_scale(
     elif tot_cands == 0:
         reason = "no valid scale candidates"
     else:
-        reason = "insufficient inliers"
+        reason = ", ".join(
+            part for part in (f"x:{reason_x}" if reason_x != "ok" else None,
+                              f"y:{reason_y}" if reason_y != "ok" else None)
+            if part
+        ) or "insufficient inliers"
 
-    inliers = max(int(info_x.get("inlier_count", 0)), int(info_y.get("inlier_count", 0)))
+    inliers = max(len(inliers_x), len(inliers_y))
+
+    median_x = float(np.median(scales_h_vals)) if scales_h_vals else None
+    median_y = float(np.median(scales_v_vals)) if scales_v_vals else None
+    tol_abs_x = abs(median_x) * agg_rel_tol if median_x is not None else None
+    tol_abs_y = abs(median_y) * agg_rel_tol if median_y is not None else None
 
     # prepare debug crops:
     prev_h = None
@@ -1341,10 +1328,32 @@ def estimate_dimline_scale(
 
     # mark inlier pairs for debug overlays
     inlier_pair_indices: set[int] = set()
-    if ok_x:
-        inlier_pair_indices.update(inlier_pairs_x)
-    if ok_y:
-        inlier_pair_indices.update(inlier_pairs_y)
+    center_x = scale_x_svg_per_unit if ok_x else median_x
+    center_y = scale_y_svg_per_unit if ok_y else median_y
+    if tol_abs_x is not None and center_x is not None:
+        for entry in scale_candidates:
+            if entry.get("orientation") != "h":
+                continue
+            val = entry.get("svg_per_unit")
+            pair_idx = entry.get("pair_index")
+            if not isinstance(val, (int, float)) or not math.isfinite(val):
+                continue
+            if not isinstance(pair_idx, int):
+                continue
+            if abs(val - center_x) <= tol_abs_x:
+                inlier_pair_indices.add(pair_idx)
+    if tol_abs_y is not None and center_y is not None:
+        for entry in scale_candidates:
+            if entry.get("orientation") != "v":
+                continue
+            val = entry.get("svg_per_unit")
+            pair_idx = entry.get("pair_index")
+            if not isinstance(val, (int, float)) or not math.isfinite(val):
+                continue
+            if not isinstance(pair_idx, int):
+                continue
+            if abs(val - center_y) <= tol_abs_y:
+                inlier_pair_indices.add(pair_idx)
 
     for idx in inlier_pair_indices:
         if 0 <= idx < len(pairs):
@@ -1367,41 +1376,30 @@ def estimate_dimline_scale(
     dbg["pairs"] = pairs
     dbg["scale_aggregation"] = {
         "config": {
-            "aggregation_rel_tol": rel_tol,
-            "min_inliers": min_inliers,
+            "aggregation_rel_tol": agg_rel_tol,
+            "min_inliers": min_inliers_required,
             "min_svg_len_px_abs": min_svg_len_px_abs,
             "min_value_units": min_value_units,
         },
         "x": {
             "scale": scale_x_svg_per_unit,
-            "median": info_x.get("median"),
-            "tol_rel": info_x.get("tol_rel"),
-            "tol_abs": info_x.get("tol_abs"),
-            "inlier_count": info_x.get("inlier_count"),
-            "candidate_count": info_x.get("candidate_count"),
-            "reason": info_x.get("reason"),
+            "median": median_x,
+            "tol_rel": agg_rel_tol,
+            "tol_abs": tol_abs_x,
+            "inlier_count": len(inliers_x),
+            "candidate_count": len(scales_h_vals),
+            "reason": reason_x,
         },
         "y": {
             "scale": scale_y_svg_per_unit,
-            "median": info_y.get("median"),
-            "tol_rel": info_y.get("tol_rel"),
-            "tol_abs": info_y.get("tol_abs"),
-            "inlier_count": info_y.get("inlier_count"),
-            "candidate_count": info_y.get("candidate_count"),
-            "reason": info_y.get("reason"),
+            "median": median_y,
+            "tol_rel": agg_rel_tol,
+            "tol_abs": tol_abs_y,
+            "inlier_count": len(inliers_y),
+            "candidate_count": len(scales_v_vals),
+            "reason": reason_y,
         },
     }
-
-    # convert ratio to both svg_per_unit and unit_per_svg
-    # scale_x_svg_per_unit means [svg units] / [number units]
-    # => unit_per_svg = 1/scale_x_svg_per_unit (if nonzero)
-    def invert_or_none(v):
-        if v is None: return None
-        if abs(v) < 1e-12: return None
-        return 1.0/v
-
-    scale_x_unit_per_svg = invert_or_none(scale_x_svg_per_unit)
-    scale_y_unit_per_svg = invert_or_none(scale_y_svg_per_unit)
 
     return DimScaleResult(
         ok=ok,

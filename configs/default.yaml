@@ -105,3 +105,18 @@ dimscale:
   enabled: true
   default_unit: m
   min_inlier_cluster: 3
+dim:
+  min_inliers: 3
+  aggregation_rel_tol: 0.10
+  # optional:
+  # min_svg_len_px_abs: 30
+  # min_value_units: 0.05
+
+global_raster:
+  enabled: true
+  dpi: 150
+  search_range: [0.4, 3.0]
+  coarse_step: 0.01
+  fine_window: 0.02
+  fine_step: 0.001
+  ncc_margin_crop_pct: 3
