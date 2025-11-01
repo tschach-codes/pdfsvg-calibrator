@@ -1025,98 +1025,6 @@ def _gather_dim_candidates(
     return cands
 
 
-def _cluster_scale_ratios(
-    cands: List[DimCandidate],
-    min_total: int = 3,
-    rel_tol: float = 0.01,
-) -> Tuple[bool,str,Optional[float],Optional[float],int,int]:
-    """
-    Compute ratio_x = length_x / value, ratio_y = length_y / value
-    (length_x == length for horizontal, length_y == length for vertical.
-     For 'diag' we can project onto x/y, aber wir ignorieren diag für jetzt.)
-    Then cluster by closeness (±1 %).
-    We need:
-      - >= min_total candidates overall
-      - and >=2 inliers in at least one cluster
-
-    Returns:
-      ok(bool), reason(str),
-      best_ratio_x, best_ratio_y,
-      total_candidates, inlier_cluster_size
-    """
-    usable = []
-    for c in cands:
-        if c.numeric_value is None:
-            continue
-        if c.numeric_value == 0:
-            continue
-
-        dx = abs(c.p2[0] - c.p1[0])
-        dy = abs(c.p2[1] - c.p1[1])
-
-        # ratio_x meaningful if horizontal-ish
-        ratio_x = None
-        ratio_y = None
-        if c.orientation == "h":
-            ratio_x = dx / c.numeric_value
-        elif c.orientation == "v":
-            ratio_y = dy / c.numeric_value
-        # (diag we ignore for now)
-
-        usable.append((ratio_x, ratio_y))
-
-    if len(usable) < min_total:
-        return (False, f"not enough dimension candidates ({len(usable)})", None, None, len(usable), 0)
-
-    # cluster ratio_x and ratio_y separately, pick biggest consistent group
-    best_ratio_x, inliers_x = _cluster_1d(
-        [r[0] for r in usable if r[0] is not None],
-        rel_tol=rel_tol
-    )
-    best_ratio_y, inliers_y = _cluster_1d(
-        [r[1] for r in usable if r[1] is not None],
-        rel_tol=rel_tol
-    )
-
-    inlier_cluster_size = max(inliers_x, inliers_y)
-
-    if inlier_cluster_size < 2:
-        return (False, "no stable 1% cluster", best_ratio_x, best_ratio_y, len(usable), inlier_cluster_size)
-
-    return (True, "ok", best_ratio_x, best_ratio_y, len(usable), inlier_cluster_size)
-
-
-def _cluster_1d(values: List[float], rel_tol: float) -> Tuple[Optional[float], int]:
-    """
-    Very simple clustering: sort, slide window, find largest group where
-    max/min <= (1+rel_tol)*min.
-    Return median and group size.
-    """
-    vals = [v for v in values if v is not None and math.isfinite(v)]
-    if not vals:
-        return (None, 0)
-    vals.sort()
-    best_group = []
-    start = 0
-    for start in range(len(vals)):
-        vmin = vals[start]
-        vmax_allowed = vmin * (1.0 + rel_tol)
-        group = [vmin]
-        for j in range(start+1, len(vals)):
-            if vals[j] <= vmax_allowed:
-                group.append(vals[j])
-            else:
-                break
-        if len(group) > len(best_group):
-            best_group = group[:]
-
-    if not best_group:
-        return (None, 0)
-    # median of best_group
-    m = np.median(best_group)
-    return (float(m), len(best_group))
-
-
 def _raster_debug_crop(
     root,
     bbox: Tuple[float,float,float,float],
@@ -1180,14 +1088,54 @@ def estimate_dimline_scale(
     - parse SVG
     - extract <line> segments
     - gather DimCandidates via long-line + nearby text logic
-    - cluster ratios (x and y separately)
-    - pick best cluster if >=3 total, >=2 inliers in 1% band
+    - berechne svg/unit-Skalenkandidaten aus den Paaren
+    - robuste Aggregation via Median + ±(rel_tol) und Mindestanzahl an Inliern
     - pick one horiz and one vert candidate to render debug crops
 
     Returns DimScaleResult with scales + debug crop images.
     """
 
     debug_dict: Dict[str, Any] = {}
+    cfg_map: Mapping[str, Any] | None = config if isinstance(config, Mapping) else None
+    dim_cfg: Mapping[str, Any] | None = None
+    if cfg_map is not None:
+        maybe_dim = cfg_map.get("dim")
+        if isinstance(maybe_dim, Mapping):
+            dim_cfg = maybe_dim
+
+    def _resolve_min_inliers() -> int:
+        for source in (dim_cfg, cfg_map):
+            if not isinstance(source, Mapping):
+                continue
+            for key in ("min_inlier_cluster", "min_inliers"):
+                value = source.get(key)
+                if value is None:
+                    continue
+                try:
+                    value_int = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if value_int > 0:
+                    return value_int
+        return 3
+
+    min_inliers_required = _resolve_min_inliers()
+    agg_rel_tol = 0.10
+    for source in (dim_cfg, cfg_map):
+        if not isinstance(source, Mapping):
+            continue
+        tol_value = source.get("aggregation_rel_tol")
+        if tol_value is None:
+            tol_value = source.get("aggregation_tol_rel")
+        if tol_value is None:
+            continue
+        try:
+            tol_float = float(tol_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(tol_float) and tol_float > 0:
+            agg_rel_tol = tol_float
+            break
     segments_svg: List[Tuple[float, float, float, float]] = []
     text_elems: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []
@@ -1230,12 +1178,70 @@ def estimate_dimline_scale(
         config=config,
     )
 
-    cluster_rel_tol = 0.01
-    ok, reason, best_ratio_x, best_ratio_y, tot_cands, inliers = _cluster_scale_ratios(
-        cands,
-        min_total=3,
-        rel_tol=cluster_rel_tol,   # ±1%
-    )
+    scale_candidates: List[Dict[str, Any]] = []
+    for cand in cands:
+        if cand.numeric_value is None or not math.isfinite(cand.numeric_value):
+            continue
+        if cand.numeric_value <= 0:
+            continue
+        if cand.orientation not in ("h", "v"):
+            continue
+        if cand.orientation == "h":
+            svg_len = abs(cand.p2[0] - cand.p1[0])
+        else:
+            svg_len = abs(cand.p2[1] - cand.p1[1])
+        if not math.isfinite(svg_len) or svg_len <= 0:
+            continue
+        svg_per_unit = svg_len / cand.numeric_value
+        if not math.isfinite(svg_per_unit) or svg_per_unit <= 0:
+            continue
+        scale_candidates.append(
+            {
+                "orientation": cand.orientation,
+                "svg_length": svg_len,
+                "value": cand.numeric_value,
+                "svg_per_unit": svg_per_unit,
+                "pair_index": cand.pair_index,
+            }
+        )
+
+    svg_units_per_unit: Optional[float] = None
+    inlier_values: List[float] = []
+    inlier_entries: List[Dict[str, Any]] = []
+    median_scale: Optional[float] = None
+    inlier_pair_indices: set[int] = set()
+    agg_reason: Optional[str] = None
+
+    scales = [entry["svg_per_unit"] for entry in scale_candidates]
+    if scales:
+        med = float(np.median(scales))
+        median_scale = med if math.isfinite(med) else None
+        if median_scale is not None and median_scale > 0:
+            tol_abs = abs(median_scale) * agg_rel_tol
+            inlier_entries = [
+                entry
+                for entry in scale_candidates
+                if math.isfinite(entry["svg_per_unit"])
+                and abs(entry["svg_per_unit"] - median_scale) <= tol_abs
+            ]
+            inlier_values = [entry["svg_per_unit"] for entry in inlier_entries]
+            if len(inlier_values) >= min_inliers_required:
+                svg_units_per_unit = float(np.median(inlier_values))
+                for entry in inlier_entries:
+                    pair_idx = entry.get("pair_index")
+                    if isinstance(pair_idx, int):
+                        inlier_pair_indices.add(pair_idx)
+            else:
+                agg_reason = f"not enough inliers ({len(inlier_values)} < {min_inliers_required})"
+        else:
+            agg_reason = "invalid median scale"
+    else:
+        agg_reason = "no dimension scale candidates"
+
+    if svg_units_per_unit is not None:
+        agg_reason = "ok"
+    elif agg_reason is None:
+        agg_reason = "no valid scale"
 
     # prepare debug crops:
     prev_h = None
@@ -1252,29 +1258,6 @@ def estimate_dimline_scale(
             break
 
     # mark inlier pairs for debug overlays
-    def _within_rel_tol(value: Optional[float], reference: Optional[float]) -> bool:
-        if value is None or reference is None:
-            return False
-        if abs(reference) < 1e-12:
-            return False
-        return abs(value - reference) <= abs(reference) * cluster_rel_tol
-
-    inlier_pair_indices: set[int] = set()
-    for cand in cands:
-        if cand.numeric_value is None or cand.numeric_value == 0 or cand.pair_index is None:
-            continue
-        dx = abs(cand.p2[0] - cand.p1[0])
-        dy = abs(cand.p2[1] - cand.p1[1])
-        ratio = None
-        if cand.orientation == "h":
-            ratio = dx / cand.numeric_value
-            if _within_rel_tol(ratio, best_ratio_x):
-                inlier_pair_indices.add(cand.pair_index)
-        elif cand.orientation == "v":
-            ratio = dy / cand.numeric_value
-            if _within_rel_tol(ratio, best_ratio_y):
-                inlier_pair_indices.add(cand.pair_index)
-
     for idx in inlier_pair_indices:
         if 0 <= idx < len(pairs):
             pairs[idx]["inlier"] = True
@@ -1294,30 +1277,62 @@ def estimate_dimline_scale(
     dbg["segments_svg"] = segments_svg
     dbg["texts_svg"] = texts_svg_debug
     dbg["pairs"] = pairs
+    dbg["scale_candidates"] = scale_candidates
 
-    # convert ratio to both svg_per_unit and unit_per_svg
-    # best_ratio_x means [svg units] / [number units]
-    # => svg_per_unit = best_ratio_x
-    # => unit_per_svg = 1/best_ratio_x (if nonzero)
+    aggregation_debug: Dict[str, Any] = {
+        "reason": agg_reason,
+        "median": median_scale,
+        "rel_tol": agg_rel_tol,
+        "min_inliers": min_inliers_required,
+        "candidate_count": len(scale_candidates),
+        "inlier_values": inlier_values,
+        "inlier_count": len(inlier_values),
+    }
+    if median_scale is not None:
+        aggregation_debug["tolerance_abs"] = abs(median_scale) * agg_rel_tol
+    if svg_units_per_unit is not None:
+        aggregation_debug["scale"] = svg_units_per_unit
+
+    candidate_counts: Dict[str, int] = {}
+    for entry in scale_candidates:
+        ori = entry.get("orientation")
+        if isinstance(ori, str):
+            candidate_counts[ori] = candidate_counts.get(ori, 0) + 1
+    if candidate_counts:
+        aggregation_debug["candidate_counts_by_orientation"] = candidate_counts
+
+    if inlier_entries:
+        inlier_counts: Dict[str, int] = {}
+        for entry in inlier_entries:
+            ori = entry.get("orientation")
+            if isinstance(ori, str):
+                inlier_counts[ori] = inlier_counts.get(ori, 0) + 1
+        aggregation_debug["inlier_counts_by_orientation"] = inlier_counts
+    dbg["scale_aggregation"] = aggregation_debug
+
+    # convert aggregated svg_per_unit scale into both svg/unit and unit/svg
     def invert_or_none(v):
         if v is None: return None
         if abs(v) < 1e-12: return None
         return 1.0/v
 
-    scale_x_svg_per_unit = best_ratio_x
-    scale_y_svg_per_unit = best_ratio_y
-    scale_x_unit_per_svg = invert_or_none(best_ratio_x)
-    scale_y_unit_per_svg = invert_or_none(best_ratio_y)
+    scale_x_svg_per_unit = svg_units_per_unit
+    scale_y_svg_per_unit = svg_units_per_unit
+    scale_x_unit_per_svg = invert_or_none(svg_units_per_unit)
+    scale_y_unit_per_svg = invert_or_none(svg_units_per_unit)
+
+    ok_flag = svg_units_per_unit is not None
+    reason_str = agg_reason or ("ok" if ok_flag else "no valid scale")
 
     return DimScaleResult(
-        ok=ok,
-        reason=reason,
+        ok=ok_flag,
+        reason=reason_str,
         scale_x_svg_per_unit=scale_x_svg_per_unit,
         scale_y_svg_per_unit=scale_y_svg_per_unit,
         scale_x_unit_per_svg=scale_x_unit_per_svg,
         scale_y_unit_per_svg=scale_y_unit_per_svg,
-        candidates_used=tot_cands,
-        inlier_cluster_size=inliers,
+        candidates_used=len(scale_candidates),
+        inlier_cluster_size=len(inlier_values),
         preview_horizontal=prev_h,
         preview_vertical=prev_v,
         debug=debug_dict,
