@@ -1184,6 +1184,40 @@ def estimate_dimline_scale(
     segments_svg = list(segments)
     text_elems = _svg_get_text_elems(root)
 
+    # === BEGIN text debug dump ===
+    dim_cfg = (config or {}).get("dim", {}) if isinstance(config, dict) else {}
+    dump_text = bool(dim_cfg.get("dump_text_debug", True))
+    max_show = int(dim_cfg.get("max_text_debug", 60))
+
+    def _tok_summary(t):
+        return {
+            "text": t.get("text"),
+            "value": t.get("value"),
+            "unit": t.get("unit"),
+            "center": t.get("center"),
+            "bbox": t.get("bbox"),
+        }
+
+    dbg = debug_dict.setdefault("dimscale", {})
+    dbg["text_summary"] = {
+        "total": len(text_elems),
+        "with_value": sum(1 for t in text_elems if t.get("value") is not None),
+        "with_unit": sum(1 for t in text_elems if t.get("unit") is not None),
+        "examples": [_tok_summary(t) for t in text_elems[:max_show]],
+    }
+
+    if dump_text:
+        import json, os
+        base, _ = os.path.splitext(svg_path)
+        dump_path = base + "_texttokens.json"
+        try:
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump([_tok_summary(t) for t in text_elems], f, ensure_ascii=False, indent=2)
+            dbg["text_dump_path"] = dump_path
+        except Exception as _e:
+            dbg["text_dump_error"] = str(_e)
+    # === END text debug dump ===
+
     # Gather candidates
     cands = _gather_dim_candidates(
         root,
