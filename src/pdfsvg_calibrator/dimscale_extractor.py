@@ -866,6 +866,22 @@ def _gather_dim_candidates(
     if dim_cfg is None:
         dim_cfg = {}
 
+    def _get_cfg_float(mapping: Mapping[str, Any], key: str, default: float) -> float:
+        value = mapping.get(key)
+        if value is None:
+            return default
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(candidate):
+            return default
+        return candidate
+
+    min_svg_len_px_abs = _get_cfg_float(dim_cfg, "min_svg_len_px_abs", 50.0)
+    min_value_units = _get_cfg_float(dim_cfg, "min_value_units", 0.10)
+    max_baseline_dev_deg = _get_cfg_float(dim_cfg, "max_baseline_dev_deg", 15.0)
+
     max_proj_dist_pct = 0.04
     for source in (dim_cfg, cfg_map or {}):
         if not isinstance(source, Mapping):
@@ -905,55 +921,94 @@ def _gather_dim_candidates(
         entry["value_m"] = float(val)
         texts_svg_filtered.append(entry)
 
-    def _nearest_text_for_segment(
-        mid_pt: Tuple[float, float],
-        normal_vec: Tuple[float, float],
-        texts: List[Dict[str, Any]],
-    ) -> Optional[Tuple[Tuple[float, float], Dict[str, Any], float, Tuple[float, float], float]]:
-        nx, ny = normal_vec
-        if abs(nx) < 1e-9 and abs(ny) < 1e-9:
-            return None
-        mx, my = mid_pt
-        best: Optional[Tuple[Tuple[float, float], Dict[str, Any], float, Tuple[float, float], float]] = None
-        for text in texts:
-            center = text.get("center")
+    cands: List[DimCandidate] = []
+
+    def _select_best_candidates(
+        text_pool: List[Dict[str, Any]],
+        mx: float,
+        my: float,
+        nx: float,
+        ny: float,
+        dx: float,
+        dy: float,
+    ) -> Tuple[
+        Optional[Tuple[Tuple[float, float], Dict[str, Any], float, float, Tuple[float, float], Tuple[float, float]]],
+        Optional[Tuple[Tuple[float, float], Dict[str, Any], float, float, Tuple[float, float], Tuple[float, float]]],
+    ]:
+        best_pos = None
+        best_neg = None
+        seg_ang = math.degrees(math.atan2(dy, dx))
+        for text_entry in text_pool:
+            val_m = text_entry.get("value")
+            if val_m is None:
+                continue
+            try:
+                val_float = float(val_m)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(val_float) or val_float < min_value_units:
+                continue
+
+            unit = text_entry.get("unit")
+            if isinstance(unit, str):
+                unit_norm = unit.lower()
+            else:
+                unit_norm = unit
+            if unit_norm not in (None, "m"):
+                continue
+
+            center = text_entry.get("center")
             if not isinstance(center, (tuple, list)) or len(center) != 2:
                 continue
-            cx, cy = float(center[0]), float(center[1])
-            vx = cx - mx
-            vy = cy - my
-            proj = vx * nx + vy * ny
-            if proj <= 0 or proj > max_proj_dist_px:
-                continue
-            ortho = abs(vx * ny - vy * nx)
-            score = (ortho, proj)
-            if best is None or score < best[0]:
-                best = (score, text, proj, (nx, ny), ortho)
-        return best
+            cx, cy = center
+            vx = float(cx) - mx
+            vy = float(cy) - my
 
-    cands: List[DimCandidate] = []
+            proj = vx * nx + vy * ny
+            if abs(proj) > max_proj_dist_px > 0:
+                continue
+
+            ortho_err = abs(vx * ny - vy * nx)
+            score = (ortho_err, abs(proj))
+
+            ang = text_entry.get("angle")
+            if isinstance(ang, (int, float)):
+                dev = abs(((float(ang) - seg_ang + 180) % 360) - 180)
+                if dev > max_baseline_dev_deg:
+                    continue
+
+            normal_used = (nx, ny)
+            mid = (mx, my)
+
+            if proj >= 0:
+                if best_pos is None or score < best_pos[0]:
+                    best_pos = (score, text_entry, proj, ortho_err, normal_used, mid)
+            else:
+                if best_neg is None or score < best_neg[0]:
+                    best_neg = (score, text_entry, proj, ortho_err, normal_used, mid)
+        return best_pos, best_neg
 
     for seg_idx, (x1, y1, x2, y2) in enumerate(segments):
         p1 = (x1, y1)
         p2 = (x2, y2)
         L, ori = _length_and_orientation(p1, p2)
-        if L < min_len_abs:
+        if L < max(min_len_abs, min_svg_len_px_abs):
             continue
         if require_hv_only and (ori not in ("h", "v")):
             continue
 
-        mid = _midpoint(p1, p2)
-        nvec = _normal_vector(p1, p2)
+        dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+        seg_len = math.hypot(dx, dy) + 1e-9
+        nx, ny = -dy / seg_len, dx / seg_len
+        mx, my = (p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5
 
-        best_match = _nearest_text_for_segment(mid, nvec, texts_svg_filtered)
-        if best_match is None and (abs(nvec[0]) > 1e-9 or abs(nvec[1]) > 1e-9):
-            flipped_normal = (-nvec[0], -nvec[1])
-            best_match = _nearest_text_for_segment(mid, flipped_normal, texts_svg_filtered)
-        if best_match is None and enable_ocr_paths:
-            cx0 = mid[0] - normal_dist_max
-            cy0 = mid[1] - normal_dist_max
-            cx1 = mid[0] + normal_dist_max
-            cy1 = mid[1] + normal_dist_max
+        best_pos, best_neg = _select_best_candidates(texts_svg_filtered, mx, my, nx, ny, dx, dy)
+
+        if best_pos is None and best_neg is None and enable_ocr_paths:
+            cx0 = mx - normal_dist_max
+            cy0 = my - normal_dist_max
+            cx1 = mx + normal_dist_max
+            cy1 = my + normal_dist_max
             cropbox = (cx0, cy0, cx1, cy1)
 
             paths_here = _collect_paths_in_bbox(root, cropbox)
@@ -965,62 +1020,71 @@ def _gather_dim_candidates(
                         bbox_xywh = _bbox_minmax_to_xywh(cropbox)
                         ocr_entry = _make_text_entry(raw_ocr, bbox_xywh, value=val)
                         ocr_entry["_debug_index"] = len(text_elems)
-                        ocr_entry_center = ocr_entry.get("center")
-                        if isinstance(ocr_entry_center, (tuple, list)) and len(ocr_entry_center) == 2:
+                        center = ocr_entry.get("center")
+                        if isinstance(center, (tuple, list)) and len(center) == 2:
                             ocr_entry["value_m"] = float(val)
                             text_elems.append(ocr_entry)
                             texts_svg_filtered.append(ocr_entry)
-                            best_match = _nearest_text_for_segment(mid, nvec, texts_svg_filtered)
-                            if best_match is None and (abs(nvec[0]) > 1e-9 or abs(nvec[1]) > 1e-9):
-                                flipped_normal = (-nvec[0], -nvec[1])
-                                best_match = _nearest_text_for_segment(mid, flipped_normal, texts_svg_filtered)
+                            best_pos, best_neg = _select_best_candidates(
+                                texts_svg_filtered, mx, my, nx, ny, dx, dy
+                            )
 
-        if best_match is None:
-            continue
+        candidates_for_seg = [x for x in (best_pos, best_neg) if x is not None]
+        seen_pairs: set[Tuple[int, int]] = set()
+        for best in candidates_for_seg:
+            _score, text_entry, proj, ortho_err, normal_used, mid = best
+            seg_id = seg_idx
+            text_id = id(text_entry)
+            key = (seg_id, text_id)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
 
-        _score, text_entry, proj, normal_used, ortho_err = best_match
-        val_m = text_entry.get("value_m")
-        if val_m is None or not math.isfinite(val_m) or val_m <= 0:
-            continue
+            bbox_xywh = text_entry.get("bbox")
+            if not bbox_xywh:
+                continue
+            bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
 
-        bbox_xywh = text_entry.get("bbox")
-        if not bbox_xywh:
-            continue
-        bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
-        txt_idx = text_entry.get("_debug_index")
-        if txt_idx is None:
-            txt_idx = text_elems.index(text_entry)
+            txt_idx = text_entry.get("_debug_index")
+            if txt_idx is None:
+                try:
+                    txt_idx = text_elems.index(text_entry)
+                except ValueError:
+                    txt_idx = None
 
-        dot = nvec[0] * normal_used[0] + nvec[1] * normal_used[1]
-        dist_normal = proj if dot >= 0 else -proj
-
-        pairs_debug.append(
-            {
-                "seg": seg_idx,
-                "txt": txt_idx,
-                "dist": dist_normal,
-                "value": val_m,
+            pairs_debug_entry: Dict[str, Any] = {
+                "line": (p1, p2),
+                "text": text_entry.get("text"),
+                "value": text_entry.get("value"),
                 "unit": text_entry.get("unit"),
                 "proj_px": proj,
                 "ortho_err": ortho_err,
                 "normal": normal_used,
                 "mid": mid,
+                "seg": seg_idx,
             }
-        )
-        pair_idx = len(pairs_debug) - 1
+            if txt_idx is not None:
+                pairs_debug_entry["txt"] = txt_idx
+            pairs_debug.append(pairs_debug_entry)
+            pair_idx = len(pairs_debug) - 1
 
-        cand = DimCandidate(
-            p1=p1,
-            p2=p2,
-            length=L,
-            orientation=ori,
-            numeric_value=float(val_m),
-            raw_text=text_entry.get("text", ""),
-            text_bbox=bbox_minmax,
-            dist_normal=dist_normal,
-            pair_index=pair_idx,
-        )
-        cands.append(cand)
+            try:
+                numeric_value = float(text_entry.get("value"))
+            except (TypeError, ValueError):
+                continue
+
+            cand = DimCandidate(
+                p1=p1,
+                p2=p2,
+                length=L,
+                orientation=ori,
+                numeric_value=numeric_value,
+                raw_text=text_entry.get("text", ""),
+                text_bbox=bbox_minmax,
+                dist_normal=proj,
+                pair_index=pair_idx,
+            )
+            cands.append(cand)
 
     return cands
 
