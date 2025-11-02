@@ -9,7 +9,7 @@ orientation:
 raster:
   dpi_coarse: 150
   dpi_coarse_fallback: 300
-  dpi_debug: 300
+  dpi_debug: 120
   svg_ppu_coarse: 1.0
   svg_ppu_fallback: 2.0
   svg_ppu_debug: 2.0
@@ -126,3 +126,4 @@ global_raster:
   fine_window: 0.02
   fine_step: 0.001
   ncc_margin_crop_pct: 3
+  search_margin_rel: 0.08

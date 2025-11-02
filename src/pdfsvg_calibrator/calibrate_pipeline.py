@@ -65,6 +65,7 @@ def _extract_global_raster_config(config: Mapping[str, Any] | None) -> Dict[str,
         "fine_window": 0.02,
         "fine_step": 0.001,
         "ncc_margin_crop_pct": 3.0,
+        "search_margin_rel": 0.08,
     }
 
     if not isinstance(config, Mapping):
@@ -135,6 +136,7 @@ def _extract_global_raster_config(config: Mapping[str, Any] | None) -> Dict[str,
     _pick_float("fine_window", minimum=0.0)
     _pick_float("fine_step", minimum=0.0)
     _pick_float("ncc_margin_crop_pct", minimum=-0.1)
+    _pick_float("search_margin_rel", minimum=0.0)
 
     return result
 
@@ -367,7 +369,7 @@ def calibrate_pdf_svg_preprocess(
     dpi_global = int(global_raster_cfg.get("dpi", 150))
     dpi_coarse = dpi_global
     dpi_fallback = dpi_global
-    dpi_debug = int(raster_cfg.get("dpi_debug", 300))
+    dpi_debug = int(raster_cfg.get("dpi_debug", 120))
     svg_ppu_coarse = float(raster_cfg.get("svg_ppu_coarse", 1.0))
     svg_ppu_fallback = float(raster_cfg.get("svg_ppu_fallback", svg_ppu_coarse))
     svg_ppu_debug = float(raster_cfg.get("svg_ppu_debug", svg_ppu_coarse))
@@ -435,49 +437,51 @@ def calibrate_pdf_svg_preprocess(
         if save_debug and debug_outdir is not None:
             debug_path = Path(debug_outdir)
             debug_path.mkdir(parents=True, exist_ok=True)
-            pdf_dbg = render_pdf_page_gray(pdf_bytes, dpi_debug)
-            svg_dbg = render_svg_viewbox_gray(svg_bytes, svg_ppu_debug)
-            svg_dbg_oriented = apply_orientation_to_raster(
-                svg_dbg,
-                coarse,
-                canvas_shape=(int(pdf_dbg.shape[0]), int(pdf_dbg.shape[1])),
-                apply_scale=False,
-            )
-            dbg.save_debug_rasters(
-                pdf_dbg,
-                svg_dbg,
-                svg_dbg_oriented,
-                str(debug_path),
-                prefix=debug_prefix,
-            )
+            produce_full = not bool(debug_cfg.get("crops_only"))
+            if produce_full:
+                pdf_dbg = render_pdf_page_gray(pdf_bytes, dpi_debug)
+                svg_dbg = render_svg_viewbox_gray(svg_bytes, svg_ppu_debug)
+                svg_dbg_oriented = apply_orientation_to_raster(
+                    svg_dbg,
+                    coarse,
+                    canvas_shape=(int(pdf_dbg.shape[0]), int(pdf_dbg.shape[1])),
+                    apply_scale=False,
+                )
+                dbg.save_debug_rasters(
+                    pdf_dbg,
+                    svg_dbg,
+                    svg_dbg_oriented,
+                    str(debug_path),
+                    prefix=debug_prefix,
+                )
 
-            svg_dbg_rot_only = orient_svg_bitmap_no_translation(svg_dbg, coarse)
+                svg_dbg_rot_only = orient_svg_bitmap_no_translation(svg_dbg, coarse)
 
-            def ensure_bgr(img: np.ndarray) -> np.ndarray:
-                if img.ndim == 2:
-                    return np.repeat(img[..., None], 3, axis=2)
-                return img
+                def ensure_bgr(img: np.ndarray) -> np.ndarray:
+                    if img.ndim == 2:
+                        return np.repeat(img[..., None], 3, axis=2)
+                    return img
 
-            pdf_dbg_bgr = ensure_bgr(pdf_dbg)
-            svg_dbg_rot_bgr = ensure_bgr(svg_dbg_rot_only)
+                pdf_dbg_bgr = ensure_bgr(pdf_dbg)
+                svg_dbg_rot_bgr = ensure_bgr(svg_dbg_rot_only)
 
-            split_meta: Dict[str, Any] = {}
-            scale_hint_val = coarse.get("scale_hint")
-            if isinstance(scale_hint_val, (int, float)) and math.isfinite(scale_hint_val):
-                split_meta["scale_hint"] = float(scale_hint_val)
-            for key in ("Sx", "Sy"):
-                if key in coarse:
-                    split_meta[key] = coarse[key]
+                split_meta: Dict[str, Any] = {}
+                scale_hint_val = coarse.get("scale_hint")
+                if isinstance(scale_hint_val, (int, float)) and math.isfinite(scale_hint_val):
+                    split_meta["scale_hint"] = float(scale_hint_val)
+                for key in ("Sx", "Sy"):
+                    if key in coarse:
+                        split_meta[key] = coarse[key]
 
-            split_path = debug_path / f"{debug_prefix}_split_red_left_pdf_green_right_svg.png"
-            save_split_pdf_svg(
-                pdf_dbg_bgr,
-                svg_dbg_rot_bgr,
-                str(split_path),
-                (int(pdf_dbg.shape[0]), int(pdf_dbg.shape[1])),
-                (int(svg_dbg_rot_only.shape[0]), int(svg_dbg_rot_only.shape[1])),
-                meta=split_meta or None,
-            )
+                split_path = debug_path / f"{debug_prefix}_split_red_left_pdf_green_right_svg.png"
+                save_split_pdf_svg(
+                    pdf_dbg_bgr,
+                    svg_dbg_rot_bgr,
+                    str(split_path),
+                    (int(pdf_dbg.shape[0]), int(pdf_dbg.shape[1])),
+                    (int(svg_dbg_rot_only.shape[0]), int(svg_dbg_rot_only.shape[1])),
+                    meta=split_meta or None,
+                )
 
     if save_debug:
         # ensure debug_path is str/Path correctly
@@ -492,6 +496,32 @@ def calibrate_pdf_svg_preprocess(
     scale_hint_value = coarse.get("scale_hint")
     if isinstance(scale_hint_value, (int, float)) and math.isfinite(scale_hint_value):
         scale_hint_raw = float(scale_hint_value)
+
+    if (
+        isinstance(scale_hint_raw, float)
+        and math.isfinite(scale_hint_raw)
+        and scale_hint_raw > 0.0
+    ):
+        margin_rel_val = float(global_raster_cfg.get("search_margin_rel", 0.08))
+        if math.isfinite(margin_rel_val) and margin_rel_val > 0.0:
+            low = scale_hint_raw * (1.0 - margin_rel_val)
+            high = scale_hint_raw * (1.0 + margin_rel_val)
+            if low <= 0:
+                low = max(scale_hint_raw * 0.1, 1e-6)
+            if high <= low:
+                high = low * 1.05
+            global_raster_cfg = dict(global_raster_cfg)
+            global_raster_cfg["search_range"] = (low, high)
+            fine_window_raw = global_raster_cfg.get("fine_window")
+            try:
+                fine_window_val = float(fine_window_raw)
+            except (TypeError, ValueError):
+                fine_window_val = margin_rel_val
+            if not math.isfinite(fine_window_val) or fine_window_val <= 0:
+                fine_window_val = margin_rel_val
+            else:
+                fine_window_val = min(fine_window_val, margin_rel_val)
+            global_raster_cfg["fine_window"] = fine_window_val
 
     if global_raster_cfg.get("enabled", True):
         with tm.section("global_raster_scale"):
