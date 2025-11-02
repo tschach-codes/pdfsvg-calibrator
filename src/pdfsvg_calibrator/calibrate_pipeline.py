@@ -14,6 +14,7 @@ from PIL import Image
 from . import debug_utils as dbg
 from .dimension_scale_integration import refine_metric_scale
 from .orientation import apply_orientation_to_raster, coarse_orientation_from_rasters
+from .raster_align import orient_svg_bitmap_no_translation, save_split_pdf_svg
 from .rendering import get_svg_viewbox, render_pdf_page_gray, render_svg_viewbox_gray
 from .timing import Timings
 
@@ -448,6 +449,34 @@ def calibrate_pdf_svg_preprocess(
                 svg_dbg_oriented,
                 str(debug_path),
                 prefix=debug_prefix,
+            )
+
+            svg_dbg_rot_only = orient_svg_bitmap_no_translation(svg_dbg, coarse)
+
+            def ensure_bgr(img: np.ndarray) -> np.ndarray:
+                if img.ndim == 2:
+                    return np.repeat(img[..., None], 3, axis=2)
+                return img
+
+            pdf_dbg_bgr = ensure_bgr(pdf_dbg)
+            svg_dbg_rot_bgr = ensure_bgr(svg_dbg_rot_only)
+
+            split_meta: Dict[str, Any] = {}
+            scale_hint_val = coarse.get("scale_hint")
+            if isinstance(scale_hint_val, (int, float)) and math.isfinite(scale_hint_val):
+                split_meta["scale_hint"] = float(scale_hint_val)
+            for key in ("Sx", "Sy"):
+                if key in coarse:
+                    split_meta[key] = coarse[key]
+
+            split_path = debug_path / f"{debug_prefix}_split_red_left_pdf_green_right_svg.png"
+            save_split_pdf_svg(
+                pdf_dbg_bgr,
+                svg_dbg_rot_bgr,
+                str(split_path),
+                (int(pdf_dbg.shape[0]), int(pdf_dbg.shape[1])),
+                (int(svg_dbg_rot_only.shape[0]), int(svg_dbg_rot_only.shape[1])),
+                meta=split_meta or None,
             )
 
     if save_debug:
