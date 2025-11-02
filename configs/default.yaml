@@ -14,6 +14,9 @@ raster:
   svg_ppu_fallback: 2.0
   svg_ppu_debug: 2.0
   preserve_absolute_scale: true
+debug:
+  dpi: 120          # statt 300
+  crops_only: true  # nur Crops für H/V-Beispiele statt Vollbild
 coarse:
   enabled: true
   topk_rel_by_length: 0.1
@@ -106,11 +109,14 @@ dimscale:
   default_unit: m
   min_inlier_cluster: 3
 dim:
+  dump_text_debug: true
+  max_text_debug: 60
+  min_svg_len_px_abs: 50
+  min_value_units: 0.10
+  max_baseline_dev_deg: 15
+  aggregation_rel_tol: 0.05
   min_inliers: 3
-  aggregation_rel_tol: 0.10
-  # optional:
-  # min_svg_len_px_abs: 30
-  # min_value_units: 0.05
+  expected_tol_factor: 0.50
 
 global_raster:
   enabled: true
