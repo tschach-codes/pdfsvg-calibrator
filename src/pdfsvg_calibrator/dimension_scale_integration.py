@@ -252,12 +252,28 @@ def refine_metric_scale(
         tmp_svg.close()
 
     dimscale_result = None
+    metric_scale: Optional[Dict[str, Optional[float]]] = None
+    metric_reason = "dimscale_unavailable_use_coarse"
     try:
         dimscale_result = estimate_dimline_scale(
             svg_path=tmp_svg_path,
             enable_ocr_paths=enable_ocr,
             config=dimscale_cfg,
         )
+        if dimscale_result is not None and getattr(dimscale_result, "ok", False):
+            scale_x = getattr(dimscale_result, "scale_x_svg_per_unit", None)
+            scale_y = getattr(dimscale_result, "scale_y_svg_per_unit", None)
+            if scale_x is None and scale_y is None:
+                metric_reason = "dimscale_empty_use_coarse"
+            else:
+                metric_scale = {
+                    "x_svg_per_unit": scale_x,
+                    "y_svg_per_unit": scale_y,
+                }
+                metric_reason = "ok"
+        else:
+            metric_scale = None
+            metric_reason = "dimscale_unavailable_use_coarse"
     finally:
         try:
             os.unlink(tmp_svg_path)
@@ -348,6 +364,9 @@ def refine_metric_scale(
             "unit_name": unit_name,
         },
     }
+    debug_info.setdefault("metric_fallback", {})["reason"] = metric_reason
+    if metric_scale is not None:
+        debug_info["metric_fallback"]["metric_scale"] = metric_scale
     if integration_result is not None:
         debug_info["integration"] = integration_result
 
