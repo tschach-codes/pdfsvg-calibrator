@@ -86,17 +86,6 @@ def save_debug_rasters(
     diff = cv2.absdiff(pe, se)
     cv2.imwrite(f"{outdir}/{prefix}_edges_diff.png", diff)
 
-    # Split-View: links PDF (rot), rechts SVG (grün) – NACH Skalierung/Orientierung
-    try:
-        split = make_split_red_left_pdf_green_right_svg(pdf_gray, svg_oriented_no_scale)
-        filename: Final[str] = f"{outdir}/{prefix}_split_red_left_pdf_green_right_svg.png"
-        if iio is not None:
-            iio.imwrite(filename, split)
-        else:  # pragma: no cover - optional dependency
-            cv2.imwrite(filename, cv2.cvtColor(split, cv2.COLOR_RGB2BGR))
-    except Exception as e:  # pragma: no cover - debug helper
-        print("[pdfsvg] split-debug failed:", e)
-
 
 def write_dim_debug_svg(
     src_svg_path: str,

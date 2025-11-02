@@ -3,6 +3,7 @@ from __future__ import annotations
 """Raster-based coarse alignment helpers built on existing orientation logic."""
 
 import io
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ import numpy as np
 import pypdfium2 as pdfium
 from PIL import Image
 
-from .orientation import phase_correlation
+from .orientation import _apply_flip_rotate_raster, phase_correlation
 from .rendering import (
     get_svg_viewbox,
     render_pdf_page_to_bitmap,
@@ -29,6 +30,9 @@ class RenderedPage:
     image: np.ndarray
     width_pt: float
     height_pt: float
+
+
+logger = logging.getLogger(__name__)
 
 
 def _get_pdf_page_dimensions(pdf_page_bytes: bytes, page_index: int = 0) -> Tuple[float, float]:
@@ -539,3 +543,89 @@ def estimate_raster_alignment(
 
     ok_flag = best_scale is not None and math.isfinite(best_score)
     return ok_flag, result
+
+
+def orient_svg_bitmap_no_translation(
+    svg_bitmap: np.ndarray, coarse: Mapping[str, object]
+) -> np.ndarray:
+    """Rotate/flip an SVG raster according to coarse orientation without tx/ty."""
+
+    rotation = int(round(float(coarse.get("rotation_deg", 0))))
+    flip = bool(coarse.get("flip_horizontal", False))
+    return _apply_flip_rotate_raster(svg_bitmap, rotation, flip)
+
+
+def save_split_pdf_svg(
+    pdf_img: np.ndarray,
+    svg_img_oriented: np.ndarray,
+    out_path: str,
+    pdf_shape: tuple[int, int],
+    svg_shape: tuple[int, int],
+    meta: dict[str, Any] | None = None,
+) -> None:
+    """
+    Side-by-side debug: left=PDF (red), right=SVG (green).
+    - Do NOT use tx/ty here.
+    - Canvas: H=max(h_pdf,h_svg), W=w_pdf+w_svg
+    - Place PDF at (0,0), SVG at (w_pdf,0)
+    - Draw a vertical black separator at x=w_pdf
+    - Annotate small white text (top-left) with sizes and scales from meta.
+    """
+
+    import cv2
+    import numpy as np
+
+    h_pdf, w_pdf = pdf_shape
+    h_svg, w_svg = svg_shape
+    H = max(h_pdf, h_svg)
+    W = w_pdf + w_svg
+    canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+    # Ensure inputs match their own panes (pad if needed)
+    def pad_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
+        hh, ww = img.shape[:2]
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        out[:hh, :ww] = img[:h, :w]
+        return out
+
+    pdf_pad = pad_to(pdf_img, h_pdf, w_pdf)
+    svg_pad = pad_to(svg_img_oriented, h_svg, w_svg)
+
+    # Colorize: PDF->red, SVG->green
+    pdf_red = np.zeros_like(pdf_pad)
+    pdf_red[..., 2] = cv2.cvtColor(pdf_pad, cv2.COLOR_BGR2GRAY)
+    svg_green = np.zeros_like(svg_pad)
+    svg_green[..., 1] = cv2.cvtColor(svg_pad, cv2.COLOR_BGR2GRAY)
+
+    canvas[0:h_pdf, 0:w_pdf] = pdf_red
+    canvas[0:h_svg, w_pdf : w_pdf + w_svg] = svg_green
+
+    # Separator
+    cv2.line(canvas, (w_pdf, 0), (w_pdf, H - 1), (0, 0, 0), 2)
+
+    # Small label
+    if meta:
+        label = f"pdf {w_pdf}x{h_pdf} | svg {w_svg}x{h_svg}"
+        if "scale_hint" in meta:
+            label += f" | hint {meta['scale_hint']:.6f}"
+        if "Sx" in meta and "Sy" in meta:
+            label += f" | Sx {meta['Sx']} Sy {meta['Sy']}"
+        cv2.putText(
+            canvas,
+            label,
+            (10, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    logger.info(
+        "split_debug: pdf=%s svg=%s placed=(0,0) & (%s,0) use_tx_ty=False",
+        pdf_shape,
+        svg_shape,
+        w_pdf,
+    )
+
+    cv2.imwrite(out_path, canvas)
