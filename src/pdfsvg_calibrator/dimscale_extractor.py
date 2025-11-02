@@ -9,35 +9,6 @@ from lxml import etree
 import re
 
 
-NUM_RE = re.compile(
-    r"(?<!\\d)"
-    r"(\\d{1,4}(?:[.,]\\d{1,3})?)"     # Zahl mit Komma oder Punkt
-    r"(?:\\s*(m|cm))?"                # optionale Einheit
-    r"\\b(?![²m])",                   # kein m² oder mm
-    re.IGNORECASE
-)
-
-
-def _parse_length_token(s: str, default_unit: str = "m"):
-    """
-    Parse numeric text like '2.50', '2,50', '250', '2.50 m', '250 cm'
-    Returns Wert in Metern (float) oder None.
-    """
-    s = s.replace("\u202f", " ").replace("\xa0", " ")
-    m = NUM_RE.search(s)
-    if not m:
-        return None
-    val_str = m.group(1).replace(",", ".")
-    try:
-        val = float(val_str)
-    except ValueError:
-        return None
-    unit = (m.group(2) or default_unit).lower()
-    if unit == "cm":
-        val /= 100.0
-    return val  # in Meter
-
-
 def _safe_local_tag(el) -> Optional[str]:
     """
     Return lowercase localname for real element nodes.
@@ -495,11 +466,11 @@ def _svg_get_text_elems(root) -> List[Dict[str,Any]]:
     filtered: List[Dict[str, Any]] = []
     for entry in texts:
         raw_txt = entry.get("text", "")
-        parsed_val = _parse_length_token(raw_txt)
-        if parsed_val is None:
+        val_m, unit = _parse_text_value_unit(raw_txt)
+        if val_m is None:
             continue
-        entry["value"] = parsed_val
-        entry["unit"] = "m"
+        entry["value"] = val_m
+        entry["unit"] = unit
         filtered.append(entry)
     return filtered
 
@@ -827,6 +798,65 @@ def _get_viewbox_from_root(root) -> Optional[Tuple[float,float,float,float]]:
 # Core logic
 ###############################################################################
 
+
+# NEW: robuste Helfer für Text-/Zahlenanalyse
+_NUM_PAT = re.compile(
+    r"""
+    (?<!\d)                     # kein Ziffer davor
+    (?P<num>\d{1,5}(?:[.,]\d{1,3})?)   # 12 oder 12,34 oder 12345
+    \s*
+    (?P<unit>(?:m|cm)?)         # optional m / cm, häufig fehlt ganz
+    (?!\s*(?:m2|m²|²|mm)\b)     # keine Flächen/‘mm’
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _parse_text_value_unit(txt: str) -> tuple[Optional[float], Optional[str]]:
+    m = _NUM_PAT.search(txt or "")
+    if not m:
+        return None, None
+    raw = m.group("num").replace(",", ".")
+    try:
+        val = float(raw)
+    except ValueError:
+        return None, None
+    unit = m.group("unit").lower() if m.group("unit") else None
+    if unit is None or unit == "":
+        unit = "m"
+    if unit == "cm":
+        val = val / 100.0
+        unit = "m"
+    if val <= 0:
+        return None, None
+    return val, unit
+
+
+def _project_text_to_line(
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    text_entry: Mapping[str, Any],
+) -> tuple[float, float]:
+    center = text_entry.get("center") if isinstance(text_entry, Mapping) else None
+    if not isinstance(center, (tuple, list)) or len(center) != 2:
+        return math.nan, math.nan
+    cx, cy = float(center[0]), float(center[1])
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    seg_len = math.hypot(dx, dy)
+    if seg_len <= 0:
+        return math.nan, math.nan
+    tx, ty = dx / seg_len, dy / seg_len
+    nx, ny = -ty, tx
+    midx = (p1[0] + p2[0]) * 0.5
+    midy = (p1[1] + p2[1]) * 0.5
+    vx = cx - midx
+    vy = cy - midy
+    proj_along = vx * tx + vy * ty
+    ortho_err = vx * nx + vy * ny
+    return proj_along, ortho_err
+
+
 def _gather_dim_candidates(
     root,
     segments: List[Tuple[float,float,float,float]],
@@ -912,81 +942,15 @@ def _gather_dim_candidates(
 
     texts_svg_filtered: List[Dict[str, Any]] = []
     for entry in text_elems:
-        val = entry.get("value")
         center = entry.get("center")
+        bbox = entry.get("bbox")
         if not isinstance(center, (tuple, list)) or len(center) != 2:
             continue
-        if not isinstance(val, (int, float)) or not math.isfinite(val) or val <= 0:
+        if bbox is None:
             continue
-        entry["value_m"] = float(val)
         texts_svg_filtered.append(entry)
 
     cands: List[DimCandidate] = []
-
-    def _select_best_candidates(
-        text_pool: List[Dict[str, Any]],
-        mx: float,
-        my: float,
-        nx: float,
-        ny: float,
-        dx: float,
-        dy: float,
-    ) -> Tuple[
-        Optional[Tuple[Tuple[float, float], Dict[str, Any], float, float, Tuple[float, float], Tuple[float, float]]],
-        Optional[Tuple[Tuple[float, float], Dict[str, Any], float, float, Tuple[float, float], Tuple[float, float]]],
-    ]:
-        best_pos = None
-        best_neg = None
-        seg_ang = math.degrees(math.atan2(dy, dx))
-        for text_entry in text_pool:
-            val_m = text_entry.get("value")
-            if val_m is None:
-                continue
-            try:
-                val_float = float(val_m)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(val_float) or val_float < min_value_units:
-                continue
-
-            unit = text_entry.get("unit")
-            if isinstance(unit, str):
-                unit_norm = unit.lower()
-            else:
-                unit_norm = unit
-            if unit_norm not in (None, "m"):
-                continue
-
-            center = text_entry.get("center")
-            if not isinstance(center, (tuple, list)) or len(center) != 2:
-                continue
-            cx, cy = center
-            vx = float(cx) - mx
-            vy = float(cy) - my
-
-            proj = vx * nx + vy * ny
-            if abs(proj) > max_proj_dist_px > 0:
-                continue
-
-            ortho_err = abs(vx * ny - vy * nx)
-            score = (ortho_err, abs(proj))
-
-            ang = text_entry.get("angle")
-            if isinstance(ang, (int, float)):
-                dev = abs(((float(ang) - seg_ang + 180) % 360) - 180)
-                if dev > max_baseline_dev_deg:
-                    continue
-
-            normal_used = (nx, ny)
-            mid = (mx, my)
-
-            if proj >= 0:
-                if best_pos is None or score < best_pos[0]:
-                    best_pos = (score, text_entry, proj, ortho_err, normal_used, mid)
-            else:
-                if best_neg is None or score < best_neg[0]:
-                    best_neg = (score, text_entry, proj, ortho_err, normal_used, mid)
-        return best_pos, best_neg
 
     for seg_idx, (x1, y1, x2, y2) in enumerate(segments):
         p1 = (x1, y1)
@@ -998,17 +962,84 @@ def _gather_dim_candidates(
             continue
 
         dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-        seg_len = math.hypot(dx, dy) + 1e-9
-        nx, ny = -dy / seg_len, dx / seg_len
-        mx, my = (p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5
+        seg_len = math.hypot(dx, dy)
+        if seg_len <= 0:
+            continue
+        normal_vec = (-dy / seg_len, dx / seg_len)
+        mid = ((p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5)
+        seg_ang = math.degrees(math.atan2(dy, dx))
 
-        best_pos, best_neg = _select_best_candidates(texts_svg_filtered, mx, my, nx, ny, dx, dy)
+        best_by_side: dict[tuple[int, int], tuple[float, Dict[str, Any]]] = {}
 
-        if best_pos is None and best_neg is None and enable_ocr_paths:
-            cx0 = mx - normal_dist_max
-            cy0 = my - normal_dist_max
-            cx1 = mx + normal_dist_max
-            cy1 = my + normal_dist_max
+        def _consider_text_entry(text_entry: Dict[str, Any]) -> None:
+            if not isinstance(text_entry, Mapping):
+                return
+            raw_text = text_entry.get("text", "")
+            val_m, unit = _parse_text_value_unit(raw_text)
+            if val_m is None or val_m < min_value_units:
+                return
+            unit_norm = unit.lower() if isinstance(unit, str) else unit
+            if unit_norm not in (None, "m"):
+                return
+
+            center = text_entry.get("center")
+            if not isinstance(center, (tuple, list)) or len(center) != 2:
+                return
+            bbox_xywh = text_entry.get("bbox")
+            if not bbox_xywh:
+                return
+
+            proj_along, ortho_err = _project_text_to_line(p1, p2, text_entry)
+            if not (math.isfinite(proj_along) and math.isfinite(ortho_err)):
+                return
+            dist_normal = abs(ortho_err)
+            if max_proj_dist_px > 0 and dist_normal > max_proj_dist_px:
+                return
+
+            ang = text_entry.get("angle")
+            if isinstance(ang, (int, float)):
+                dev = abs(((float(ang) - seg_ang + 180) % 360) - 180)
+                if dev > max_baseline_dev_deg:
+                    return
+
+            cx, cy = float(center[0]), float(center[1])
+            vecx = cx - mid[0]
+            vecy = cy - mid[1]
+            side = 1 if (vecx * normal_vec[0] + vecy * normal_vec[1]) >= 0 else -1
+
+            bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
+            cand_payload: Dict[str, Any] = {
+                "p1": p1,
+                "p2": p2,
+                "L": L,
+                "ori": ori,
+                "val_m": float(val_m),
+                "unit": unit_norm or "m",
+                "text": raw_text,
+                "bbox": bbox_minmax,
+                "dist_normal": dist_normal,
+                "signed_normal": ortho_err,
+                "proj_along": proj_along,
+                "normal_used": normal_vec,
+                "mid": mid,
+                "text_entry": text_entry,
+                "seg_idx": seg_idx,
+                "side": side,
+            }
+
+            key = (seg_idx, side)
+            prev = best_by_side.get(key)
+            if prev is None or dist_normal < prev[0]:
+                best_by_side[key] = (dist_normal, cand_payload)
+
+        for text_entry in texts_svg_filtered:
+            _consider_text_entry(text_entry)
+
+        if not best_by_side and enable_ocr_paths:
+            cx0 = mid[0] - normal_dist_max
+            cy0 = mid[1] - normal_dist_max
+            cx1 = mid[0] + normal_dist_max
+            cy1 = mid[1] + normal_dist_max
             cropbox = (cx0, cy0, cx1, cy1)
 
             paths_here = _collect_paths_in_bbox(root, cropbox)
@@ -1022,28 +1053,23 @@ def _gather_dim_candidates(
                         ocr_entry["_debug_index"] = len(text_elems)
                         center = ocr_entry.get("center")
                         if isinstance(center, (tuple, list)) and len(center) == 2:
-                            ocr_entry["value_m"] = float(val)
                             text_elems.append(ocr_entry)
                             texts_svg_filtered.append(ocr_entry)
-                            best_pos, best_neg = _select_best_candidates(
-                                texts_svg_filtered, mx, my, nx, ny, dx, dy
-                            )
+                            _consider_text_entry(ocr_entry)
 
-        candidates_for_seg = [x for x in (best_pos, best_neg) if x is not None]
-        seen_pairs: set[Tuple[int, int]] = set()
-        for best in candidates_for_seg:
-            _score, text_entry, proj, ortho_err, normal_used, mid = best
-            seg_id = seg_idx
+        seen_text_ids: set[int] = set()
+        for (_seg_key, _side), (_err, payload) in best_by_side.items():
+            text_entry = payload.get("text_entry")
+            if text_entry is None:
+                continue
             text_id = id(text_entry)
-            key = (seg_id, text_id)
-            if key in seen_pairs:
+            if text_id in seen_text_ids:
                 continue
-            seen_pairs.add(key)
+            seen_text_ids.add(text_id)
 
-            bbox_xywh = text_entry.get("bbox")
-            if not bbox_xywh:
+            bbox_minmax = payload.get("bbox")
+            if bbox_minmax is None:
                 continue
-            bbox_minmax = _bbox_xywh_to_minmax(bbox_xywh)
 
             txt_idx = text_entry.get("_debug_index")
             if txt_idx is None:
@@ -1054,34 +1080,39 @@ def _gather_dim_candidates(
 
             pairs_debug_entry: Dict[str, Any] = {
                 "line": (p1, p2),
-                "text": text_entry.get("text"),
-                "value": text_entry.get("value"),
-                "unit": text_entry.get("unit"),
-                "proj_px": proj,
-                "ortho_err": ortho_err,
-                "normal": normal_used,
-                "mid": mid,
+                "text": payload.get("text"),
+                "value": payload.get("val_m"),
+                "unit": payload.get("unit"),
+                "proj_px": payload.get("proj_along"),
+                "dist_normal": payload.get("dist_normal"),
+                "signed_normal": payload.get("signed_normal"),
+                "normal": payload.get("normal_used"),
+                "mid": payload.get("mid"),
                 "seg": seg_idx,
+                "side": payload.get("side"),
             }
             if txt_idx is not None:
                 pairs_debug_entry["txt"] = txt_idx
             pairs_debug.append(pairs_debug_entry)
             pair_idx = len(pairs_debug) - 1
 
+            numeric_value = payload.get("val_m")
             try:
-                numeric_value = float(text_entry.get("value"))
+                numeric_value = float(numeric_value) if numeric_value is not None else None
             except (TypeError, ValueError):
+                numeric_value = None
+            if numeric_value is None:
                 continue
 
             cand = DimCandidate(
-                p1=p1,
-                p2=p2,
-                length=L,
-                orientation=ori,
+                p1=payload["p1"],
+                p2=payload["p2"],
+                length=payload["L"],
+                orientation=payload["ori"],
                 numeric_value=numeric_value,
-                raw_text=text_entry.get("text", ""),
+                raw_text=str(payload.get("text", "")),
                 text_bbox=bbox_minmax,
-                dist_normal=proj,
+                dist_normal=float(payload.get("signed_normal", 0.0)),
                 pair_index=pair_idx,
             )
             cands.append(cand)
