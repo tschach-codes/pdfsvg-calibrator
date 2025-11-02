@@ -1311,6 +1311,45 @@ def estimate_dimline_scale(
     else:
         min_value_units = None
 
+    # Optionaler Erwartungswert aus config:
+    # dim.expected_svg_per_unit (direkt) ODER aus coarse abgeleitet
+    expected = None
+    tol_factor = float(dim_cfg.get("expected_tol_factor", 0.50))  # 50% Abweichung erlaubt
+    coarse_cfg = (config or {}).get("coarse", {}) if isinstance(config, dict) else {}
+    try:
+        # Wenn vorhanden: direkt verwenden
+        if "expected_svg_per_unit" in dim_cfg:
+            expected = float(dim_cfg["expected_svg_per_unit"])
+        # Oder aus coarse ableiten (falls du das dort bereitstellst)
+        elif "expected_svg_per_unit" in coarse_cfg:
+            expected = float(coarse_cfg["expected_svg_per_unit"])
+    except Exception:
+        expected = None
+
+    filtered = []
+    if expected and math.isfinite(expected) and expected > 0:
+        lo, hi = expected * (1.0 - tol_factor), expected * (1.0 + tol_factor)
+        for cand in cands:
+            if cand.numeric_value and cand.numeric_value > 0:
+                if cand.orientation == "h":
+                    svg_len = abs(cand.p2[0]-cand.p1[0])
+                elif cand.orientation == "v":
+                    svg_len = abs(cand.p2[1]-cand.p1[1])
+                else:
+                    continue
+                s = svg_len / cand.numeric_value
+                if lo <= s <= hi:
+                    filtered.append(cand)
+        if filtered:
+            cands = filtered
+            dbg = debug_dict.setdefault("dimscale", {})
+            dbg.setdefault("sanity_gate", {})["kept"] = len(cands)
+            dbg["sanity_gate"]["expected"] = expected
+            dbg["sanity_gate"]["tol_factor"] = tol_factor
+    else:
+        # kein Gate aktiv
+        pass
+
     scales_h: List[float] = []
     scales_v: List[float] = []
     kept_candidates: List[Tuple[str, float, Optional[int]]] = []
