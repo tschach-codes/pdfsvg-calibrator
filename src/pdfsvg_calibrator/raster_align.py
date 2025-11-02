@@ -575,56 +575,76 @@ def save_split_pdf_svg(
     import cv2
     import numpy as np
 
-    h_pdf, w_pdf = pdf_shape
-    h_svg, w_svg = svg_shape
-    H = max(h_pdf, h_svg)
-    W = w_pdf + w_svg
-    canvas = np.zeros((H, W, 3), dtype=np.uint8)
+    pdf_gray = pdf_img
+    if pdf_gray.ndim == 3:
+        pdf_gray = cv2.cvtColor(pdf_gray, cv2.COLOR_BGR2GRAY)
 
-    # Ensure inputs match their own panes (pad if needed)
-    def pad_to(img: np.ndarray, h: int, w: int) -> np.ndarray:
-        hh, ww = img.shape[:2]
-        out = np.zeros((h, w, 3), dtype=np.uint8)
-        out[:hh, :ww] = img[:h, :w]
-        return out
+    svg_gray = svg_img_oriented
+    if svg_gray.ndim == 3:
+        svg_gray = cv2.cvtColor(svg_gray, cv2.COLOR_BGR2GRAY)
 
-    pdf_pad = pad_to(pdf_img, h_pdf, w_pdf)
-    svg_pad = pad_to(svg_img_oriented, h_svg, w_svg)
+    h_pdf, w_pdf = pdf_gray.shape[:2]
 
-    # Colorize: PDF->red, SVG->green
-    pdf_red = np.zeros_like(pdf_pad)
-    pdf_red[..., 2] = cv2.cvtColor(pdf_pad, cv2.COLOR_BGR2GRAY)
-    svg_green = np.zeros_like(svg_pad)
-    svg_green[..., 1] = cv2.cvtColor(svg_pad, cv2.COLOR_BGR2GRAY)
-
-    canvas[0:h_pdf, 0:w_pdf] = pdf_red
-    canvas[0:h_svg, w_pdf : w_pdf + w_svg] = svg_green
-
-    # Separator
-    cv2.line(canvas, (w_pdf, 0), (w_pdf, H - 1), (0, 0, 0), 2)
-
-    # Small label
+    scale_factor = 1.0
     if meta:
-        label = f"pdf {w_pdf}x{h_pdf} | svg {w_svg}x{h_svg}"
-        if "scale_hint" in meta:
-            label += f" | hint {meta['scale_hint']:.6f}"
+        for key in ("scale", "scale_hint"):
+            val = meta.get(key)
+            if isinstance(val, (int, float)) and math.isfinite(val) and val > 0:
+                scale_factor = float(val)
+                break
+
+    if scale_factor <= 0:
+        scale_factor = 1.0
+
+    svg_scaled = cv2.resize(
+        svg_gray,
+        None,
+        fx=scale_factor,
+        fy=scale_factor,
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+    h_svg_scaled, w_svg_scaled = svg_scaled.shape[:2]
+
+    pdf_rgb = cv2.cvtColor(pdf_gray, cv2.COLOR_GRAY2BGR)
+    pdf_rgb[..., 1:] = 0
+
+    svg_rgb = cv2.cvtColor(svg_scaled, cv2.COLOR_GRAY2BGR)
+    svg_rgb[..., 0] = 0
+    svg_rgb[..., 2] = 0
+
+    H = max(h_pdf, h_svg_scaled)
+    W = w_pdf + w_svg_scaled
+    canvas = np.zeros((H, W, 3), dtype=np.uint8)
+    canvas[:h_pdf, :w_pdf] = pdf_rgb
+    canvas[:h_svg_scaled, w_pdf : w_pdf + w_svg_scaled] = svg_rgb
+
+    cv2.line(canvas, (w_pdf, 0), (w_pdf, H - 1), (0, 0, 0), 3)
+
+    label_parts = [f"pdf {w_pdf}x{h_pdf}", f"svg {w_svg_scaled}x{h_svg_scaled}"]
+    if meta:
+        if "scale_hint" in meta and isinstance(meta["scale_hint"], (int, float)):
+            label_parts.append(f"hint {meta['scale_hint']:.6f}")
+        if "scale" in meta and isinstance(meta["scale"], (int, float)):
+            label_parts.append(f"scale {meta['scale']:.6f}")
         if "Sx" in meta and "Sy" in meta:
-            label += f" | Sx {meta['Sx']} Sy {meta['Sy']}"
-        cv2.putText(
-            canvas,
-            label,
-            (10, 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+            label_parts.append(f"Sx {meta['Sx']} Sy {meta['Sy']}")
+    label = " | ".join(label_parts)
+    cv2.putText(
+        canvas,
+        label,
+        (10, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
     logger.info(
-        "split_debug: pdf=%s svg=%s placed=(0,0) & (%s,0) use_tx_ty=False",
-        pdf_shape,
-        svg_shape,
+        "split_debug: pdf=%s svg_scaled=%s placed=(0,0) & (%s,0) use_tx_ty=False",
+        pdf_gray.shape,
+        svg_scaled.shape,
         w_pdf,
     )
 

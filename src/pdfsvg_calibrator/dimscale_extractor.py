@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict, Any, Mapping
 import math
 import io
+import json
+import os
 import numpy as np
 from PIL import Image, ImageDraw
 from lxml import etree
@@ -1283,6 +1285,10 @@ def estimate_dimline_scale(
     dim_cfg = (config or {}).get("dim", {}) if isinstance(config, dict) else {}
     dump_text = bool(dim_cfg.get("dump_text_debug", True))
     max_show = int(dim_cfg.get("max_text_debug", 60))
+    if max_show < 0:
+        max_show = 0
+    if max_show > 5:
+        max_show = 5
 
     def _tok_summary(t):
         return {
@@ -1302,7 +1308,6 @@ def estimate_dimline_scale(
     }
 
     if dump_text:
-        import json, os
         base, _ = os.path.splitext(svg_path)
         dump_path = base + "_texttokens.json"
         try:
@@ -1414,32 +1419,33 @@ def estimate_dimline_scale(
             scales_v.append(ratio)
             kept_candidates.append(("v", ratio, cand.pair_index))
 
-    rel_tol = float(dim_cfg.get("aggregation_rel_tol", 0.05))
-    if not math.isfinite(rel_tol) or rel_tol <= 0:
-        rel_tol = 0.05
+    tol_rel = float(dim_cfg.get("aggregation_rel_tol", 0.05))
+    if not math.isfinite(tol_rel) or tol_rel <= 0:
+        tol_rel = 0.05
 
     min_inliers_required = int(dim_cfg.get("min_inliers", 3))
     if min_inliers_required <= 0:
         min_inliers_required = 3
 
-    def _median_inliers(values, rel_tol, min_inliers):
+    def _robust(values: List[float]) -> Tuple[Optional[float], List[float]]:
         vals = [v for v in values if math.isfinite(v) and v > 0]
         if not vals:
-            return (False, None, [])
-        med = float(np.median(vals))
-        band = abs(med) * rel_tol
-        inliers = [v for v in vals if abs(v - med) <= band]
-        return (len(inliers) >= min_inliers, med, inliers)
+            return None, []
+        median_val = float(np.median(vals))
+        band = [v for v in vals if abs(v - median_val) <= tol_rel * abs(median_val)]
+        if len(band) < min_inliers_required:
+            return None, band
+        return float(np.median(band)), band
 
-    ok_h, med_h, inliers_h = _median_inliers(scales_h, rel_tol, min_inliers_required)
-    ok_v, med_v, inliers_v = _median_inliers(scales_v, rel_tol, min_inliers_required)
+    sx_med, sx_inliers = _robust(scales_h)
+    sy_med, sy_inliers = _robust(scales_v)
 
-    scale_x_svg_per_unit = med_h if ok_h else None
-    scale_y_svg_per_unit = med_v if ok_v else None
+    scale_x_svg_per_unit = sx_med
+    scale_y_svg_per_unit = sy_med
 
     tot_cands = len(scales_h) + len(scales_v)
 
-    def invert_or_none(v):
+    def invert_or_none(v: Optional[float]) -> Optional[float]:
         if v is None or abs(v) < 1e-12:
             return None
         return 1.0 / v
@@ -1447,21 +1453,19 @@ def estimate_dimline_scale(
     scale_x_unit_per_svg = invert_or_none(scale_x_svg_per_unit)
     scale_y_unit_per_svg = invert_or_none(scale_y_svg_per_unit)
 
-    def _axis_reason(values: List[float], ok_axis: bool, inliers_axis: List[float]):
+    def _axis_reason(values: List[float], median_val: Optional[float], inliers_axis: List[float]):
         if not values:
             return "no candidates"
-        if ok_axis:
-            return "ok"
-        if len(inliers_axis) < min_inliers_required:
-            return f"not enough inliers ({len(inliers_axis)}<{min_inliers_required})"
-        return "median rejected"
+        if median_val is None:
+            if len(inliers_axis) < min_inliers_required:
+                return f"not enough inliers ({len(inliers_axis)}<{min_inliers_required})"
+            return "median rejected"
+        return "ok"
 
-    reason_h = _axis_reason(scales_h, ok_h, inliers_h)
-    reason_v = _axis_reason(scales_v, ok_v, inliers_v)
+    reason_h = _axis_reason(scales_h, sx_med, sx_inliers)
+    reason_v = _axis_reason(scales_v, sy_med, sy_inliers)
 
-    ok_x = scale_x_svg_per_unit is not None
-    ok_y = scale_y_svg_per_unit is not None
-    ok = ok_x or ok_y
+    ok = (scale_x_svg_per_unit is not None) or (scale_y_svg_per_unit is not None)
     if ok:
         reason = "ok"
     elif tot_cands == 0:
@@ -1474,7 +1478,7 @@ def estimate_dimline_scale(
             reason_parts.append(f"y:{reason_v}")
         reason = ", ".join(reason_parts) if reason_parts else "insufficient inliers"
 
-    inliers = max(len(inliers_h), len(inliers_v))
+    inliers = max(len(sx_inliers), len(sy_inliers))
 
     # prepare debug crops:
     prev_h = None
@@ -1492,54 +1496,92 @@ def estimate_dimline_scale(
 
     # mark inlier pairs for debug overlays
     inlier_pair_indices: set[int] = set()
-    if ok_h and med_h:
-        th_h = abs(med_h) * rel_tol
+    if sx_med is not None:
+        th_h = abs(sx_med) * tol_rel
         for ori, s, idx in kept_candidates:
             if ori != "h" or not isinstance(idx, int):
                 continue
-            if abs(s - med_h) <= th_h:
+            if abs(s - sx_med) <= th_h:
                 inlier_pair_indices.add(idx)
-    if ok_v and med_v:
-        th_v = abs(med_v) * rel_tol
+    if sy_med is not None:
+        th_v = abs(sy_med) * tol_rel
         for ori, s, idx in kept_candidates:
             if ori != "v" or not isinstance(idx, int):
                 continue
-            if abs(s - med_v) <= th_v:
+            if abs(s - sy_med) <= th_v:
                 inlier_pair_indices.add(idx)
 
     for idx in inlier_pair_indices:
         if 0 <= idx < len(pairs):
             pairs[idx]["inlier"] = True
 
-    texts_svg_debug = [
-        {
-            "text": t.get("text"),
-            "unit": t.get("unit"),
-            "value": t.get("value"),
-            "bbox": t.get("bbox"),
-            "center": t.get("center"),
-        }
-        for t in text_elems
-    ]
+    segments_examples = [segments_svg[i] for i in range(min(5, len(segments_svg)))]
+    pair_examples = []
+    for pair in pairs[:5]:
+        pair_examples.append(
+            {
+                "seg": pair.get("seg"),
+                "txt": pair.get("txt"),
+                "orientation": pair.get("orientation"),
+                "value": pair.get("value"),
+                "unit": pair.get("unit"),
+                "inlier": bool(pair.get("inlier", False)),
+            }
+        )
 
     dbg = debug_dict.setdefault("dimscale", {})
-    dbg["segments_svg"] = segments_svg
-    dbg["texts_svg"] = texts_svg_debug
-    dbg["pairs"] = pairs
-    dbg["scale_aggregation"] = {
-        "rel_tol": rel_tol,
-        "min_inliers": min_inliers_required,
-        "candidate_count_h": len(scales_h),
-        "candidate_count_v": len(scales_v),
-        "median_h": med_h,
-        "inliers_h": len(inliers_h),
-        "ok_h": ok_h,
-        "reason_h": reason_h,
-        "median_v": med_v,
-        "inliers_v": len(inliers_v),
-        "ok_v": ok_v,
-        "reason_v": reason_v,
+    dbg["segments_summary"] = {
+        "total": len(segments_svg),
+        "examples": segments_examples,
     }
+    dbg["pairs_summary"] = {
+        "total": len(pairs),
+        "inliers": sum(1 for p in pairs if p.get("inlier")),
+        "examples": pair_examples,
+    }
+    dbg["scale_reasons"] = {"x": reason_h, "y": reason_v}
+    dbg["scale_aggregation"] = {
+        "x": {
+            "median": sx_med,
+            "inliers": len(sx_inliers),
+            "candidate_count": len(scales_h),
+            "tol_rel": tol_rel,
+        },
+        "y": {
+            "median": sy_med,
+            "inliers": len(sy_inliers),
+            "candidate_count": len(scales_v),
+            "tol_rel": tol_rel,
+        },
+    }
+
+    agg_dump_path: Optional[str] = None
+    if svg_path:
+        base, _ = os.path.splitext(svg_path)
+        agg_dump_path = base + "_dim_agg.json"
+        agg_dump = {
+            "segments_svg": segments_svg,
+            "texts_svg": text_elems,
+            "pairs": pairs,
+            "scale_candidates": {
+                "horizontal": scales_h,
+                "vertical": scales_v,
+                "tol_rel": tol_rel,
+                "min_inliers": min_inliers_required,
+                "median_x": sx_med,
+                "median_y": sy_med,
+                "inliers_x": sx_inliers,
+                "inliers_y": sy_inliers,
+                "kept_candidates": kept_candidates,
+            },
+        }
+        try:
+            with open(agg_dump_path, "w", encoding="utf-8") as f:
+                json.dump(agg_dump, f, ensure_ascii=False, indent=2)
+            dbg["aggregation_dump_path"] = agg_dump_path
+        except Exception as exc:  # pragma: no cover - debug aid
+            dbg["aggregation_dump_error"] = str(exc)
+
 
     return DimScaleResult(
         ok=ok,
